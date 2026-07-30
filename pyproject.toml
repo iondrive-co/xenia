@@ -1,0 +1,29 @@
+[project]
+name = "xenia"
+version = "0.1.0"
+description = "What coding agents were trying to do on this machine, and whether it worked"
+requires-python = ">=3.11"
+# No runtime dependencies, deliberately. This code runs as a hook on every
+# tool call an agent makes, in repos with their own unrelated environments;
+# an import that can fail or a virtualenv that can drift would make the
+# recorder the thing that breaks the agent.
+dependencies = []
+
+[project.scripts]
+xenia = "xenia.app:main"
+xenia-hook = "xenia.hook:main"
+xenia-mcp = "xenia.mcp:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xenia"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/xenia/schema.sql" = "xenia/schema.sql"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
