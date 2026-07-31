@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 14
 
 GENERAL_REPO = "general"
 
@@ -89,6 +89,15 @@ SNIPPET_LIMIT = int(os.environ.get("XENIA_SNIPPET_LIMIT", "600"))
 DETAIL_LIMIT = int(os.environ.get("XENIA_DETAIL_LIMIT", "2000"))
 PROMPT_LIMIT = int(os.environ.get("XENIA_PROMPT_LIMIT", "4000"))
 RESPONSE_LIMIT = int(os.environ.get("XENIA_RESPONSE_LIMIT", "400"))
+
+# The most a single MCP reply may serialise to. Row limits bound rows, and rows
+# are not one size — a grouped report row is a hundred bytes, a call carrying a
+# shell heredoc is two thousand — so a reply inside its row limit can still be
+# large enough that the client discards it whole and the agent gets nothing for
+# the query. Every failure xenia has on record against its own MCP is that one:
+# 57k, 92k and 106k character replies, all thrown away. Replies at 39k have
+# been accepted, so the ceiling sits below that with room to spare.
+REPLY_LIMIT = int(os.environ.get("XENIA_REPLY_LIMIT", "32000"))
 
 TASK_IDLE_MINUTES = float(os.environ.get("XENIA_TASK_IDLE_MINUTES", "20"))
 

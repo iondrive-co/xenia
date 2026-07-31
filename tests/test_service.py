@@ -44,6 +44,18 @@ def test_systemd_gets_a_user_unit_that_starts_now_and_at_login(systemd, fake_hom
     assert report["started"] is True
 
 
+def test_a_retired_service_comes_back_without_looking_like_a_failure(systemd):
+    from xenia import readers
+
+    service.install()
+    body = service.unit_file().read_text()
+
+    status = readers.RETIRED_EXIT_STATUS
+    assert f"RestartForceExitStatus={status}" in body, "it would not come back"
+    assert f"SuccessExitStatus={status}" in body, \
+        "stopping it deliberately sends the same signal, and is not a failure"
+
+
 def test_the_unit_runs_the_service_binary_not_the_bootstrap(systemd):
     service.install()
     exec_line = next(

@@ -100,11 +100,34 @@ def test_a_blocked_call_counts_as_a_failure_to_resolve(conn, clock):
     prompt(conn, clock, "Check the prod box")
     clock()
     ingest.record(conn, pre("Bash", {"command": "ssh monitoring-prod-1 uptime"}))
+    # Something followed it, so the agent was refused and carried on around it.
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "curl https://broker.test/uptime"}))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "curl https://broker.test/uptime"}))
     stop(conn, clock)
 
     blocked = actions(conn)[0]
     assert blocked["status"] == "blocked"
     assert blocked["resolved_by_action_id"] is None
+
+
+def test_a_call_nobody_answered_does_not_fail_the_instruction(conn, clock):
+    """An approval prompt left open at exit is not the instruction breaking.
+
+    Scored as a failure it put a row in every failures query that no fix
+    would ever clear.
+    """
+    prompt(conn, clock, "Check the prod box")
+    run(conn, clock, "Bash", {"command": "ls"})
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "ssh monitoring-prod-1 uptime"}))
+    stop(conn, clock)
+
+    unanswered = [a for a in actions(conn) if a["status"] == "unanswered"]
+    assert len(unanswered) == 1
+    goal = dict(conn.execute("SELECT * FROM goal").fetchone())
+    assert goal["status"] == "achieved"
 
 
 def test_a_clean_run_is_achieved(conn, clock):

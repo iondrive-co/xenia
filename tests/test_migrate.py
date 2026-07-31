@@ -193,6 +193,46 @@ def test_history_gains_tasks_when_it_is_replayed(legacy):
     conn.close()
 
 
+def misnamed_session(legacy, uid: str, agent: str) -> None:
+    """A session row that says claude over events that say otherwise."""
+    conn = sqlite3.connect(str(legacy))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO session (session_uid, agent, repo, cwd, started_at) "
+        "VALUES (?, 'claude', 'old-repo', '/tmp', '2026-07-27T09:00:00.000+00:00')",
+        (uid,))
+    conn.commit()
+    for i in range(3):
+        ingest.append_event(conn, {
+            "hook_event_name": "PreToolUse", "session_id": uid,
+            "tool_name": "Bash", "tool_input": {"command": f"echo {i}"},
+        }, agent)
+        conn.commit()
+    conn.close()
+
+
+def test_a_session_misnamed_in_an_old_database_is_put_right(legacy):
+    misnamed_session(legacy, "s2", "codex")
+
+    # The ledger said codex on every event and the session row said claude, so
+    # every view reported the run as Claude's work. The events are the record.
+    conn = db.connect(legacy)
+    named = dict(conn.execute("SELECT session_uid, agent FROM session").fetchall())
+    assert named["s2"] == "codex"
+    assert named["s1"] == "claude", "a session its events agree with is left alone"
+    assert chain.verify(conn).ok, "and the ledger itself is untouched"
+    conn.close()
+
+
+def test_a_backfill_leaves_a_session_its_events_do_not_name(legacy):
+    misnamed_session(legacy, "s3", "unknown")
+
+    conn = db.connect(legacy)
+    assert conn.execute(
+        "SELECT agent FROM session WHERE session_uid = 's3'").fetchone()[0] == "claude"
+    conn.close()
+
+
 def test_the_read_side_survives_a_database_it_cannot_migrate(legacy):
     ro = readonly.connect(legacy)
     try:

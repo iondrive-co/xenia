@@ -43,16 +43,30 @@ def _cap(text: str | None, limit: int) -> str | None:
     return text if len(text) <= limit else text[:limit] + f"…[+{len(text) - limit} chars]"
 
 
+def declared_agent(payload: dict[str, Any]) -> str | None:
+    """The agent this payload names, from the payload itself.
+
+    The transcript path is the one piece of evidence that belongs to *this*
+    session. Environment variables are ambient and travel: a codex run started
+    from a Claude Code shell inherits CLAUDECODE=1, and reading that first
+    files the whole session under the wrong agent.
+    """
+    transcript = payload.get("transcript_path") or ""
+    if "/.codex/" in transcript:
+        return "codex"
+    if "/.claude/" in transcript:
+        return "claude"
+    return None
+
+
 def detect_agent(payload: dict[str, Any]) -> str:
+    named = declared_agent(payload)
+    if named:
+        return named
+
     if os.environ.get("CLAUDECODE") == "1" or os.environ.get("CLAUDE_CODE") == "1":
         return "claude"
     if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_HOME"):
-        return "codex"
-
-    transcript = payload.get("transcript_path") or ""
-    if "/.claude/" in transcript:
-        return "claude"
-    if "/.codex/" in transcript:
         return "codex"
 
     declared = (os.environ.get("AI_AGENT") or "").lower()
@@ -83,12 +97,23 @@ def repo_for(cwd: str | None) -> tuple[str, str | None]:
         path = parent
 
 
+# Fields a runtime echoes into the hook payload that the agent never sees.
+# Claude Code returns the whole pre-edit file as 'originalFile' on every
+# Edit reply, so a one-line change to a 400 KB file was recorded as a
+# 400 KB reply — and 'tools' ordered by total_bytes, the view that answers
+# "what floods a context", put Edit top at 51 MB against Read's 7 MB. What
+# reaches the model is the patch, which is measured with everything else.
+ECHOED_BACK = ("originalFile",)
+
+
 def response_bytes(payload: dict[str, Any]) -> int | None:
     response = payload.get("tool_response")
     if response is None:
         return None
     if isinstance(response, str):
         return len(response.encode("utf-8", "replace"))
+    if isinstance(response, dict):
+        response = {k: v for k, v in response.items() if k not in ECHOED_BACK}
     try:
         return len(json.dumps(response, default=str).encode("utf-8", "replace"))
     except (TypeError, ValueError):
@@ -178,10 +203,26 @@ def append_event(conn: sqlite3.Connection, payload: dict[str, Any], agent: str) 
     return int(cursor.lastrowid)
 
 
+def reconcile_agent(conn: sqlite3.Connection, session_id: int, stored: str,
+                    payload: dict[str, Any], agent: str) -> None:
+    """Correct a session whose agent was settled before its runtime said so.
+
+    Every view names the agent by joining through the session row, so a
+    session opened under the wrong name reports its whole run as another
+    agent's work. Evidence carried by the payload overrules what is stored;
+    an unknown session yields to anything at all.
+    """
+    settled = declared_agent(payload) or (agent if stored == "unknown" else None)
+    if settled and settled != stored:
+        conn.execute("UPDATE session SET agent = ? WHERE id = ?", (settled, session_id))
+
+
 def ensure_session(conn: sqlite3.Connection, payload: dict[str, Any], agent: str) -> int:
     uid = payload.get("session_id") or f"anon-{agent}-{os.getppid()}"
-    row = conn.execute("SELECT id FROM session WHERE session_uid = ?", (uid,)).fetchone()
+    row = conn.execute("SELECT id, agent FROM session WHERE session_uid = ?",
+                       (uid,)).fetchone()
     if row:
+        reconcile_agent(conn, int(row["id"]), row["agent"], payload, agent)
         return int(row["id"])
 
     cwd = payload.get("cwd") or os.getcwd()
@@ -385,7 +426,13 @@ def task_for_action(conn: sqlite3.Connection, session_id: int, tool: str,
             set_current_task(conn, session_id, task_id)
             return task_id
 
-    if current is not None and current["source"] != "signature":
+    # A run of work the agent never named: same instruction, no idle gap. It is
+    # one job, so it is one task. Splitting it per signature turned a single
+    # piece of work into a row for every call it took — a read, fourteen greps
+    # and an edit reported as sixteen tasks of one action each. What the calls
+    # were is what xenia_calls is for; a new instruction (add_goal) or a quiet
+    # spell (went_cold) is what ends the run.
+    if current is not None:
         return int(current["id"])
 
     task_id = upsert_task(conn, session_id, label=signature_label(tool, result),
@@ -540,8 +587,14 @@ def _analyse_mcp(tool: str, mcp: tuple[str, str], args: dict[str, Any]) -> class
     return result
 
 
-def _exec_target(verb: str, verb_args: list[str]) -> str:
-    operand = (classify.first_operand(verb_args) or "").strip()
+def _exec_target(verb: str, verb_args: list[str],
+                 heredoc: str | None = None) -> str:
+    # The label keeps the opening line of a script, which reads far better
+    # than a digest of it. The signature cannot: two unrelated one-off scripts
+    # open `import json, os` alike, and grouping by that would call them the
+    # same work. See classify.exec_operand.
+    code, rest = classify.program_of(verb, verb_args, heredoc)
+    operand = (code if code is not None else classify.first_operand(rest) or "").strip()
     first_line = operand.splitlines()[0].strip() if operand else ""
     return _cap(f"{verb} {first_line}".strip(), 120)
 
@@ -571,21 +624,34 @@ def _analyse_bash(args: dict[str, Any], cwd: str | None, repo_path: str | None) 
             ))
 
     spawned = bool(remote and remote.channel == classify.MCP_SPAWN_CHANNEL)
-    kind = "remote_call" if (remote and not spawned) else ("fs_change" if fs else "exec")
+    if remote and not spawned:
+        kind = "remote_call"
+    elif spawned:
+        # Running the server binary is what this command is. A file written
+        # somewhere else on the same line — a scratch file, a redirected
+        # transcript — is incidental to it, and taking the kind from there
+        # filed the spawn as a file change. The write is still recorded; it is
+        # just not what the action was.
+        kind = "exec"
+    else:
+        kind = "fs_change" if fs else "exec"
+
     primary, primary_args = classify.significant_call(calls)
+    heredoc = classify.heredoc_bodies(command)
     if remote:
         sig = classify.signature("remote", remote.channel, remote.host or "", remote.method or "")
     elif fs:
         sig = classify.signature("fs", fs[0].op, fs[0].path)
     else:
         sig = classify.signature("exec", primary,
-                                 classify.first_operand(primary_args) or "")
+                                 classify.exec_operand(primary, primary_args, heredoc))
 
     result = classify.Result(
         kind=kind,
         signature=sig,
         target=(remote.host or remote.url if remote
-                else (fs[0].path if fs else _exec_target(primary, primary_args))),
+                else (fs[0].path if fs
+                      else _exec_target(primary, primary_args, heredoc))),
         detail=_cap(redact.redact(command), config.DETAIL_LIMIT) or "",
         remote=remote,
         fs=fs,
@@ -704,7 +770,8 @@ def record(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
     elif hook == "PostToolUse":
         _close_action(conn, event_id, session_id, payload)
     elif hook in ("Stop", "SubagentStop", "SessionEnd"):
-        close_session(conn, session_id, reason=hook.lower())
+        close_session(conn, session_id, reason=hook.lower(),
+                      transcript=payload.get("transcript_path"))
 
     conn.commit()
     return event_id
@@ -830,6 +897,115 @@ DENIED_ERROR = (
     "a PreToolUse hook refused this one, or it was declined at the permission "
     "prompt, and the agent carried on around it"
 )
+
+# What the runtime calls each kind of refusal, mapped to what someone reading
+# the report has to DO about it. A rule is a code or config change; a user
+# decline is a permissions decision that is not the agent's to make. Anything
+# else stays NULL rather than guessing, because a wrong attribution here sends
+# the reader to the wrong file.
+DENIAL_KINDS = {
+    "permission-rule": "rule",
+    "user-rejected": "user",
+}
+
+# How far back through a transcript to look for denial records. They sit next
+# to the calls they refused, and a session's dangling actions are resolved at
+# its close, so the tail is where the answers are. Bounded because this runs
+# inside a hook: a transcript grows to tens of MB and no denial is worth
+# stalling the agent's next tool call over.
+TRANSCRIPT_TAIL_BYTES = 2_000_000
+
+
+def outcomes_in(transcript_path: str | None, *,
+                whole: bool = False) -> dict[str, tuple[str, str | None, str | None]]:
+    """Map tool_use_id -> (status, blocked_by, error) from the runtime's record.
+
+    No PostToolUse hook fires for a call the runtime refused — and, it turns
+    out, for a good many that simply FAILED: of the calls this record had
+    settled as denials, the transcripts show `Exit code 1` with a traceback,
+    `screenshot failed`, and one review that completed successfully. Inferring
+    "something refused this" from a missing completion turned every one of
+    those into a permission problem, and the failures view into a list of
+    identical sentences explaining nothing.
+
+    The transcript has the answer the hook never got: a `toolDenialKind` when
+    something really did refuse the call, and otherwise the tool_result the
+    call actually returned.
+
+    Reads only the tail by default, which is where a just-ended call's answer
+    is and keeps a hook off the critical path. `whole` is for going back over
+    a session that ended long ago: transcripts here run to 10 MB and an answer
+    from the middle of one is nowhere near the end.
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return {}
+
+    try:
+        handle = open(transcript_path, "rb")
+    except OSError:
+        return {}
+
+    with handle:
+        if not whole:
+            try:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - TRANSCRIPT_TAIL_BYTES))
+                # A partial first line when the file was longer than the tail.
+                if size > TRANSCRIPT_TAIL_BYTES:
+                    handle.readline()
+            except OSError:
+                return {}
+        return _outcomes_from(handle)
+
+
+def _text_of(block: dict[str, Any]) -> str | None:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return None
+    try:
+        return json.dumps(content, default=str)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _outcomes_from(lines) -> dict[str, tuple[str, str | None, str | None]]:
+    found: dict[str, tuple[str, str | None, str | None]] = {}
+    for raw_line in lines:
+        line = raw_line.decode("utf-8", "replace") if isinstance(
+            raw_line, bytes) else raw_line
+        if '"tool_result"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+
+        blocked_by = DENIAL_KINDS.get(record.get("toolDenialKind") or "")
+        for block in (record.get("message") or {}).get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            use_id = block.get("tool_use_id")
+            if not use_id:
+                continue
+
+            if blocked_by:
+                # A refusal: the runtime names who, and for a rule the
+                # result is that rule's own words — the reason to keep.
+                result = record.get("toolUseResult")
+                reason = result if isinstance(result, str) else _text_of(block)
+                found[str(use_id)] = (
+                    "blocked", blocked_by, _cap(reason, config.RESPONSE_LIMIT))
+            elif block.get("is_error"):
+                found[str(use_id)] = (
+                    "error", None, _cap(_text_of(block), config.RESPONSE_LIMIT))
+            else:
+                # It ran and returned. Whatever kept the completion hook from
+                # firing, this was never a refusal.
+                found[str(use_id)] = ("ok", None, None)
+    return found
 OUTSTANDING_ERROR = (
     "outstanding — no completion event and nothing followed it: the call was "
     "still in flight when the session ended, waiting on an approval that never "
@@ -837,8 +1013,48 @@ OUTSTANDING_ERROR = (
 )
 
 
-def close_session(conn: sqlite3.Connection, session_id: int, reason: str) -> None:
+def apply_outcomes(conn: sqlite3.Connection, session_id: int,
+                   transcript: str | None, *, whole: bool = False) -> int:
+    """Settle this session's uncompleted calls on what the runtime recorded.
+
+    Runs at every session close, and again over history when the record is
+    migrated: a row settled by inference is exactly the row this can improve,
+    so one is re-opened when nothing better has explained it yet. A call that
+    got a real completion event is never touched — it already has the truth,
+    with the timings and reply size this cannot supply.
+
+    The inferred texts are placeholders and give way to the real message;
+    anything else on the row came from somewhere better and is left alone.
+    """
+    settled = 0
+    for use_id, (status, blocked_by, why) in outcomes_in(
+            transcript, whole=whole).items():
+        settled += conn.execute(
+            "UPDATE action SET status = ?, "
+            "                  ended_at = COALESCE(ended_at, ?), "
+            "                  blocked_by = ?, "
+            "                  error = CASE WHEN error IS NULL "
+            "                                 OR error IN (?, ?) "
+            "                               THEN ? ELSE error END "
+            "WHERE session_id = ? AND corr_key = ? "
+            "  AND (status = 'started' "
+            "       OR (blocked_by IS NULL "
+            "           AND status IN ('blocked', 'unanswered')))",
+            (status, utcnow(), blocked_by, DENIED_ERROR, OUTSTANDING_ERROR,
+             why, session_id, f"id:{use_id}"),
+        ).rowcount
+    return settled
+
+
+def close_session(conn: sqlite3.Connection, session_id: int, reason: str,
+                  transcript: str | None = None) -> None:
     from . import resolve
+
+    # What the runtime said, before what xenia can infer. A refused call is
+    # only ever settled here — no PostToolUse fires for one — so this is the
+    # last chance to record why, and 'denied' below is the fallback for the
+    # ones the transcript does not explain.
+    apply_outcomes(conn, session_id, transcript)
 
     conn.execute(
         "UPDATE action SET status = 'blocked', ended_at = ?, "
@@ -850,8 +1066,13 @@ def close_session(conn: sqlite3.Connection, session_id: int, reason: str) -> Non
         "                 AND later.status IN ('ok', 'error'))",
         (utcnow(), DENIED_ERROR, session_id),
     )
+    # Not 'blocked'. Nothing refused these — the session ended with the call
+    # still in flight, usually on an approval prompt nobody answered before
+    # closing the window. Scoring that as breakage put a row in every
+    # failures query that no fix would ever remove, so it gets an outcome of
+    # its own and the failure predicates stop matching it.
     conn.execute(
-        "UPDATE action SET status = 'blocked', ended_at = ?, "
+        "UPDATE action SET status = 'unanswered', ended_at = ?, "
         "                  error = COALESCE(error, ?) "
         "WHERE session_id = ? AND status = 'started'",
         (utcnow(), OUTSTANDING_ERROR, session_id),

@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .readers import RETIRED_EXIT_STATUS
+
 LABEL = "dev.xenia.tray"
 UNIT_NAME = "xenia.service"
 
@@ -94,6 +96,11 @@ def _write_unit(path: Path) -> None:
         f"ExecStart={service_command()}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
+        # Retired by a schema migration. Forced so it comes back on the new
+        # code, and successful so that stopping it deliberately — which sends
+        # the same signal — leaves the unit inactive rather than failed.
+        f"SuccessExitStatus={RETIRED_EXIT_STATUS}\n"
+        f"RestartForceExitStatus={RETIRED_EXIT_STATUS}\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"

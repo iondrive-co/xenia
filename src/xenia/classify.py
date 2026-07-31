@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import posixpath
 import re
@@ -89,17 +90,56 @@ def _split_unquoted(text: str) -> list[str]:
     return parts
 
 
+def mask_quoted(text: str) -> str:
+    """The same text with the inside of every quoted run blanked out.
+
+    A `>` between quotes is a character in a string, not a redirection: it is
+    a comparison in an inline Python program, an arrow in a format string, a
+    fragment of a grep pattern. Scanning the raw text for redirections reads
+    those as writes and invents a file — `fs:modify:',` — so the scan runs
+    over this instead. Blanks are the same width as what they replace, so
+    offsets still line up with the original.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == "\\" and quote != "'" and i + 1 < len(text):
+            out.append("  ")
+            i += 2
+            continue
+        if quote:
+            out.append(char if char == quote else " ")
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+            out.append(char)
+        else:
+            out.append(char)
+        i += 1
+    return "".join(out)
+
+
 _HEREDOC = re.compile(r"<<(?P<dash>-?)\s*(?P<quote>['\"]?)"
                       r"(?P<word>[A-Za-z_][\w.-]*)(?P=quote)")
 
 
-def strip_heredocs(command: str) -> str:
+def split_heredocs(command: str) -> tuple[str, list[str]]:
+    """The command with every heredoc body lifted out, and those bodies.
+
+    The bodies are not shell and must not be tokenised as any, but they are
+    not nothing either: fed to an interpreter, the body *is* the program, and
+    it is what tells one run apart from another.
+    """
     text = command or ""
     if "<<" not in text:
-        return text
+        return text, []
 
     lines = text.split("\n")
     kept: list[str] = []
+    bodies: list[str] = []
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -107,12 +147,25 @@ def strip_heredocs(command: str) -> str:
         i += 1
         for match in _HEREDOC.finditer(line):
             word, dashed = match.group("word"), bool(match.group("dash"))
+            body: list[str] = []
             while i < len(lines):
                 candidate = lines[i]
                 i += 1
                 if (candidate.strip() if dashed else candidate.rstrip()) == word:
                     break
-    return "\n".join(kept)
+                body.append(candidate)
+            if body:
+                bodies.append("\n".join(body))
+    return "\n".join(kept), bodies
+
+
+def strip_heredocs(command: str) -> str:
+    return split_heredocs(command)[0]
+
+
+def heredoc_bodies(command: str) -> str | None:
+    bodies = split_heredocs(command)[1]
+    return "\n".join(bodies) if bodies else None
 
 
 def segments(command: str) -> list[str]:
@@ -188,6 +241,94 @@ def operands(args: list[str]) -> list[str]:
 def first_operand(args: list[str]) -> str | None:
     found = operands(args)
     return found[0] if found else None
+
+
+# Runtimes that take a program on the command line. Shells are deliberately
+# absent: `bash -c` is followed into by verb_and_args, because what it carries
+# really is another command. What python3 -c carries is not.
+_INTERPRETERS = frozenset({
+    "python", "python2", "python3", "node", "nodejs", "deno", "bun",
+    "ruby", "perl", "php", "rscript", "lua", "osascript",
+})
+
+_CODE_FLAGS = ("-c", "-e", "--command", "--eval")
+
+
+def is_interpreter(verb: str) -> bool:
+    return posixpath.basename((verb or "").strip()).lower() in _INTERPRETERS
+
+
+def inline_code(verb: str, args: list[str]) -> tuple[str | None, list[str]]:
+    """The program handed to an interpreter with -c/-e, split off from the rest.
+
+    Source is not shell. Left in the argument list it becomes the command's
+    first operand, and a whole program ends up as the identity of the work —
+    `exec:python3:import pathlib\\nsrc = pathlib.path(...)` as a signature, and
+    the same body again as the task label.
+    """
+    if not is_interpreter(verb):
+        return None, args
+
+    code: str | None = None
+    rest: list[str] = []
+    skip = False
+    for i, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        if code is None:
+            if arg in _CODE_FLAGS and i + 1 < len(args):
+                code, skip = args[i + 1], True
+                continue
+            joined = next((f for f in _CODE_FLAGS if arg.startswith(f + "=")), None)
+            if joined:
+                code = arg.split("=", 1)[1]
+                continue
+        rest.append(arg)
+    return code, rest
+
+
+# Consonants only, so a digest can never be mistaken for the hex or the digit
+# runs that signature() normalises away as volatile.
+_DIGEST_ALPHABET = "bcdfghjklmnpqrstvwxyz"
+
+
+def code_digest(code: str) -> str:
+    value = int(hashlib.sha256(code.encode("utf-8", "replace")).hexdigest()[:12], 16)
+    out: list[str] = []
+    for _ in range(6):
+        value, index = divmod(value, len(_DIGEST_ALPHABET))
+        out.append(_DIGEST_ALPHABET[index])
+    return "".join(out)
+
+
+def program_of(verb: str, args: list[str],
+               heredoc: str | None = None) -> tuple[str | None, list[str]]:
+    """The program this command runs, however it was handed over.
+
+    Inline after -c, or piped in as a heredoc — either way it is source, and
+    either way the rest of the argument list is what remains to be read as
+    shell.
+    """
+    code, rest = inline_code(verb, args)
+    if code is None and heredoc and is_interpreter(verb) \
+            and any(a.startswith("<<") for a in args):
+        code = heredoc
+        rest = [a for a in rest if not a.startswith("<<")]
+    return code, rest
+
+
+def exec_operand(verb: str, args: list[str], heredoc: str | None = None) -> str:
+    """What names this command apart from others of the same verb.
+
+    A program is named by a digest of itself: short enough to read, stable
+    enough that the same script run twice is one kind of work, and distinct
+    enough that two unrelated one-off scripts are not.
+    """
+    code, rest = program_of(verb, args, heredoc)
+    if code is not None:
+        return f"-c {code_digest(code)}"
+    return first_operand(rest) or ""
 
 
 def flag_value(args: list[str], *names: str) -> str | None:
@@ -504,7 +645,7 @@ def fs_facts(verb: str, args: list[str], raw: str) -> list[tuple[str, str]]:
             targets = operands or ["<worktree>"]
             out.extend((t, "modify") for t in targets)
 
-    for match in _REDIRECT_RE.finditer(raw):
+    for match in _REDIRECT_RE.finditer(mask_quoted(raw)):
         path = match.group("path")
         if path not in ("/dev/null", "/dev/stdout", "/dev/stderr"):
             out.append((path, "modify"))

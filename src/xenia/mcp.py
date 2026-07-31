@@ -65,7 +65,7 @@ VIEW_PARAMS: dict[str, frozenset[str]] = {
     "instructions": frozenset({"status", "goal_id"}),
     "failures": frozenset({"min_count"}),
     "repeats": frozenset({"agent", "tool", "via", "channel", "session", "kind",
-                          "within_minutes", "min_count"}),
+                          "within_minutes", "min_count", "order"}),
     "tools": frozenset({"agent", "tool", "via", "channel", "session", "signature",
                         "kind", "status", "environment", "group_by", "order",
                         "min_count"}),
@@ -97,13 +97,24 @@ TOOLS: list[dict[str, Any]] = [
             "carries whole prompts, which is why the rest carry a 'goal_id' — "
             "pass one back as 'goal_id' for the full text of that instruction.\n"
             "  failures      one kind of work that keeps failing, worst first, "
-            "grouped across sessions and repos. 'recovered' is how often a "
-            "later call put it right; many failures and few recoveries is a "
-            "gap in the environment or the instructions, and the most "
-            "actionable row here. Pass 'example_action_id' to xenia_trace.\n"
+            "grouped across sessions. 'repos' names the checkouts it failed "
+            "in, because that is where a fix goes; 'previously' is the same "
+            "count over the window before this one, so a row failing 8 times "
+            "against 0 is new and one against 12 is already getting better. "
+            "'recovered' is how often a later call put it right; many failures "
+            "and few recoveries is a gap in the environment or the "
+            "instructions, and the most actionable row here. Refusals split "
+            "by who did the refusing: 'refused_by_rule' is a hook or a "
+            "permission rule, and the reason is in 'example_error' — a config "
+            "or code fix; 'declined_by_user' is a person saying no at the "
+            "prompt, which is not yours to change. Pass 'example_action_id' "
+            "to xenia_trace.\n"
             "  repeats       one piece of work a session did again minutes "
             "after it had already succeeded. This is the waste 'failures' "
-            "cannot show, since none of it failed.\n"
+            "cannot show, since none of it failed. Cost it in "
+            "'repeated_bytes' rather than 'repeated_ms': redoing work is "
+            "rarely slow, but every repeat puts its whole reply back into a "
+            "context.\n"
             "  tools         one tool, broker, host, repo or signature, with "
             "calls, failure rate, latency and reply bytes. Ask this rather "
             "than totalling rows yourself; order by 'total_bytes' for what "
@@ -113,7 +124,11 @@ TOOLS: list[dict[str, Any]] = [
             "hashed to what was already there — 'unchanged' is bytes that "
             "reached the drive and changed nothing.\n"
             "\n"
-            "Rows come back under 'rows'. 'since', 'repo' and 'limit' apply to "
+            "Rows come back under 'rows'. The tasks view also returns "
+            "'instructions', the text of each instruction its rows sat under, "
+            "keyed by 'goal_id' — one entry per instruction rather than the "
+            "same sentence repeated down every row. 'since', 'repo' and "
+            "'limit' apply to "
             "every view; each other parameter names the views that read it, "
             "and passing one to a view that does not is an error rather than a "
             "filter that quietly does nothing. For the individual calls behind "
@@ -139,7 +154,11 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "[tasks instructions tools] Restrict to one "
                                    "outcome. For tasks and instructions: "
                                    f"{', '.join(readonly.TASK_STATUSES)}. For "
-                                   f"tools: {', '.join(readonly.STATUSES)}."},
+                                   f"tools: {', '.join(readonly.STATUSES)} — "
+                                   "where 'blocked' is a call something "
+                                   "refused and 'unanswered' is one nobody "
+                                   "answered before the session ended, which "
+                                   "is counted as a failure nowhere."},
                 "source": _views("tasks", {
                     "type": "string", "enum": list(readonly.TASK_SOURCES),
                     "description": "How the task was identified: the agent's "
@@ -177,14 +196,21 @@ TOOLS: list[dict[str, Any]] = [
                                    "(default 'path')."},
                 "order": {
                     "type": "string",
-                    "enum": sorted(set(readonly.STAT_ORDERS) | set(readonly.DISK_ORDERS)),
-                    "description": "[tools disk] Sort by. For tools: "
+                    "enum": sorted(set(readonly.STAT_ORDERS)
+                                   | set(readonly.DISK_ORDERS)
+                                   | set(readonly.REPEAT_ORDERS)),
+                    "description": "[repeats tools disk] Sort by. For tools: "
                                    f"{', '.join(sorted(readonly.STAT_ORDERS))} "
                                    "(default 'total_ms', the time the group "
                                    "actually cost). For disk: "
                                    f"{', '.join(sorted(readonly.DISK_ORDERS))} "
                                    "(default 'wasted_bytes'; use 'writes' when "
-                                   "sizes are unknown)."},
+                                   "sizes are unknown). For repeats: "
+                                   f"{', '.join(sorted(readonly.REPEAT_ORDERS))} "
+                                   "(default 'repeats'; order by "
+                                   "'repeated_bytes' for what the redoing cost "
+                                   "a context, which is where the cost of this "
+                                   "view lands — redone work is rarely slow)."},
                 "min_count": {
                     "type": "integer",
                     "description": "[failures repeats tools disk] Drop rows "
@@ -214,7 +240,10 @@ TOOLS: list[dict[str, Any]] = [
             "size and a short command, and nothing that repeats identically "
             "down the rows. Defaults to the heaviest replies first; pass the "
             "'signature' or 'tool' from a report row to drill into it, and the "
-            "'action_id' it returns to xenia_trace."
+            f"'action_id' it returns to xenia_trace. 'detail' is cut to "
+            f"{readonly.CALL_CHARS} characters so a page of rows stays "
+            "readable — xenia_trace on the same action id is where the whole "
+            "command is, for any call and not only a failed one."
         ),
         "inputSchema": {
             "type": "object",
@@ -226,6 +255,15 @@ TOOLS: list[dict[str, Any]] = [
                          "description": "Restrict to one kind of action."},
                 "status": {"type": "string", "enum": list(readonly.STATUSES),
                            "description": "Restrict to one outcome."},
+                "blocked_by": {
+                    "type": "string", "enum": list(readonly.BLOCKED_BY),
+                    "description": "Restrict to calls the runtime refused, by "
+                                   "who refused them: 'rule' for a hook or "
+                                   "permission rule (the reason is on the "
+                                   "row's error, and the fix is in a file), "
+                                   "'user' for a decline at the prompt. Calls "
+                                   "that simply never completed carry "
+                                   "neither."},
                 "order": {"type": "string",
                           "enum": ["bytes", "duration_ms", "at"],
                           "description": "Sort by reply size (default), time "
@@ -238,7 +276,12 @@ TOOLS: list[dict[str, Any]] = [
                                          f"{readonly.CALLS_DEFAULT_LIMIT}, "
                                          f"capped at {readonly.MAX_LIMIT}). "
                                          f"Small on purpose: this is a "
-                                         f"drill-down, not a timeline."},
+                                         f"drill-down, not a timeline. Raising "
+                                         f"it is the wrong move on a reply that "
+                                         f"came back truncated — rows here are "
+                                         f"whole shell commands, so a few "
+                                         f"hundred of them hit the reply "
+                                         f"ceiling and get cut. Filter instead."},
             },
         },
     },
@@ -250,7 +293,12 @@ TOOLS: list[dict[str, Any]] = [
                        "failure was actually recovered from. A fix in a later "
                        "session gives the two endpoints only: the work between "
                        "them belongs to two sessions and threading it into one "
-                       "list by clock time would not be a reading of anything.",
+                       "list by clock time would not be a reading of anything. "
+                       "Takes ANY action id, not only a failed one: it is also "
+                       "the way to read one call's arguments in full, since "
+                       "xenia_calls shortens them to keep its rows scannable "
+                       "and a recovery series is simply absent when there was "
+                       "nothing to recover from.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -265,6 +313,80 @@ TOOLS: list[dict[str, Any]] = [
 
 def _scrub(payload: Any) -> Any:
     return json.loads(redact.redact(json.dumps(payload, default=str)))
+
+
+def _compact(payload: Any) -> str:
+    return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+#: Where each tool keeps the list that makes a reply big. One per reply.
+REPLY_ROWS = ("rows", "calls", "series")
+
+TRUNCATION_ADVICE = (
+    "Rows are ordered most-significant first, so this is the top of the answer "
+    "rather than a slice out of the middle of it. Narrow the query instead of "
+    "raising 'limit': a filter — signature, tool, session, status, since — "
+    "returns a whole answer, where a bigger limit returns one the client "
+    "discards entirely."
+)
+
+
+def _fit(payload: Any, budget: int) -> Any:
+    """Drop rows off the end of a reply until it serialises within `budget`.
+
+    A reply over the client's ceiling is not truncated by the client, it is
+    thrown away, and the agent pays for the query and learns nothing. Every
+    failure on xenia's own record is that: replies of 57k, 92k and 106k
+    characters, each inside its row limit and each discarded whole. A short
+    answer that says it is short beats a complete one that never arrives.
+
+    The tail is the cheapest thing to lose. Every view that can produce a reply
+    this big already orders it worst-, heaviest- or latest-first, so the rows
+    that survive are the ones the question was about.
+    """
+    if not isinstance(payload, dict) or len(_compact(payload)) <= budget:
+        return payload
+    key = next((k for k in REPLY_ROWS
+                if isinstance(payload.get(k), list) and payload[k]), None)
+    if key is None:
+        return payload
+
+    rows = payload[key]
+    # Largest prefix of rows that still fits, once the note explaining the cut
+    # is itself accounted for.
+    lo, hi = 0, len(rows)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(_compact(_trim(payload, key, rows, mid))) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return _trim(payload, key, rows, lo)
+
+
+def _trim(payload: dict[str, Any], key: str, rows: list[Any],
+          kept: int) -> dict[str, Any]:
+    out = dict(payload)
+    out[key] = rows[:kept]
+    out["truncated"] = {
+        "rows_returned": kept,
+        "rows_dropped": len(rows) - kept,
+        "reason": f"the full reply exceeded the {config.REPLY_LIMIT} character "
+                  f"ceiling on a single answer and would have been discarded "
+                  f"by the client rather than shortened",
+        "advice": TRUNCATION_ADVICE,
+    }
+    # The tasks view carries one copy of each instruction its rows sat under.
+    # Dropping rows can orphan those, and an instruction nothing now refers to
+    # is the most expensive kind of dead weight — it is whole prompt text.
+    if isinstance(out.get("instructions"), dict):
+        live = {str(r.get("goal_id")) for r in out[key]
+                if isinstance(r, dict) and r.get("goal_id") is not None}
+        out["instructions"] = {k: v for k, v in out["instructions"].items()
+                               if k in live}
+        if not out["instructions"]:
+            del out["instructions"]
+    return out
 
 
 def _one_of(name: str, value: Any, allowed) -> Any:
@@ -288,6 +410,23 @@ def _check_params(view: str, args: dict[str, Any]) -> None:
         raise KeyError(f"view '{view}' does not read " + ", ".join(strays))
 
 
+def _lift(rows: list[dict[str, Any]], key: str, field: str) -> dict[str, Any]:
+    """Move a field that repeats identically down the rows into a lookup.
+
+    Every task under one instruction carries the same instruction. Twenty rows
+    of one job spent three quarters of the reply restating the sentence that
+    'goal_id' already points at. The text is still here, once per instruction
+    rather than once per row, and the rows still say which one they sat under.
+    """
+    lifted: dict[str, Any] = {}
+    for row in rows:
+        text = row.pop(field, None)
+        ident = row.get(key)
+        if text is not None and ident is not None:
+            lifted[str(ident)] = text
+    return lifted
+
+
 def _report(conn, args: dict[str, Any]) -> Any:
     view = _one_of("view", args.get("view"), VIEWS)
     if view is None:
@@ -298,12 +437,18 @@ def _report(conn, args: dict[str, Any]) -> Any:
     limit = int(args.get("limit") or readonly.DEFAULT_LIMIT)
 
     if view == "tasks":
-        return {"view": view, "rows": readonly.tasks(
+        rows = readonly.tasks(
             conn, since=since, repo=repo,
             status=_one_of("status", args.get("status"), readonly.TASK_STATUSES),
             source=_one_of("source", args.get("source"), readonly.TASK_SOURCES),
             agent=args.get("agent"), search=args.get("search"),
-            overstated_only=bool(args.get("overstated_only")), limit=limit)}
+            overstated_only=bool(args.get("overstated_only")), limit=limit)
+        out: dict[str, Any] = {"view": view}
+        under = _lift(rows, "goal_id", "goal_summary")
+        if under:
+            out["instructions"] = under
+        out["rows"] = rows
+        return out
 
     if view == "instructions":
         return {"view": view, "rows": readonly.goals(
@@ -326,6 +471,8 @@ def _report(conn, args: dict[str, Any]) -> Any:
                     tool=args.get("tool"), via=args.get("via"),
                     channel=args.get("channel"), session=args.get("session"),
                     within_minutes=window,
+                    order=_one_of("order", args.get("order"),
+                                  readonly.REPEAT_ORDERS) or "repeats",
                     min_repeats=int(args.get("min_count") or 1), limit=limit)}
 
     if view == "tools":
@@ -372,6 +519,8 @@ def _dispatch(name: str, args: dict[str, Any], db_path=None) -> Any:
                 via=args.get("via"), session=args.get("session"),
                 signature=args.get("signature"), kind=args.get("kind"),
                 status=args.get("status"),
+                blocked_by=_one_of("blocked_by", args.get("blocked_by"),
+                                   readonly.BLOCKED_BY),
                 order=args.get("order") or "bytes",
                 descending=bool(args.get("descending", True)),
                 limit=int(args.get("limit") or readonly.CALLS_DEFAULT_LIMIT),
@@ -420,7 +569,14 @@ class Server:
                         "Every view groups. xenia_calls is the drill-down to "
                         "the individual calls behind one of their rows, and "
                         "xenia_trace takes an action id and shows how that "
-                        "failure was recovered from."
+                        "failure was recovered from.\n"
+                        "\n"
+                        "Replies are capped at "
+                        f"{config.REPLY_LIMIT} characters and rows past that "
+                        "are dropped, with a 'truncated' key saying how many "
+                        "and why — a cut answer beats one the client discards "
+                        "whole. If you see it, narrow the query rather than "
+                        "raising 'limit'."
                     ) + self._retirement_notice(),
                 })
 
@@ -437,10 +593,14 @@ class Server:
                 if not isinstance(args, dict):
                     return _err(msg_id, -32602, "arguments must be an object")
 
-                payload = _scrub(_dispatch(name, args, self.db_path))
+                payload = _fit(_scrub(_dispatch(name, args, self.db_path)),
+                               config.REPLY_LIMIT)
+                # Compact, not indented. The spec wants the serialised JSON
+                # alongside the structured copy, so whatever this costs the
+                # client pays twice; indentation bought nothing for either
+                # reader and 26% more of both.
                 return _ok(msg_id, {
-                    "content": [{"type": "text",
-                                 "text": json.dumps(payload, indent=2, default=str)}],
+                    "content": [{"type": "text", "text": _compact(payload)}],
                     "structuredContent": payload,
                     "isError": False,
                 })

@@ -164,7 +164,8 @@ def test_a_prompt_opens_a_goal_that_later_actions_attach_to(conn, clock):
     assert one(conn, "SELECT goal_id FROM action")["goal_id"] == goal["id"]
 
 
-def test_a_call_with_no_completion_is_recorded_as_blocked(conn, clock):
+def test_a_call_with_no_completion_is_still_settled(conn, clock):
+    """Nothing is left 'started' once the session that made it has ended."""
     clock()
     ingest.record(conn, pre("Bash", {"command": "ssh monitoring-prod-1 uptime"}))
     clock()
@@ -172,7 +173,8 @@ def test_a_call_with_no_completion_is_recorded_as_blocked(conn, clock):
                          "cwd": CORE})
 
     action = one(conn, "SELECT * FROM action")
-    assert action["status"] == "blocked"
+    assert action["status"] == "unanswered"
+    assert action["ended_at"] is not None
 
 
 def test_a_call_the_agent_worked_around_reads_as_a_denial(conn, clock):
@@ -200,7 +202,8 @@ def test_a_call_still_in_flight_at_the_end_is_not_called_a_denial(conn, clock):
                          "cwd": CORE})
 
     action = one(conn, "SELECT * FROM action")
-    assert action["status"] == "blocked"
+    assert action["status"] == "unanswered", \
+        "not 'blocked' either — nothing refused it, so nothing here is a failure"
     assert action["error"].startswith("outstanding —")
 
 
@@ -310,6 +313,110 @@ def test_agent_is_detected_from_the_transcript_path(conn, clock):
         "transcript_path": "/home/agent/.codex/sessions/abc.jsonl",
     })
     assert one(conn, "SELECT agent FROM session")["agent"] == "codex"
+
+
+def test_the_transcript_beats_an_inherited_environment(conn, clock, monkeypatch):
+    # codex started from a Claude Code shell inherits CLAUDECODE=1. The
+    # transcript path is this session's own; the variable is the parent's.
+    monkeypatch.setenv("CLAUDECODE", "1")
+    clock()
+    ingest.record(conn, {
+        "hook_event_name": "SessionStart", "session_id": "cx2", "cwd": OPS,
+        "transcript_path": "/home/agent/.codex/sessions/abc.jsonl",
+    })
+
+    assert one(conn, "SELECT agent FROM session")["agent"] == "codex"
+    assert one(conn, "SELECT agent FROM event")["agent"] == "codex"
+
+
+def test_a_session_named_wrongly_is_put_right_by_a_later_event(conn, clock,
+                                                              monkeypatch):
+    monkeypatch.setenv("CLAUDECODE", "1")
+    clock()
+    ingest.record(conn, {"hook_event_name": "SessionStart",
+                         "session_id": "cx3", "cwd": OPS})
+    assert one(conn, "SELECT agent FROM session")["agent"] == "claude"
+
+    clock()
+    ingest.record(conn, dict(
+        pre("Bash", {"command": "ls"}, session="cx3", cwd=OPS),
+        transcript_path="/home/agent/.codex/sessions/abc.jsonl"))
+
+    # Every view joins through the session to name the agent, so leaving this
+    # would report the whole run as Claude's work.
+    assert one(conn, "SELECT agent FROM session")["agent"] == "codex"
+
+
+def test_an_inline_script_is_not_the_identity_of_the_work(conn, clock):
+    body = "import pathlib\nsrc = pathlib.Path('/tmp/a').read_text()\nprint(src)\n"
+    clock()
+    ingest.record(conn, pre("Bash", {"command": f"python3 -c '{body}'"}))
+
+    signature = one(conn, "SELECT signature FROM action")["signature"]
+    assert "pathlib" not in signature, "the program is not the group it belongs to"
+    assert signature.startswith("exec:python3:-c ")
+    assert len(signature) < 40
+
+
+def test_a_script_fed_in_as_a_heredoc_is_named_the_same_way(conn, clock):
+    clock()
+    ingest.record(conn, pre("Bash", {"command":
+        "python3 - <<'PY'\nimport pathlib\nprint(pathlib.Path('x'))\nPY"}))
+
+    action = one(conn, "SELECT signature, target, kind FROM action")
+    assert action["signature"].startswith("exec:python3:-c ")
+    assert "pathlib" not in action["signature"]
+    assert action["target"] == "python3 import pathlib", "the label still reads"
+    assert action["kind"] == "exec"
+
+
+def test_two_scripts_in_heredocs_are_two_kinds_of_work(conn, clock):
+    for program in ("print(1)", "print(2)"):
+        clock()
+        ingest.record(conn, pre("Bash", {
+            "command": f"python3 - <<'PY'\n{program}\nPY"}))
+
+    sigs = [r["signature"] for r in conn.execute(
+        "SELECT signature FROM action ORDER BY id")]
+    assert sigs[0] != sigs[1], "not every heredoc script is the same work"
+
+
+def test_two_different_inline_scripts_are_two_kinds_of_work(conn, clock):
+    for program in ("print(1)", "print(2)"):
+        clock()
+        ingest.record(conn, pre("Bash", {"command": f"python3 -c '{program}'"}))
+
+    sigs = [r["signature"] for r in conn.execute(
+        "SELECT signature FROM action ORDER BY id")]
+    assert sigs[0] != sigs[1]
+
+
+def test_the_same_inline_script_twice_is_one_kind_of_work(conn, clock):
+    for _ in range(2):
+        clock()
+        ingest.record(conn, pre("Bash", {"command": "python3 -c 'print(1)'"}))
+
+    sigs = {r["signature"] for r in conn.execute("SELECT signature FROM action")}
+    assert len(sigs) == 1
+
+
+def test_a_greater_than_inside_a_quoted_program_is_not_a_file_write(conn, clock):
+    clock()
+    ingest.record(conn, pre("Bash", {"command":
+        "python3 -c 'for n in xs:\n    if n > 3: print(\"%s -> big\" % n)\n'"}))
+
+    action = one(conn, "SELECT kind FROM action")
+    assert action["kind"] == "exec"
+    assert conn.execute("SELECT COUNT(*) AS n FROM fs_change").fetchone()["n"] == 0
+
+
+def test_a_real_redirect_beside_a_quoted_one_is_still_found(conn, clock):
+    clock()
+    ingest.record(conn, pre("Bash", {"command":
+        "echo 'a > b' > /tmp/out.txt"}))
+
+    paths = [r["path"] for r in conn.execute("SELECT path FROM fs_change")]
+    assert paths == ["/tmp/out.txt"]
 
 
 @pytest.mark.parametrize(
@@ -502,6 +609,224 @@ def test_a_reply_is_measured_before_redaction(conn, clock):
     assert one(conn, "SELECT result_bytes FROM action")["result_bytes"] == raw
 
 
+def test_an_edit_reply_is_measured_without_the_file_it_echoes_back(conn, clock):
+    """result_bytes is what floods a context, not what the hook was handed.
+
+    Claude Code returns the whole pre-edit file as 'originalFile'. Sizing it
+    made a one-line change to a big file look like a huge reply — the live
+    record had 405 KB against a 383 KB src/main.ts whose patch was ~1 KB.
+    """
+    path = f"{CORE}/big.ts"
+    args = {"file_path": path, "old_string": "a", "new_string": "b"}
+    whole_file = "x" * 100_000
+
+    clock()
+    ingest.record(conn, pre("Edit", args))
+    clock()
+    ingest.record(conn, post("Edit", args, response={
+        "filePath": path, "oldString": "a", "newString": "b",
+        "structuredPatch": [{"lines": ["-a", "+b"]}],
+        "originalFile": whole_file,
+    }))
+
+    measured = one(conn, "SELECT result_bytes FROM action")["result_bytes"]
+    assert measured < 200, "the echoed file is not context the agent paid for"
+
+
+def _transcript(tmp_path, *records) -> str:
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return str(path)
+
+
+def _denial(use_id: str, kind: str, result: str) -> dict:
+    """One transcript record of the shape the runtime writes for a refusal."""
+    return {
+        "type": "user",
+        "toolDenialKind": kind,
+        "toolUseResult": result,
+        "message": {"content": [
+            {"type": "tool_result", "tool_use_id": use_id, "is_error": True,
+             "content": result},
+        ]},
+    }
+
+
+def test_a_refused_call_records_who_refused_it(conn, clock, tmp_path):
+    """Three refusals need three different fixes, so they are not one status.
+
+    No PostToolUse fires for a refused call, so from inside the hook a rule,
+    a person and a session that just ended all look identical. The runtime
+    writes the difference to the transcript and nowhere else.
+    """
+    hooked = {"command": "ssh prod-1 uptime"}
+    declined = {"command": "rm -rf /tmp/scratch"}
+    vanished = {"command": "sleep 600"}
+
+    for use_id, args in (("toolu_rule", hooked), ("toolu_user", declined),
+                         ("toolu_none", vanished)):
+        clock()
+        ingest.record(conn, dict(pre("Bash", args), tool_use_id=use_id))
+
+    clock()
+    ingest.record(conn, {
+        "hook_event_name": "Stop", "session_id": "s1", "cwd": CORE,
+        "transcript_path": _transcript(
+            tmp_path,
+            _denial("toolu_rule", "permission-rule",
+                    "Error: Direct `ssh` from the Bash tool is disabled."),
+            _denial("toolu_user", "user-rejected", "User rejected tool use"),
+        ),
+    })
+
+    rows = {r["detail"]: r for r in conn.execute(
+        "SELECT detail, status, blocked_by, error FROM action")}
+    rule = rows["ssh prod-1 uptime"]
+    user = rows["rm -rf /tmp/scratch"]
+    gone = rows["sleep 600"]
+
+    assert (rule["status"], rule["blocked_by"]) == ("blocked", "rule")
+    assert "is disabled" in rule["error"], "a rule's reason names the fix"
+    assert (user["status"], user["blocked_by"]) == ("blocked", "user")
+    assert gone["blocked_by"] is None, "nothing explained this one; do not guess"
+
+
+def _result(use_id: str, text: str, *, is_error: bool = False) -> dict:
+    """A transcript record for a call that ran, with no denial attached."""
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": use_id, "is_error": is_error,
+         "content": text},
+    ]}}
+
+
+def test_a_call_that_merely_failed_is_not_reported_as_a_denial(conn, clock,
+                                                               tmp_path):
+    """A missing completion event does not mean somebody refused the call.
+
+    No PostToolUse fires for plenty of ordinary failures, and calling them
+    all denials made a hundred rows say 'a PreToolUse hook refused this one'
+    over what were really `Exit code 1` and a screenshot timeout. Six in a
+    hundred were refusals. The transcript has the real message.
+    """
+    broke = {"command": "python3 -c 'raise SystemExit(1)'"}
+    worked = {"command": "echo fine"}
+
+    for use_id, args in (("toolu_broke", broke), ("toolu_worked", worked)):
+        clock()
+        ingest.record(conn, dict(pre("Bash", args), tool_use_id=use_id))
+
+    clock()
+    ingest.record(conn, {
+        "hook_event_name": "Stop", "session_id": "s1", "cwd": CORE,
+        "transcript_path": _transcript(
+            tmp_path,
+            _result("toolu_broke", "Exit code 1\nTraceback (most recent call "
+                                   "last):\n  File \"<string>\"", is_error=True),
+            _result("toolu_worked", "fine"),
+        ),
+    })
+
+    rows = {r["detail"]: r for r in conn.execute(
+        "SELECT detail, status, blocked_by, error FROM action")}
+    broken = rows["python3 -c 'raise SystemExit(1)'"]
+    assert (broken["status"], broken["blocked_by"]) == ("error", None)
+    assert "Traceback" in broken["error"], "the real message, not a guess"
+
+    fine = rows["echo fine"]
+    assert fine["status"] == "ok", "it ran and returned; nothing refused it"
+
+
+def test_a_real_completion_event_is_never_overwritten(conn, clock, tmp_path):
+    """The transcript is the fallback, not the authority.
+
+    A call that got its PostToolUse already has timings and a reply size this
+    cannot supply, so it is left exactly as recorded.
+    """
+    args = {"command": "echo hello"}
+    clock()
+    ingest.record(conn, dict(pre("Bash", args), tool_use_id="toolu_done"))
+    clock()
+    ingest.record(conn, dict(post("Bash", args, response={"stdout": "hello"}),
+                             tool_use_id="toolu_done"))
+
+    clock()
+    ingest.record(conn, {
+        "hook_event_name": "Stop", "session_id": "s1", "cwd": CORE,
+        "transcript_path": _transcript(
+            tmp_path, _result("toolu_done", "nonsense", is_error=True)),
+    })
+
+    row = one(conn, "SELECT status, error, result_bytes FROM action")
+    assert (row["status"], row["error"]) == ("ok", None)
+    assert row["result_bytes"] is not None
+
+
+def test_a_call_nobody_answered_is_not_scored_as_a_failure(conn, clock):
+    """An approval prompt still open at exit is not breakage.
+
+    It used to land as 'blocked', which put a row in every failures query
+    that no fix would ever clear.
+    """
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "sleep 600"}))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE})
+
+    row = one(conn, "SELECT status, error FROM action")
+    assert row["status"] == "unanswered"
+    assert "outstanding" in row["error"]
+
+
+def test_a_refusal_is_explained_after_the_fact_too(conn, clock, tmp_path):
+    """Classifying only new refusals leaves every row an audit reads null.
+
+    A session already closed has its blocked calls settled by inference. The
+    transcript still says who refused them, so a later pass can improve the
+    row it could not explain at the time.
+    """
+    args = {"command": "ssh prod-1 uptime"}
+    clock()
+    ingest.record(conn, dict(pre("Bash", args), tool_use_id="toolu_late"))
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "echo carried on"}))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "echo carried on"}))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE})
+
+    inferred = one(conn, "SELECT status, blocked_by, error FROM action "
+                         "WHERE detail = 'ssh prod-1 uptime'")
+    assert (inferred["status"], inferred["blocked_by"]) == ("blocked", None)
+    assert "denied" in inferred["error"], "inference is all it had"
+
+    settled = ingest.apply_outcomes(conn, 1, _transcript(
+        tmp_path,
+        _denial("toolu_late", "permission-rule",
+                "Error: Direct `ssh` from the Bash tool is disabled."),
+    ))
+
+    after = one(conn, "SELECT status, blocked_by, error FROM action "
+                      "WHERE detail = 'ssh prod-1 uptime'")
+    assert settled == 1
+    assert (after["status"], after["blocked_by"]) == ("blocked", "rule")
+    assert "is disabled" in after["error"], "the placeholder gave way"
+
+
+def test_a_missing_transcript_leaves_the_inferred_answer_alone(conn, clock):
+    clock()
+    ingest.record(conn, dict(pre("Bash", {"command": "ssh prod-1 uptime"}),
+                             tool_use_id="toolu_x"))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE, "transcript_path": "/no/such/file.jsonl"})
+
+    row = one(conn, "SELECT status, blocked_by, error FROM action")
+    assert row["status"] == "unanswered" and row["blocked_by"] is None
+    assert "outstanding" in row["error"]
+
+
 def test_an_absent_reply_is_not_zero_bytes(conn, clock):
     clock()
     ingest.record(conn, pre("Bash", {"command": "ls"}))
@@ -521,6 +846,19 @@ def test_a_wrapper_spawn_is_attributed_to_its_broker_end_to_end(conn, clock):
     remote = one(conn, "SELECT via, channel FROM remote_call")
     assert remote["via"] == "acme-gitlab"
     assert remote["channel"] == classify.MCP_SPAWN_CHANNEL
+
+
+def test_a_spawn_that_also_writes_a_file_is_still_a_spawn(conn, clock):
+    clock()
+    ingest.record(conn, pre("Bash", {"command":
+        "make install && printf '%s\\n' '{\"jsonrpc\":\"2.0\"}' "
+        "| ~/.local/bin/acme-gitlab-mcp > /tmp/reply.json"}))
+
+    action = one(conn, "SELECT kind, signature FROM action")
+    assert action["signature"] == "remote:mcp_spawn:stdio"
+    assert action["kind"] == "exec", "the scratch file is not what the call was"
+    paths = [r["path"] for r in conn.execute("SELECT path FROM fs_change")]
+    assert paths == ["/tmp/reply.json"], "and it is still recorded"
 
 
 def test_a_compound_command_is_not_named_after_cd(conn, clock):
@@ -548,10 +886,13 @@ def test_a_fragment_of_shell_syntax_is_never_a_task_name(conn, clock):
 
 
 def test_a_target_that_only_restates_the_tool_is_dropped(conn, clock):
+    # Separate sessions: within one, consecutive unnamed work is a single task,
+    # and only the call that opened it gets to name it.
     clock()
-    ingest.record(conn, pre("ToolSearch", {"query": "select:Read"}))
+    ingest.record(conn, pre("ToolSearch", {"query": "select:Read"}, session="s1"))
     clock()
-    ingest.record(conn, pre("mcp__xenia__xenia_summary", {"since": "24h"}))
+    ingest.record(conn, pre("mcp__xenia__xenia_summary", {"since": "24h"},
+                            session="s2"))
 
     labels = {r["label"] for r in conn.execute("SELECT label FROM task")}
     assert "ToolSearch" in labels
@@ -615,13 +956,12 @@ def test_a_tool_that_is_not_a_shell_keeps_its_name(conn, clock):
     assert one(conn, "SELECT label FROM task")["label"] == "Edit CLAUDE.md"
 
 
-def test_two_commands_sharing_a_cd_do_not_share_a_task(conn, clock):
+def test_two_commands_sharing_a_cd_are_not_the_same_work(conn, clock):
     clock()
     ingest.record(conn, pre("Bash", {"command": "cd /srv && pytest -q"}))
     clock()
     ingest.record(conn, pre("Bash", {"command": "cd /srv && ruff check ."}))
 
     sigs = [r["signature"] for r in conn.execute("SELECT signature FROM action ORDER BY id")]
-    assert sigs[0] != sigs[1]
-    labels = {r["label"] for r in conn.execute("SELECT label FROM task")}
-    assert labels == {"pytest", "ruff check"}
+    assert sigs[0] != sigs[1], "the cd is not what either command is"
+    assert "pytest" in sigs[0] and "ruff" in sigs[1]

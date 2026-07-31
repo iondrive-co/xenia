@@ -88,6 +88,28 @@ def test_every_view_is_offered_and_answers(server):
         assert isinstance(result["structuredContent"]["rows"], list)
 
 
+def test_the_instruction_is_carried_once_not_on_every_task_row(conn, clock,
+                                                               tmp_path):
+    clock()
+    prompt = "add a byte budget to the loki renderer, and keep the tests green"
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit",
+                         "session_id": "s1", "cwd": CORE, "prompt": prompt})
+    for name in ("alpha", "beta", "gamma"):
+        clock()
+        ingest.record(conn, pre("Bash", {"command": f"./{name}.sh",
+                                         "description": f"run {name}"}))
+    conn.commit()
+
+    payload = call(mcp.Server(tmp_path / "audit.db"),
+                   "xenia_report", {"view": "tasks"})["structuredContent"]
+
+    assert len(payload["rows"]) == 3
+    assert not any("goal_summary" in row for row in payload["rows"])
+    assert list(payload["instructions"].values()) == [prompt]
+    goal = next(iter(payload["instructions"]))
+    assert {str(row["goal_id"]) for row in payload["rows"]} == {goal}
+
+
 def test_a_view_is_required_and_must_be_one_of_the_six(server):
     for arguments in ({}, {"view": "everything"}):
         reply = server.handle({
@@ -197,3 +219,64 @@ def test_limits_are_capped_regardless_of_what_is_asked_for(server):
     rows = call(server, "xenia_report",
                 {"view": "tasks", "limit": 999999})["structuredContent"]["rows"]
     assert len(rows) <= 500
+
+
+def test_a_reply_over_the_ceiling_is_cut_rather_than_discarded(conn, clock,
+                                                               tmp_path,
+                                                               monkeypatch):
+    # Rows carrying whole shell commands: a few hundred of them is past any
+    # client's ceiling, and the client's answer to that is to drop the reply
+    # whole rather than shorten it.
+    for i in range(300):
+        clock()
+        ingest.record(conn, pre("Bash", {"command": f"echo {'x' * 400} {i}"}))
+    conn.commit()
+    monkeypatch.setattr(mcp.config, "REPLY_LIMIT", 8000)
+
+    result = call(mcp.Server(tmp_path / "audit.db"), "xenia_calls",
+                  {"tool": "Bash", "limit": 300})
+    payload = result["structuredContent"]
+
+    assert len(mcp._compact(payload)) <= 8000
+    assert 0 < len(payload["calls"]) < 300
+    assert payload["truncated"]["rows_returned"] == len(payload["calls"])
+    assert payload["truncated"]["rows_dropped"] == 300 - len(payload["calls"])
+    # The text copy is the same answer, so it has to have been cut too.
+    assert json.loads(result["content"][0]["text"]) == payload
+
+
+def test_a_reply_within_the_ceiling_says_nothing_about_truncation(server):
+    for view in mcp.VIEWS:
+        payload = call(server, "xenia_report", {"view": view})["structuredContent"]
+        assert "truncated" not in payload
+    assert "truncated" not in call(server, "xenia_calls")["structuredContent"]
+
+
+def test_trimming_tasks_drops_the_instructions_left_with_no_rows(conn, clock,
+                                                                 tmp_path,
+                                                                 monkeypatch):
+    for i in range(60):
+        clock()
+        ingest.record(conn, {
+            "hook_event_name": "UserPromptSubmit", "session_id": f"s{i}",
+            "cwd": CORE, "prompt": f"instruction number {i} " + "y" * 600,
+        })
+        clock()
+        ingest.record(conn, pre("Bash", {"command": f"echo {i}"},
+                                session=f"s{i}"))
+    conn.commit()
+    monkeypatch.setattr(mcp.config, "REPLY_LIMIT", 6000)
+
+    payload = call(mcp.Server(tmp_path / "audit.db"), "xenia_report",
+                   {"view": "tasks", "limit": 200})["structuredContent"]
+
+    assert payload["truncated"]["rows_dropped"] > 0
+    kept = {str(r["goal_id"]) for r in payload["rows"] if r.get("goal_id")}
+    assert set(payload.get("instructions", {})) <= kept
+    assert len(mcp._compact(payload)) <= 6000
+
+
+def test_the_reply_is_not_padded_with_indentation(server):
+    text = call(server, "xenia_report", {"view": "tools"})["content"][0]["text"]
+    assert "\n" not in text
+    assert ": " not in text.replace('": "', '":"')

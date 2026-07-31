@@ -280,7 +280,12 @@ def _replay(conn: sqlite3.Connection, event_id: int, payload: dict) -> None:
     elif hook == "PostToolUse":
         ingest._close_action(conn, event_id, session_id, payload)
     elif hook in ("Stop", "SubagentStop", "SessionEnd"):
-        ingest.close_session(conn, session_id, reason=hook.lower())
+        # The ledger stores the payload, so a rebuild can re-read the
+        # transcript and recover denial kinds for history — if the transcript
+        # is still on disk. When it is gone, outcomes_in() finds nothing and
+        # the row falls back to the inferred 'denied', as it did before.
+        ingest.close_session(conn, session_id, reason=hook.lower(),
+                             transcript=payload.get("transcript_path"))
 
 
 def _plus_hours(iso: str | None, hours: int) -> str | None:

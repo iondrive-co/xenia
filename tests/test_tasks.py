@@ -386,18 +386,24 @@ def test_friction_groups_repeated_failures(conn, clock, tmp_path):
         ro.close()
 
 
-def test_a_shape_derived_task_does_not_adopt_a_different_shape(conn, clock):
+def test_a_run_of_unnamed_work_is_one_task_whatever_shape_the_calls_are(conn, clock):
     run(conn, clock,
-        pre("ToolSearch", {"query": "select:Read"}),
-        post("ToolSearch", {"query": "select:Read"}),
-        pre("mcp__xenia__xenia_summary", {"since": "24h"}),
-        post("mcp__xenia__xenia_summary", {"since": "24h"}))
+        {"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+         "cwd": CORE, "prompt": "add a byte budget to the renderer"},
+        pre("Read", {"file_path": f"{CORE}/CLAUDE.md"}),
+        post("Read", {"file_path": f"{CORE}/CLAUDE.md"}),
+        pre("Grep", {"pattern": "budget"}), post("Grep", {"pattern": "budget"}),
+        pre("Bash", {"command": "go vet ./..."}),
+        post("Bash", {"command": "go vet ./..."}),
+        pre("Edit", {"file_path": f"{CORE}/render.go",
+                     "old_string": "a", "new_string": "b"}),
+        post("Edit", {"file_path": f"{CORE}/render.go",
+                      "old_string": "a", "new_string": "b"}))
     stop(conn, clock)
 
-    labels = {r["label"] for r in conn.execute("SELECT label FROM task")}
-    assert labels == {"ToolSearch", "mcp__xenia__xenia_summary"}
-    assert all(r["actions"] == 1 for r in conn.execute(
-        "SELECT actions FROM v_task_outcomes"))
+    rows = list(conn.execute("SELECT label, source, actions FROM v_task_outcomes"))
+    assert len(rows) == 1, "one job, not one task per call"
+    assert (rows[0]["source"], rows[0]["actions"]) == ("signature", 4)
 
 
 def test_work_under_a_task_the_agent_named_is_still_inherited(conn, clock):

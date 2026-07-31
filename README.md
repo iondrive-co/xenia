@@ -1,6 +1,6 @@
 # xenia
 
-A local MCP and tray icon for keeping track of how well agents are acheiving their goals, and what is going wrong. Install and run on linux or mac with
+Xenia helps agents work better on your computer by providing a local MCP for them to check for repeated mistakes, and a tray icon with an overview page for you. Install and run on linux or mac with:
 ```bash
 ./bin/xenia
 ```
@@ -29,6 +29,9 @@ The actions between an `action_id` failure and the fix.
 
 ### Arguments
 
-`since` (`24h`, `7d`, or a date), `repo` — work outside any checkout is filed under `general` — and `limit` apply to every view. Where `tool`, `via`, `channel`, `session` and `signature` are accepted they match exactly or as a glob, so one `via: "acme-*"` covers every call through a site's brokers, and a `signature` from any view drills straight into the calls behind that row.
+`since` (`24h`, `7d`, or a date)
+`repo` (work outside any checkout is filed under `general`)
+`limit` applies to every view. 
+Where `tool`, `via`, `channel`, `session` and `signature` are accepted they match exactly or as a glob (`via: "acme-*"`), and a `signature` from any view drills straight into the calls behind that row.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).

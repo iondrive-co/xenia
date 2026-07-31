@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -192,6 +193,81 @@ def test_a_heredoc_does_not_dominate_the_friction_report(conn, clock, tmp_path):
         ro.close()
 
 
+def test_friction_names_the_repos_a_fix_would_land_in(conn, clock, tmp_path):
+    """A count sends the reader back for another query before they can act."""
+    args = {"command": "docker exec services psql -c 'select 1'"}
+    for cwd in (CORE, OPS, CORE):
+        clock()
+        ingest.record(conn, pre("Bash", args, session="s-" + cwd[-4:], cwd=cwd))
+        clock()
+        ingest.record(conn, post("Bash", args, session="s-" + cwd[-4:], cwd=cwd,
+                                 ok=False))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        row = readonly.friction(ro)[0]
+        assert row["failures"] == 3
+        assert sorted(row["repos"].split(",")) == ["core", "ops"]
+    finally:
+        ro.close()
+
+
+def test_friction_says_whether_a_failure_is_new(conn, clock, tmp_path,
+                                                 monkeypatch):
+    """8 failures against 0 last week is a breakage; against 12 it is mending."""
+    args = {"command": "curl https://flaky.test"}
+    for day, count in (("20", 1), ("27", 3)):
+        for i in range(count):
+            monkeypatch.setenv("XENIA_FAKE_NOW", f"2026-07-{day}T09:0{i}:00.000+00:00")
+            ingest.record(conn, pre("Bash", args))
+            ingest.record(conn, post("Bash", args, ok=False))
+    conn.commit()
+    monkeypatch.delenv("XENIA_FAKE_NOW")
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        # A window reaching back to the 24th: three failures inside it, and the
+        # one on the 20th sits in the equally long window before it.
+        row = readonly.friction(ro, since="2026-07-24")[0]
+        assert (row["failures"], row["previously"]) == (3, 1)
+        assert readonly.friction(ro)[0]["previously"] is None, \
+            "over all time there is no window before"
+    finally:
+        ro.close()
+
+
+def test_friction_splits_a_refusal_by_who_refused_it(conn, clock, tmp_path):
+    args = {"command": "ssh prod-1 uptime"}
+    for use_id in ("toolu_a", "toolu_b"):
+        clock()
+        ingest.record(conn, dict(pre("Bash", args), tool_use_id=use_id))
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("\n".join(json.dumps({
+        "toolDenialKind": kind, "toolUseResult": text,
+        "message": {"content": [{"type": "tool_result", "tool_use_id": use_id}]},
+    }) for use_id, kind, text in (
+        ("toolu_a", "permission-rule", "Error: `ssh` from Bash is disabled."),
+        ("toolu_b", "user-rejected", "User rejected tool use"),
+    )) + "\n")
+
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE, "transcript_path": str(transcript)})
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        row = readonly.friction(ro)[0]
+        assert (row["refused_by_rule"], row["declined_by_user"]) == (1, 1)
+        refused = readonly.calls(ro, blocked_by="rule")
+        assert len(refused) == 1 and refused[0]["blocked_by"] == "rule"
+        assert "is disabled" in refused[0]["detail"] or refused[0]["status"] == "blocked"
+    finally:
+        ro.close()
+
+
 @pytest.fixture
 def brokered(conn, clock, tmp_path):
     calls = [
@@ -321,6 +397,171 @@ def test_redundancy_finds_repeated_work_that_never_failed(conn, clock, tmp_path)
         assert (row["calls"], row["repeats"]) == (4, 3)
         assert row["distinct_args"] == 1, "the very same call, four times"
         assert row["tool"] == "Read"
+    finally:
+        ro.close()
+
+
+def test_redundancy_costs_the_repeats_in_context_not_in_time(conn, clock,
+                                                              tmp_path):
+    """Redone work is rarely slow; it is expensive because it is re-read.
+
+    Live numbers behind this: 25 repeated edits came to 4.2 seconds, while one
+    re-read source file came to 322 KB of context.
+    """
+    args = {"file_path": f"{CORE}/README.md"}
+    for _ in range(4):
+        clock()
+        ingest.record(conn, pre("Read", args))
+        clock()
+        ingest.record(conn, post("Read", args, response={"content": "x" * 1000}))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        row = readonly.redundancy(ro)[0]
+        assert row["repeats"] == 3
+        # The first read is what the session needed; the other three are what
+        # it paid twice for.
+        assert row["repeated_bytes"] > 3000
+        assert readonly.redundancy(ro, order="nonsense") \
+            == readonly.redundancy(ro, order="repeats")
+    finally:
+        ro.close()
+
+
+def test_redundancy_can_be_ordered_by_what_the_redoing_cost(conn, clock, tmp_path):
+    # Few repeats, huge replies — invisible when the view ranks by count alone.
+    bulky = {"file_path": f"{CORE}/huge.log"}
+    for _ in range(2):
+        clock()
+        ingest.record(conn, pre("Read", bulky))
+        clock()
+        ingest.record(conn, post("Read", bulky, response={"content": "x" * 40_000}))
+
+    slight = {"file_path": f"{CORE}/tiny.txt"}
+    for _ in range(6):
+        clock()
+        ingest.record(conn, pre("Read", slight))
+        clock()
+        ingest.record(conn, post("Read", slight, response={"content": "x"}))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        by_count = readonly.redundancy(ro, order="repeats")
+        by_bytes = readonly.redundancy(ro, order="repeated_bytes")
+        assert by_count[0]["signature"].endswith("tiny.txt")
+        assert by_bytes[0]["signature"].endswith("huge.log"), \
+            "one repeat of a 40 KB reply outweighs five of a 1-byte one"
+    finally:
+        ro.close()
+
+
+def test_redundancy_does_not_count_incremental_edits_to_one_file(conn, clock,
+                                                                  tmp_path):
+    """Editing a file eighteen times is how work gets done, not waste.
+
+    A file edit's detail is only 'Edit <path>', so every edit to one file
+    looked like the same call repeated — burying the genuine repeats under
+    normal incremental editing, and crediting one 383 KB file with 7.1 MB of
+    'repeated' bytes. Different content is different work.
+    """
+    path = f"{CORE}/main.ts"
+    for line in ("const a = 1", "const b = 2", "const c = 3", "const d = 4"):
+        clock()
+        args = {"file_path": path, "old_string": "//", "new_string": line}
+        ingest.record(conn, pre("Edit", args))
+        clock()
+        ingest.record(conn, post("Edit", args))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        assert readonly.redundancy(ro) == [], "four different edits, no repeat"
+    finally:
+        ro.close()
+
+
+def test_redundancy_still_catches_the_same_edit_written_twice(conn, clock,
+                                                              tmp_path):
+    path = f"{CORE}/main.ts"
+    args = {"file_path": path, "old_string": "//", "new_string": "const a = 1"}
+    for _ in range(3):
+        clock()
+        ingest.record(conn, pre("Edit", args))
+        clock()
+        ingest.record(conn, post("Edit", args))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        row = readonly.redundancy(ro)[0]
+        assert (row["calls"], row["repeats"]) == (3, 2)
+        assert row["distinct_args"] == 1, "byte-identical, three times over"
+    finally:
+        ro.close()
+
+
+def test_a_call_nobody_answered_is_not_in_the_failures_view(conn, clock,
+                                                            tmp_path):
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "curl https://broken.test"}))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "curl https://broken.test"},
+                             ok=False))
+    # Last call of the session: the prompt was still open when it ended, so
+    # nothing follows this one and nothing ever answered it.
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "ssh prod-1 uptime"}))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE})
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        signatures = {r["signature"] for r in readonly.friction(ro, min_failures=1)}
+        assert signatures == {"remote:http:broken.test:get"}, \
+            "the error counts; nobody answering a prompt does not"
+
+        stats = readonly.tool_stats(ro)[0]
+        assert (stats["failed"], stats["unanswered"]) == (1, 1)
+        assert stats["failure_rate"] == 0.5, "rated on the one that broke"
+    finally:
+        ro.close()
+
+
+def test_redundancy_does_not_count_a_tool_asked_different_questions(conn, clock,
+                                                                    tmp_path):
+    # One signature, every call carrying different arguments. A query tool used
+    # is not a query tool repeated.
+    for expression in ("up", "rate(errors[5m])", "node_load1", "go_goroutines"):
+        clock()
+        ingest.record(conn, pre("mcp__acme-prom__prom_query", {"query": expression}))
+        clock()
+        ingest.record(conn, post("mcp__acme-prom__prom_query", {"query": expression}))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        assert readonly.redundancy(ro) == []
+    finally:
+        ro.close()
+
+
+def test_redundancy_still_finds_the_one_repeat_among_the_variations(conn, clock,
+                                                                    tmp_path):
+    for expression in ("up", "node_load1", "up"):
+        clock()
+        ingest.record(conn, pre("mcp__acme-prom__prom_query", {"query": expression}))
+        clock()
+        ingest.record(conn, post("mcp__acme-prom__prom_query", {"query": expression}))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        row = readonly.redundancy(ro)[0]
+        assert (row["calls"], row["repeats"], row["distinct_args"]) == (3, 1, 2)
     finally:
         ro.close()
 
@@ -559,6 +800,9 @@ def test_calls_carries_nothing_that_repeats_down_the_rows(ro):
         assert "goal_prompt" not in row
         assert "goal_summary" not in row
         assert "task" not in row
+        # Only ever set on a refused call, so it does not ride along as a null
+        # on every row that completed.
+        assert "blocked_by" not in row or row["status"] == "blocked"
         assert len(str(row["detail"] or "")) <= readonly.CALL_CHARS + 20
 
 

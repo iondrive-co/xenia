@@ -103,6 +103,12 @@ CREATE TABLE IF NOT EXISTS action (
     target          TEXT,
     detail          TEXT,
     status          TEXT    NOT NULL,
+    -- Why a 'blocked' action never completed, when the runtime said so:
+    -- 'user' (declined at the permission prompt), 'rule' (a hook or a
+    -- permission rule refused it, and `error` carries that reason), or NULL
+    -- for the ones nothing explains — in flight when the session ended.
+    -- The three want different fixes, which is why they are not one status.
+    blocked_by      TEXT,
     error           TEXT,
     started_at      TEXT    NOT NULL,
     ended_at        TEXT,
