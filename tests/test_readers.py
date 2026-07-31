@@ -141,6 +141,56 @@ def test_nothing_is_recorded_when_nobody_was_retired(registry, tmp_path):
     assert n == 0
 
 
+def test_the_report_registers_itself_while_it_serves(fake_home, monkeypatch):
+    from xenia import app, tray as tray_mod
+
+    seen: list[dict] = []
+
+    class Tray:
+        def __init__(self, name, menu):
+            pass
+
+        def every(self, seconds, action):
+            pass
+
+        def start(self):
+            seen.extend(readers.registered())
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(tray_mod, "Tray", Tray)
+    instance = app.App()
+    try:
+        assert instance.run() == 0
+    finally:
+        instance.report.stop()
+
+    assert [(row["pid"], row["schema_version"]) for row in seen] == [
+        (os.getpid(), config.SCHEMA_VERSION)], "not registered while serving"
+    assert not list(readers.registry_dir().glob("*.json")), "left behind on exit"
+
+
+def test_the_report_asks_to_be_started_again_when_it_is_retired(fake_home, capsys):
+    from xenia import app
+
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        app._come_back_on_retirement()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler), "no handler was installed"
+
+        with pytest.raises(SystemExit) as exit_info:
+            handler(signal.SIGTERM, None)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert exit_info.value.code == readers.RETIRED_EXIT_STATUS, \
+        "the service unit is written to expect exactly this status back"
+    said = capsys.readouterr().err
+    assert "not an error" in said, "a retirement is expected, and has to read that way"
+
+
 def test_a_retired_reader_says_why_on_its_way_out(monkeypatch, capsys):
     import signal as signal_mod
 

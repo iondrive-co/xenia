@@ -26,7 +26,14 @@ SORTABLE = {
 }
 
 KINDS = ("remote_call", "fs_change", "fs_read", "exec", "other")
-STATUSES = ("started", "ok", "error", "blocked")
+# 'blocked' is a call something refused. 'unanswered' is one nobody answered
+# — in flight when the session ended — which is not a failure and is counted
+# as one nowhere.
+STATUSES = ("started", "ok", "error", "blocked", "unanswered")
+FAILED_STATUSES = ("error", "blocked")
+# Who refused a blocked call, when the runtime said so. A blocked call with
+# neither is one the transcript did not explain.
+BLOCKED_BY = ("rule", "user")
 TASK_STATUSES = ("open", "achieved", "partial", "failed", "no_action", "abandoned")
 TASK_SOURCES = ("plan", "intent", "signature")
 
@@ -51,6 +58,12 @@ STAT_ORDERS = {
     "p95_ms": "p95_ms",
     "total_bytes": "total_bytes",
     "p95_bytes": "p95_bytes",
+}
+
+REPEAT_ORDERS = {
+    "repeats": "SUM(repeated)",
+    "repeated_bytes": "repeated_bytes",
+    "repeated_ms": "repeated_ms",
 }
 
 DISK_GROUPS = {
@@ -140,6 +153,22 @@ def parse_since(since: str | None) -> str | None:
     except ValueError:
         return None
     return text if text[:1].isdigit() else None
+
+
+def _window_before(cutoff: str) -> str:
+    """Where the window of the same length immediately before this one starts.
+
+    A date like '2026-07-01' is a cutoff, not a duration, so its length is
+    measured to now the same way an explicit '7d' is: both arrive here as a
+    timestamp, and what came before it is the same span again.
+    """
+    try:
+        start = datetime.fromisoformat(cutoff)
+    except ValueError:
+        return cutoff
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return (start - (datetime.now(timezone.utc) - start)).isoformat()
 
 
 def _clean(value: Any) -> Any:
@@ -235,22 +264,29 @@ def calls(conn: sqlite3.Connection, *, since: str | None = None,
           via: str | None = None, session: str | None = None,
           signature: str | None = None, status: str | None = None,
           kind: str | None = None, agent: str | None = None,
+          blocked_by: str | None = None,
           order: str = "bytes", descending: bool = True,
           limit: int = CALLS_DEFAULT_LIMIT) -> list[dict[str, Any]]:
     where, params = _action_filters(
         since=since, repo=repo, tool=tool, via=via, session=session,
         signature=signature, status=status, kind=kind, agent=agent)
+    if blocked_by:
+        where.append("a.blocked_by = :blocked_by")
+        params["blocked_by"] = blocked_by
     column = SORTABLE.get(order, "a.result_bytes")
     direction = "DESC" if descending else "ASC"
     params["limit"] = max(1, min(int(limit or CALLS_DEFAULT_LIMIT), MAX_LIMIT))
 
-    return _rows(conn.execute(f"""
+    rows = _rows(conn.execute(f"""
         SELECT a.id            AS action_id,
                a.started_at    AS at,
                s.agent         AS agent,
                s.repo          AS repo,
                a.tool          AS tool,
                a.status        AS status,
+               -- Only ever set on a blocked call, so it costs a key on the
+               -- rows where the next question is "refused by what?".
+               a.blocked_by    AS blocked_by,
                a.duration_ms   AS duration_ms,
                a.result_bytes  AS result_bytes,
                r.via           AS via,
@@ -263,6 +299,13 @@ def calls(conn: sqlite3.Connection, *, since: str | None = None,
         ORDER BY ({column} IS NULL), {column} {direction}, a.id {direction}
         LIMIT :limit
     """, params))
+
+    # This view carries nothing that repeats identically down the rows, and
+    # blocked_by is null on every call that completed.
+    for row in rows:
+        if row.get("blocked_by") is None:
+            row.pop("blocked_by", None)
+    return rows
 
 
 def interactions(
@@ -366,7 +409,8 @@ def summary(conn: sqlite3.Connection, *, since: str | None = None) -> dict[str, 
                SUM(a.kind = 'remote_call')                AS remote_calls,
                SUM(a.kind = 'fs_change')                  AS fs_changes,
                SUM(a.status = 'error')                    AS failed,
-               SUM(a.status = 'blocked')                  AS blocked
+               SUM(a.status = 'blocked')                  AS blocked,
+               SUM(a.status = 'unanswered')               AS unanswered
         FROM action a WHERE 1=1{clause}
     """, params).fetchone()
     out = {k: (row[k] or 0) for k in row.keys()}
@@ -502,11 +546,36 @@ def friction(conn: sqlite3.Connection, *, since: str | None = None,
     params["min_failures"] = max(1, int(min_failures or 1))
     params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
 
+    # The window immediately before this one, same length. A count from it
+    # turns "8 failures" into "8 failures, none last week" — which is the
+    # difference between a new breakage and one somebody already decided to
+    # live with. Only meaningful when a window was asked for; over all time
+    # there is nothing before.
+    previously = "NULL"
+    if cutoff:
+        params["previous_start"] = _window_before(cutoff)
+        previously = """(
+            SELECT COUNT(*) FROM action p
+            JOIN session ps ON ps.id = p.session_id
+            WHERE p.signature = a.signature
+              AND p.status IN ('error', 'blocked')
+              AND p.started_at >= :previous_start
+              AND p.started_at < :since
+              AND (:repo IS NULL OR ps.repo = :repo)
+        )"""
+        params.setdefault("repo", None)
+
     return _rows(conn.execute(f"""
         SELECT a.signature                              AS signature,
                COUNT(*)                                 AS failures,
+               {previously}                             AS previously,
                COUNT(DISTINCT a.session_id)             AS sessions,
-               COUNT(DISTINCT s.repo)                   AS repos,
+               -- Named, not counted. Every fix for a failing signature lands
+               -- in a repo, so a row that says '2' sends the reader back for
+               -- another query before they can act on it.
+               GROUP_CONCAT(DISTINCT s.repo)            AS repos,
+               SUM(a.blocked_by = 'rule')               AS refused_by_rule,
+               SUM(a.blocked_by = 'user')               AS declined_by_user,
                SUM(a.resolved_by_action_id IS NOT NULL) AS recovered,
                SUM(a.crossed_goal)                      AS needed_new_instruction,
                SUM(a.crossed_session)                   AS needed_new_session,
@@ -621,6 +690,9 @@ def tool_stats(
                SUM(scoped.status = 'ok')                     AS ok,
                SUM(scoped.status = 'error')                  AS failed,
                SUM(scoped.status = 'blocked')                AS blocked,
+               -- Reported, never rated: nobody answered the prompt before
+               -- the session closed, and no fix to this tool changes that.
+               SUM(scoped.status = 'unanswered')             AS unanswered,
                ROUND(1.0 * SUM(scoped.status IN ('error', 'blocked'))
                          / COUNT(*), 3)                      AS failure_rate,
                COALESCE(latency.timed, 0)                    AS timed,
@@ -655,8 +727,10 @@ def redundancy(
     session: str | None = None,
     within_minutes: float = 10.0,
     min_repeats: int = 1,
+    order: str = "repeats",
     limit: int = DEFAULT_LIMIT,
 ) -> list[dict[str, Any]]:
+    order_by = REPEAT_ORDERS.get(order or "repeats", REPEAT_ORDERS["repeats"])
     where, params = _action_filters(
         since=since, repo=repo, kind=kind, agent=agent, tool=tool, via=via,
         channel=channel, session=session)
@@ -675,18 +749,35 @@ def redundancy(
             SELECT a.id AS id, a.session_id AS session_id, a.signature AS signature,
                    a.tool AS tool, a.kind AS kind, a.intent AS intent,
                    a.detail AS detail, a.duration_ms AS ms,
+                   a.result_bytes AS bytes,
+                   -- What has to match for a call to be the same call again.
+                   -- 'detail' alone is enough for a command or a query, whose
+                   -- arguments are in it — but a file edit's detail is only
+                   -- 'Edit <path>', so eighteen successive edits to one file
+                   -- read as eighteen repeats of one edit. The content hash
+                   -- is what separates rewriting a file from writing it: an
+                   -- edit that produced different bytes did different work.
+                   a.detail || COALESCE('|' || f.sha256_after, '') AS same_work,
                    a.started_at AS at, s.session_uid AS session,
                    s.repo AS repo, s.agent AS agent, t.label AS task
             FROM action a
             JOIN session s ON s.id = a.session_id
             LEFT JOIN task t ON t.id = a.task_id
             LEFT JOIN remote_call r ON r.action_id = a.id
+            LEFT JOIN fs_change f ON f.action_id = a.id
             WHERE {' AND '.join(where)}
         ),
         flagged AS (
+            -- Partitioned by the arguments as well as the signature. A
+            -- signature is a kind of work, not an instance of it: a query tool
+            -- asked seventy-three different questions shares one signature and
+            -- repeated nothing. Work is only redone when the same call is made
+            -- again, so `detail` — the command, or the arguments the call was
+            -- given — is part of what has to match.
             SELECT scoped.*,
                    CASE WHEN (julianday(at) - julianday(
-                                 LAG(at) OVER (PARTITION BY session_id, signature
+                                 LAG(at) OVER (PARTITION BY session_id, signature,
+                                                            same_work
                                                ORDER BY at, id))) * 1440.0
                              <= :window
                         THEN 1 ELSE 0 END AS repeated
@@ -699,9 +790,15 @@ def redundancy(
                MAX(kind)                                 AS kind,
                COUNT(*)                                  AS calls,
                SUM(repeated)                             AS repeats,
-               COUNT(DISTINCT detail)                    AS distinct_args,
+               COUNT(DISTINCT same_work)                 AS distinct_args,
                SUM(CASE WHEN repeated = 1
                         THEN COALESCE(ms, 0) ELSE 0 END) AS repeated_ms,
+               -- What the redoing actually cost. Redone work is rarely slow —
+               -- 25 repeated edits came to 4.2 seconds — but every repeat
+               -- puts its whole reply back into the context: one file was
+               -- re-read for 322 KB. Time is the wrong unit for this view.
+               SUM(CASE WHEN repeated = 1
+                        THEN COALESCE(bytes, 0) ELSE 0 END) AS repeated_bytes,
                MIN(at)                                   AS first_at,
                MAX(at)                                   AS last_at,
                MAX(id)                                   AS last_action_id,
@@ -711,7 +808,7 @@ def redundancy(
         FROM flagged
         GROUP BY session_id, signature
         HAVING SUM(repeated) >= :min_repeats
-        ORDER BY SUM(repeated) DESC, repeated_ms DESC
+        ORDER BY {order_by} DESC, SUM(repeated) DESC
         LIMIT :limit
     """, params))
 

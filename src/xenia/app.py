@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import webbrowser
 from pathlib import Path
 
-from . import config, db, install, report as report_mod, service
+from . import config, db, install, readers, report as report_mod, service
 
 STATE_DIR_NAME = "xenia"
 
@@ -210,6 +211,37 @@ def _print_setup(report: dict, *, first_run: bool) -> None:
     sys.stdout.flush()
 
 
+def _come_back_on_retirement() -> None:
+    """Ask to be started again when a migration retires this process.
+
+    The report is a reader like any other, so a schema bump SIGTERMs it. The
+    exit status is what decides whether it comes back: a service manager
+    ignores a clean exit, and does not restart a stop it asked for itself, so
+    leaving non-zero is restarted on the new code while `systemctl stop` still
+    stops. Recording is unaffected either way — that is the hook's job, and the
+    hook is a fresh process every time.
+    """
+    def farewell(signum, _frame):
+        try:
+            sys.stderr.write(
+                f"xenia: exiting on signal {signum}. If a schema migration "
+                f"retired this process (it was built for schema "
+                f"{config.SCHEMA_VERSION}), that is expected and not an error, "
+                f"and it will be started again on the new code. Nothing stopped "
+                f"being recorded.\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        _release_runtime()
+        readers.unregister()
+        raise SystemExit(128 + signum)
+
+    try:
+        signal.signal(signal.SIGTERM, farewell)
+    except (ValueError, OSError):
+        pass
+
+
 class App:
     def __init__(self) -> None:
         self.report = report_mod.Report()
@@ -249,6 +281,8 @@ class App:
         from . import tray as tray_mod
 
         self.report.start()
+        readers.register(config.SCHEMA_VERSION)
+        _come_back_on_retirement()
         runtime_file().write_text(json.dumps({
             "pid": os.getpid(), "url": self.report.url,
         }, indent=2) + "\n")
@@ -269,6 +303,7 @@ class App:
             except KeyboardInterrupt:
                 pass
         finally:
+            readers.unregister()
             _release_runtime()
         return 0
 

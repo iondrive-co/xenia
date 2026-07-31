@@ -10,6 +10,10 @@ from . import config
 
 _MARKER = "xenia"
 
+# What a reader exits with when this module retires it. Non-zero on purpose:
+# it is what asks a service manager to start the reader again on the new code.
+RETIRED_EXIT_STATUS = 128 + signal.SIGTERM
+
 
 def registry_dir() -> Path:
     explicit = os.environ.get("XENIA_READER_DIR")
