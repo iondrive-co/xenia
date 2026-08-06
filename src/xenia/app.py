@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import sys
+import time
 import webbrowser
 from pathlib import Path
 
@@ -297,7 +298,6 @@ class App:
             print(f"No tray icon on this desktop: {exc}", file=sys.stderr)
             print(f"Report: {self.report.url}", file=sys.stderr)
             try:
-                import time
                 while True:
                     time.sleep(3600)
             except KeyboardInterrupt:
@@ -312,16 +312,18 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv:
         print("xenia takes no arguments.\n\n"
-              "  xenia            set up on first run, then open the report\n\n"
+              "  xenia            set up on first run, restart what is already "
+              "running,\n"
+              "                   then open the report\n\n"
               "Everything else is in the report itself, or in the read-only "
               "MCP server (xenia-mcp).", file=sys.stderr)
         return 2
 
     running = _read_runtime()
     if running.get("url") and _alive(running.get("pid", -1)):
-        webbrowser.open(running["url"])
-        print(f"xenia is already running. Report: {running['url']}")
-        return 0
+        outcome = _restart(running)
+        if outcome is not None:
+            return outcome
 
     first_run = not setup_marker().exists()
     setup = run_setup()
@@ -341,13 +343,59 @@ def main(argv: list[str] | None = None) -> int:
     return App().run(show_report=True)
 
 
-def _await_report(timeout: float = 10.0) -> str | None:
-    import time
+def _restart(running: dict) -> int | None:
+    """Start the running instance again, on the code that is on disk now.
+
+    Typing `xenia` at one that is already up used to say so and stop, which is
+    the one thing it is never asked for: a process holds the code it started
+    with, so the answer came from the version before whatever prompted the
+    command. None means there was no service to restart and the caller should
+    start one here — the old instance is gone by then.
+    """
+    old_pid = running.get("pid")
+    ok, detail = service.restart()
+
+    if not ok:
+        if _retire(old_pid):
+            return None
+        print(f"xenia is running (pid {old_pid}) and would not restart: "
+              f"{detail}\nReport: {running['url']}", file=sys.stderr)
+        return 1
+
+    url = _await_report(exclude_pid=old_pid)
+    if url is None:
+        print(f"Restarted xenia — {detail} — but it has not published a report "
+              f"yet.", file=sys.stderr)
+        return 1
+
+    webbrowser.open(url)
+    print(f"Restarted xenia — {detail}. Report: {url}")
+    return 0
+
+
+def _retire(pid: int | None, timeout: float = 10.0) -> bool:
+    """Ask an instance no service manager owns to stop, and wait for it to."""
+    if not pid or not _alive(pid):
+        return True
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _await_report(timeout: float = 10.0, exclude_pid: int | None = None) -> str | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         running = _read_runtime()
-        if running.get("url") and _alive(running.get("pid", -1)):
+        pid = running.get("pid", -1)
+        if running.get("url") and pid != exclude_pid and _alive(pid):
             return running["url"]
         time.sleep(0.25)
     return None

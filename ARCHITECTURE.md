@@ -4,7 +4,7 @@
 
 | | |
 | --- | --- |
-| `bin/xenia` | the command — sets up, starts the service, opens the report, exits |
+| `bin/xenia` | the command — sets up, starts the service (restarting one already running, so it picks up the code on disk), opens the report, exits |
 | `bin/xenia-service` | the long-running process: tray and report |
 | `bin/xenia-hook` | hook entry point — fails soft, always exits 0 |
 | `bin/xenia-mcp` | the read-only MCP server, over stdio |
