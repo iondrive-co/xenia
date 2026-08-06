@@ -165,6 +165,32 @@ def is_running() -> bool:
     return False
 
 
+def restart() -> tuple[bool, str]:
+    """Ask the service manager to start the unit again on the current code.
+
+    A running process holds the code it started with, so this is what `xenia`
+    does when it finds one — it is nearly always typed by someone who has just
+    changed something. False means there was nothing to restart, and the caller
+    has to retire the process itself.
+    """
+    kind = manager()
+    if kind == "systemd":
+        ok, detail = _run(["systemctl", "--user", "restart", UNIT_NAME])
+        return ok, (detail if not ok else f"systemd user unit {UNIT_NAME}")
+
+    if kind == "launchd":
+        uid = os.getuid()
+        ok, detail = _run(
+            ["launchctl", "kickstart", "-k", f"gui/{uid}/{LABEL}"])
+        if not ok:
+            _run(["launchctl", "bootout", f"gui/{uid}/{LABEL}"])
+            ok, detail = _run(["launchctl", "bootstrap", f"gui/{uid}",
+                               str(plist_file())])
+        return ok, (detail if not ok else f"launchd agent {LABEL}")
+
+    return False, "no service manager"
+
+
 def stop() -> bool:
     kind = manager()
     if kind == "systemd":

@@ -82,6 +82,14 @@ def test_systemd_install_is_repeatable(systemd):
     assert second["started"] is True
 
 
+def test_systemd_is_asked_to_restart_the_unit_in_place(systemd):
+    ok, detail = service.restart()
+
+    assert ok
+    assert ["systemctl", "--user", "restart", "xenia.service"] in systemd
+    assert "xenia.service" in detail
+
+
 @pytest.fixture
 def launchd(fake_home, monkeypatch, calls):
     monkeypatch.setattr(sys, "platform", "darwin")
@@ -123,6 +131,39 @@ def test_launchd_falls_back_to_load_when_bootstrap_is_unsupported(
 
     assert [a[1] for a in seen] == ["bootstrap", "load"]
     assert report["started"] is True
+
+
+def test_launchd_restart_kickstarts_the_agent(launchd):
+    ok, _ = service.restart()
+
+    assert ok
+    assert any(args[:3] == ["launchctl", "kickstart", "-k"] for args in launchd)
+
+
+def test_launchd_restart_falls_back_to_reloading_the_agent(fake_home, monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_run(args):
+        seen.append(args)
+        return (False, "no such service") if args[1] == "kickstart" else (True, "")
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(service, "manager", lambda: "launchd")
+    monkeypatch.setattr(service, "_run", fake_run)
+
+    ok, _ = service.restart()
+
+    assert ok
+    assert [a[1] for a in seen] == ["kickstart", "bootout", "bootstrap"]
+
+
+def test_restarting_without_a_service_manager_says_so(fake_home, monkeypatch):
+    monkeypatch.setattr(service, "manager", lambda: None)
+
+    ok, detail = service.restart()
+
+    assert ok is False
+    assert "no service manager" in detail
 
 
 def test_no_supervisor_falls_back_to_a_login_entry(fake_home, monkeypatch):

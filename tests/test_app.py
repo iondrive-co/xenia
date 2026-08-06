@@ -142,19 +142,70 @@ def test_the_command_takes_no_arguments(fake_home, capsys):
     assert "takes no arguments" in capsys.readouterr().err
 
 
-def test_a_second_invocation_defers_to_the_running_one(fake_home, monkeypatch):
+def test_a_second_invocation_restarts_the_running_one(fake_home, monkeypatch):
     import os
     app.runtime_file().write_text(json.dumps({
-        "pid": os.getpid(), "url": "http://127.0.0.1:9/?t=x",
+        "pid": os.getpid(), "url": "http://127.0.0.1:9/?t=old",
     }))
 
+    monkeypatch.setattr(app.service, "restart", lambda: (True, "xenia.service"))
+    monkeypatch.setattr(app, "_await_report", lambda **_kw: "http://127.0.0.1:9/?t=new")
     opened = []
     monkeypatch.setattr(app.webbrowser, "open", opened.append)
     monkeypatch.setattr(app.App, "run", lambda self, **kw: (_ for _ in ()).throw(
         AssertionError("must not start a second instance")))
 
     assert app.main([]) == 0
-    assert opened == ["http://127.0.0.1:9/?t=x"]
+    assert opened == ["http://127.0.0.1:9/?t=new"], \
+        "the report of the instance that was replaced is the old code's"
+
+
+def test_the_restart_waits_for_the_new_instance_not_the_departing_one(fake_home):
+    import os
+    app.runtime_file().write_text(json.dumps({
+        "pid": os.getpid(), "url": "http://127.0.0.1:9/?t=old",
+    }))
+
+    assert app._await_report(timeout=0.5, exclude_pid=os.getpid()) is None
+
+
+def test_an_unmanaged_instance_is_stopped_before_a_new_one_starts(
+    fake_home, monkeypatch
+):
+    import signal
+    app.runtime_file().write_text(json.dumps({
+        "pid": 4242, "url": "http://127.0.0.1:9/?t=x",
+    }))
+
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(app.service, "restart", lambda: (False, "no service manager"))
+    monkeypatch.setattr(app.service, "manager", lambda: None)
+    monkeypatch.setattr(app.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(app, "_alive", lambda pid: not signals)
+    monkeypatch.setattr(app.webbrowser, "open", lambda _url: None)
+    started = []
+    monkeypatch.setattr(app.App, "run", lambda self, **kw: started.append(True) or 0)
+
+    assert app.main([]) == 0
+    assert signals == [(4242, signal.SIGTERM)]
+    assert started == [True]
+
+
+def test_an_instance_that_will_not_stop_is_reported_rather_than_doubled(
+    fake_home, monkeypatch, capsys
+):
+    app.runtime_file().write_text(json.dumps({
+        "pid": 4242, "url": "http://127.0.0.1:9/?t=x",
+    }))
+
+    monkeypatch.setattr(app.service, "restart", lambda: (False, "no service manager"))
+    monkeypatch.setattr(app, "_alive", lambda pid: True)
+    monkeypatch.setattr(app, "_retire", lambda pid, **_kw: False)
+    monkeypatch.setattr(app.App, "run", lambda self, **kw: (_ for _ in ()).throw(
+        AssertionError("must not start a second instance")))
+
+    assert app.main([]) == 1
+    assert "would not restart" in capsys.readouterr().err
 
 
 def test_a_stale_runtime_file_does_not_block_startup(fake_home, monkeypatch):
