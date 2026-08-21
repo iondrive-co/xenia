@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import datetime
 
 import pytest
-from conftest import CORE, FAKE_GITLAB_PAT, FAKE_GRAFANA_TOKEN, pre
+from conftest import CORE, FAKE_GITLAB_PAT, FAKE_GRAFANA_TOKEN, post, pre
 
 from xenia import db as xdb
 from xenia import ingest, mcp
@@ -280,3 +281,83 @@ def test_the_reply_is_not_padded_with_indentation(server):
     text = call(server, "xenia_report", {"view": "tools"})["content"][0]["text"]
     assert "\n" not in text
     assert ": " not in text.replace('": "', '":"')
+
+
+def test_every_reply_says_what_time_it_is(server):
+    for payload in (call(server, "xenia_report", {"view": "tasks"}),
+                    call(server, "xenia_calls"),
+                    call(server, "xenia_trace", {"action_id": 1})):
+        answer = payload["structuredContent"]
+        assert answer["now"].endswith("Z"), "the record is UTC and says so"
+        # The same instant on the other clock the reader has: their shell,
+        # their logs, their file mtimes.
+        assert (datetime.fromisoformat(answer["now"].replace("Z", "+00:00"))
+                == datetime.fromisoformat(answer["now_local"]))
+
+
+def test_a_cut_reply_names_the_order_it_kept_the_top_of(conn, clock, tmp_path,
+                                                        monkeypatch):
+    # One failure, buried under a page of the one-action successes that fill
+    # any real window, and then cut down to what fits.
+    bad = {"command": "curl https://nope.test", "description": "reach the API"}
+    clock()
+    ingest.record(conn, pre("Bash", bad))
+    clock()
+    ingest.record(conn, post("Bash", bad, ok=False))
+    for i in range(60):
+        args = {"command": f"sed -n '{i}p' notes.md",
+                "description": f"read part {i} " + "x" * 200}
+        clock()
+        ingest.record(conn, pre("Bash", args))
+        clock()
+        ingest.record(conn, post("Bash", args))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE})
+    conn.commit()
+    monkeypatch.setattr(mcp.config, "REPLY_LIMIT", 6000)
+
+    payload = call(mcp.Server(tmp_path / "audit.db"),
+                   "xenia_report", {"view": "tasks"})["structuredContent"]
+
+    assert payload["truncated"]["rows_dropped"] > 0
+    # The row the question was about is the row that survived the cut.
+    assert payload["rows"][0]["status"] == "failed"
+    # And the note describes the order the rows were really in, rather than
+    # promising a significance the view might not have been sorted by.
+    assert payload["ordered_by"] in payload["truncated"]["advice"]
+    assert "failed" in payload["ordered_by"]
+
+
+def test_a_timeline_says_it_is_a_timeline(server):
+    payload = call(server, "xenia_report",
+                   {"view": "tasks", "order": "at"})["structuredContent"]
+    assert payload["ordered_by"] == "most recent first"
+
+
+def test_the_orders_the_other_views_use_are_named_too(server):
+    for view, expected in (("failures", "recovered"), ("tools", "highest"),
+                           ("disk", "highest"), ("repeats", "highest"),
+                           ("instructions", "recent")):
+        payload = call(server, "xenia_report", {"view": view})["structuredContent"]
+        assert expected in payload["ordered_by"], view
+    assert call(server, "xenia_calls",
+                {"order": "at"})["structuredContent"]["ordered_by"] == (
+        "most recent first")
+
+
+def test_failures_can_be_grouped_by_cause_and_searched(server):
+    payload = call(server, "xenia_report",
+                   {"view": "failures", "group_by": "cause",
+                    "search": "nothing matches this"})["structuredContent"]
+    assert payload["group_by"] == "cause"
+    assert payload["rows"] == []
+
+
+def test_a_grouping_no_view_offers_is_still_refused(server):
+    reply = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "xenia_report",
+                   "arguments": {"view": "failures", "group_by": "host"}},
+    })
+    assert "cause" in reply["error"]["message"]

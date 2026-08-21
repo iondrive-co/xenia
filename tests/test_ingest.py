@@ -965,3 +965,21 @@ def test_two_commands_sharing_a_cd_are_not_the_same_work(conn, clock):
     sigs = [r["signature"] for r in conn.execute("SELECT signature FROM action ORDER BY id")]
     assert sigs[0] != sigs[1], "the cd is not what either command is"
     assert "pytest" in sigs[0] and "ruff" in sigs[1]
+
+
+def test_a_long_error_keeps_the_half_that_says_what_to_do(conn, clock):
+    error = "the call failed. " * 60 + "ACTION: retry with --force"
+    args = {"command": "deploy --now"}
+    clock()
+    ingest.record(conn, pre("Bash", args))
+    clock()
+    ingest.record(conn, post("Bash", args,
+                             response={"is_error": True, "error": error}))
+
+    stored = conn.execute("SELECT error FROM action").fetchone()["error"]
+    assert len(stored) < len(error), "a long error is still capped"
+    assert stored.startswith("the call failed.")
+    # The head says what failed and the tail says what to do about it. Keeping
+    # only the head stores the half the agent already knows.
+    assert stored.endswith("ACTION: retry with --force")
+    assert " chars]…" in stored, "and the cut says how much of it went"

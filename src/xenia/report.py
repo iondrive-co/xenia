@@ -99,10 +99,12 @@ class Report:
                     conn, since=one("since"), repo=one("repo"),
                     status=one("status"), source=one("source"),
                     agent=one("agent"), search=one("q"),
+                    order=one("order", "significance") or "significance",
                     overstated_only=one("overstated") == "1")}
             if path == "/api/friction":
                 return {"rows": readonly.friction(
                     conn, since=one("since"), repo=one("repo"),
+                    search=one("q"), group_by=one("by", "signature") or "signature",
                     min_failures=int(one("min") or 2))}
             if path == "/api/interactions":
                 return {"rows": readonly.interactions(

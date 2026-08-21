@@ -43,6 +43,25 @@ def _cap(text: str | None, limit: int) -> str | None:
     return text if len(text) <= limit else text[:limit] + f"…[+{len(text) - limit} chars]"
 
 
+def _cap_ends(text: str | None, limit: int) -> str | None:
+    """Keep both ends of a long value, and mark the middle that went.
+
+    For errors, and only for errors. A command is identified by its head, so
+    the head is what `_cap` keeps; an error is a sentence saying what failed
+    followed, often enough, by one saying what to do about it — "ACTION: retry
+    this tool", the flag that was wrong, the approval it wants. Storing only
+    the head throws away the half an agent can act on, and no report can put
+    it back afterwards.
+    """
+    if text is None:
+        return None
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    head, tail = limit * 2 // 3, limit - limit * 2 // 3
+    return f"{text[:head]}…[+{len(text) - limit} chars]…{text[-tail:]}"
+
+
 def declared_agent(payload: dict[str, Any]) -> str | None:
     """The agent this payload names, from the payload itself.
 
@@ -126,7 +145,7 @@ def outcome_of(payload: dict[str, Any]) -> tuple[str, str | None, str | None]:
     if isinstance(response, str):
         summary = _cap(response, config.RESPONSE_LIMIT)
         if response.lstrip().lower().startswith(("error:", "error executing")):
-            return "error", _cap(response, 500), summary
+            return "error", _cap_ends(response, 500), summary
         return "ok", None, summary
 
     if not isinstance(response, dict):
@@ -153,7 +172,7 @@ def outcome_of(payload: dict[str, Any]) -> tuple[str, str | None, str | None]:
 
     if flagged or error_text or (isinstance(exit_code, int) and exit_code != 0):
         detail = error_text or response.get("stderr") or f"exit code {exit_code}"
-        return "error", _cap(str(detail), 500), summary
+        return "error", _cap_ends(str(detail), 500), summary
     if interrupted:
         return "error", "interrupted", summary
     return "ok", None, summary
@@ -871,7 +890,7 @@ def _close_action(
     conn.execute(
         "UPDATE action SET status = ?, error = ?, ended_at = ?, duration_ms = ?, "
         "                  result_bytes = ?, end_event_id = ? WHERE id = ?",
-        (status, _cap(redact.redact(error), 1000), ended, duration,
+        (status, _cap_ends(redact.redact(error), 1000), ended, duration,
          response_bytes(payload), event_id, row["id"]),
     )
     if summary:
@@ -997,10 +1016,12 @@ def _outcomes_from(lines) -> dict[str, tuple[str, str | None, str | None]]:
                 result = record.get("toolUseResult")
                 reason = result if isinstance(result, str) else _text_of(block)
                 found[str(use_id)] = (
-                    "blocked", blocked_by, _cap(reason, config.RESPONSE_LIMIT))
+                    "blocked", blocked_by,
+                    _cap_ends(reason, config.RESPONSE_LIMIT))
             elif block.get("is_error"):
                 found[str(use_id)] = (
-                    "error", None, _cap(_text_of(block), config.RESPONSE_LIMIT))
+                    "error", None,
+                    _cap_ends(_text_of(block), config.RESPONSE_LIMIT))
             else:
                 # It ran and returned. Whatever kept the completion hook from
                 # firing, this was never a refusal.

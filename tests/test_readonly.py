@@ -8,6 +8,10 @@ from conftest import CORE, FAKE_AWS_KEY, FAKE_GITLAB_PAT, OPS, post, pre
 
 from xenia import ingest, readonly, resolve
 
+#: Room for the marker a cut leaves behind — '…[+1693 chars]'. Every cut says
+#: how much of the value went, so a reader knows whether to drill in for it.
+MARKER = 20
+
 
 @pytest.fixture
 def populated(conn, clock, tmp_path):
@@ -141,15 +145,15 @@ def test_the_instruction_is_summarised_on_an_action_row(wordy):
     for row in rows:
         assert "goal_prompt" not in row, "the whole prompt has no business here"
         assert row["goal_id"]
-        assert len(row["goal_summary"]) <= readonly.SUMMARY_CHARS + 1
-        assert row["goal_summary"].endswith("…")
+        assert len(row["goal_summary"]) <= readonly.SUMMARY_CHARS + MARKER
+        assert row["goal_summary"].endswith(" chars]"), "a cut says how much went"
         assert row["goal_summary"].startswith("Roll out the retention change.")
 
 
 def test_the_same_holds_for_the_task_report(wordy):
     for row in readonly.tasks(wordy):
         assert "goal_prompt" not in row
-        assert len(row["goal_summary"] or "") <= readonly.SUMMARY_CHARS + 1
+        assert len(row["goal_summary"] or "") <= readonly.SUMMARY_CHARS + MARKER
 
 
 def test_a_short_instruction_is_not_marked_as_cut(conn, clock, tmp_path):
@@ -187,8 +191,8 @@ def test_a_heredoc_does_not_dominate_the_friction_report(conn, clock, tmp_path):
     try:
         row = readonly.friction(ro)[0]
         assert row["failures"] == 2
-        assert len(row["example"]) <= readonly.EXAMPLE_CHARS + 1
-        assert row["example"].endswith("…")
+        assert len(row["example"]) <= readonly.EXAMPLE_CHARS + MARKER
+        assert row["example"].endswith(" chars]")
     finally:
         ro.close()
 
@@ -1022,3 +1026,189 @@ def test_a_database_with_no_version_at_all_is_not_stale(conn):
     conn.execute("DELETE FROM meta WHERE key = 'schema_version'")
     conn.commit()
     readonly.require_current(conn)
+
+
+def refusal(host: str) -> dict:
+    return {"is_error": True,
+            "error": f"probe needs a fresh approval for production host {host}"
+                     f".example.com, and the previous prompt's window has "
+                     f"expired. ACTION: retry this tool and approve it"}
+
+
+@pytest.fixture
+def refused(conn, clock, tmp_path):
+    """One reason, three kinds of work, and one ordinary failure beside it."""
+    work = (
+        ("Bash", {"command": "ssh p-fsn-040 uptime", "description": "probe 40"},
+         "p-fsn-040"),
+        ("Bash", {"command": "curl https://p-fsn-116.example.com/health",
+                  "description": "probe 116"}, "p-fsn-116"),
+        ("mcp__acme-prom__prom_query", {"query": "up{host=p-fsn-054}",
+                                        "reason": "probe 54"}, "p-fsn-054"),
+    )
+    for tool, args, host in work:
+        clock()
+        ingest.record(conn, pre(tool, args))
+        clock()
+        ingest.record(conn, post(tool, args, response=refusal(host)))
+
+    other = {"command": "pytest -q", "description": "run the suite"}
+    clock()
+    ingest.record(conn, pre("Bash", other))
+    clock()
+    ingest.record(conn, post("Bash", other, ok=False))
+    conn.commit()
+
+    handle = readonly.connect(tmp_path / "audit.db")
+    yield handle
+    handle.close()
+
+
+def test_a_refusal_that_came_back_as_an_error_is_counted_as_a_refusal(refused):
+    rows = {r["signature"]: r for r in readonly.friction(refused, min_failures=1)}
+    refusals = [r for r in rows.values() if r["refused_unattributed"]]
+
+    assert len(refusals) == 3, "one per host, since each is its own signature"
+    for row in refusals:
+        # Nothing recorded a block: the runtime never knew this was a refusal.
+        assert (row["refused_by_rule"], row["declined_by_user"]) == (0, 0)
+        assert row["refused_unattributed"] == 1
+
+
+def test_a_refusal_count_is_zero_rather_than_null_when_nothing_was_refused(refused):
+    row = next(r for r in readonly.friction(refused, min_failures=1)
+               if not r["refused_unattributed"])
+    assert (row["refused_by_rule"], row["declined_by_user"]) == (0, 0)
+
+
+def test_a_connection_refused_is_a_failure_not_a_refusal(conn, clock, tmp_path):
+    args = {"command": "ssh box-1 uptime", "description": "reach the box"}
+    clock()
+    ingest.record(conn, pre("Bash", args))
+    clock()
+    ingest.record(conn, post("Bash", args, response={
+        "is_error": True,
+        "error": "ssh: connect to host box-1 port 22: Connection refused"}))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        assert readonly.friction(ro, min_failures=1)[0]["refused_unattributed"] == 0
+        assert readonly.calls(ro, blocked_by="unattributed") == []
+    finally:
+        ro.close()
+
+
+def test_a_search_over_the_error_finds_what_the_signature_split_up(refused):
+    rows = readonly.friction(refused, min_failures=1, search="fresh approval")
+
+    assert len(rows) == 3, "three signatures, and nothing but the error joins them"
+    assert all("approval" in r["example_error"] for r in rows)
+    assert readonly.friction(refused, min_failures=1, search="pytest")
+
+
+def test_one_cause_across_six_signatures_is_one_row(refused):
+    causes = readonly.friction(refused, min_failures=1, group_by="cause")
+    approval = [c for c in causes if "approval" in c["cause"]]
+
+    assert len(approval) == 1, "one reason, however many hosts it was asked about"
+    row = approval[0]
+    assert row["failures"] == 3
+    assert row["refused_unattributed"] == 3
+    assert row["sessions"] == 1
+    # Named, so the fix does not need another query to find its targets.
+    assert len(row["signatures"].split(",")) == 3
+    assert set(row["tools"].split(",")) == {"Bash", "mcp__acme-prom__prom_query"}
+    assert "p-fsn-N" in row["cause"], "the host that varies is normalised away"
+    assert readonly.trace(refused, row["example_action_id"])["status"] == "error"
+
+
+def test_a_cause_row_still_honours_the_floor(refused):
+    assert readonly.friction(refused, min_failures=2, group_by="cause") == [
+        c for c in readonly.friction(refused, min_failures=1, group_by="cause")
+        if c["failures"] >= 2]
+
+
+def test_a_failure_outranks_a_page_of_one_action_successes(conn, clock, tmp_path):
+    bad = {"command": "curl https://nope.test", "description": "reach the API"}
+    clock()
+    ingest.record(conn, pre("Bash", bad))
+    clock()
+    ingest.record(conn, post("Bash", bad, ok=False))
+    for i in range(12):
+        args = {"command": f"sed -n '{i}p' notes.md",
+                "description": f"read part {i}"}
+        clock()
+        ingest.record(conn, pre("Bash", args))
+        clock()
+        ingest.record(conn, post("Bash", args))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE})
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        rows = readonly.tasks(ro)
+        assert (rows[0]["label"], rows[0]["status"]) == ("reach the API", "failed")
+        assert rows[-1]["status"] == "achieved"
+        # A timeline is still one parameter away, and says so.
+        assert readonly.tasks(ro, order="at")[0]["label"] == "read part 11"
+    finally:
+        ro.close()
+
+
+def test_a_failed_call_carries_the_error_and_says_what_it_cut(conn, clock,
+                                                              tmp_path):
+    error = "something went wrong " * 15 + "ACTION: pass --force next time"
+    args = {"command": "deploy --now", "description": "deploy"}
+    fine = {"command": "git status", "description": "look around"}
+    clock()
+    ingest.record(conn, pre("Bash", args))
+    clock()
+    ingest.record(conn, post("Bash", args,
+                             response={"is_error": True, "error": error}))
+    clock()
+    ingest.record(conn, pre("Bash", fine))
+    clock()
+    ingest.record(conn, post("Bash", fine))
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        row = readonly.calls(ro, status="error")[0]
+        assert row["error"].startswith("something went wrong")
+        # The half an agent can act on is the half at the end.
+        assert row["error"].endswith("ACTION: pass --force next time")
+        assert "chars]" in row["error"], "a cut says how much of it went"
+        assert len(row["error"]) < len(error)
+        assert "error" not in readonly.calls(ro, status="ok")[0]
+    finally:
+        ro.close()
+
+
+def test_a_recovery_is_timed_as_well_as_counted(conn, clock, tmp_path):
+    args = {"command": "pytest -q", "description": "run the suite"}
+    clock()
+    ingest.record(conn, pre("Bash", args))
+    clock()
+    ingest.record(conn, post("Bash", args, ok=False))
+    for _ in range(150):
+        clock()
+    ingest.record(conn, pre("Bash", args))
+    clock()
+    ingest.record(conn, post("Bash", args))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1",
+                         "cwd": CORE})
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        failed = next(r for r in readonly.calls(ro, status="error"))
+        out = readonly.trace(ro, failed["action_id"])
+        # Nothing happened in between, which is not the same as no time passing.
+        assert out["resolution_span"] == 0
+        assert out["resolution_seconds"] >= 120
+    finally:
+        ro.close()

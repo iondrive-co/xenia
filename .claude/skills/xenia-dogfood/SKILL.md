@@ -62,7 +62,13 @@ whose reply went past the client's ceiling and was **discarded whole** — 57k,
 Replies are now capped at `config.REPLY_LIMIT` (32,000 chars) and cut to fit,
 with a `truncated` key saying how many rows went and why. **If you see it,
 narrow the query — do not raise `limit`.** Raising the limit on a reply that was
-already cut asks for more of the thing that did not fit.
+already cut asks for more of the thing that did not fit. What survives a cut is
+the top of the order named in `ordered_by`, which every reply carries — read it
+before assuming the rows you wanted are the rows you got.
+
+Every reply also opens with `now` and `now_local`. The record is UTC; this
+machine is not. Correlating a row against a log or an mtime without checking
+that is one wrong hypothesis and one extra query.
 
 If something does spill to a file, the data is already on disk: `jq` it rather
 than re-querying. Probe with `jq 'type, length, keys?'` first — `Read`'s line
@@ -75,6 +81,9 @@ offsets will not chunk single-line JSON.
 | What was an agent trying to do, and did it work? | `tasks` — start here |
 | What did the *user* ask for? | `instructions` (only view with full prompts) |
 | What kind of work keeps breaking? | `failures` (low `recovered` = real gap) |
+| Why is it breaking — one reason across several tools? | `failures`, `group_by: "cause"` |
+| Which failures mention a host, a path, a phrase? | `failures`, `search:` (matches the error text) |
+| Who refused this? | `failures` — `refused_by_rule` / `declined_by_user` / `refused_unattributed` |
 | What got redone despite never failing? | `repeats` |
 | What is slow, or flooding the context? | `tools`, `order: total_bytes` / `total_ms` |
 | What was written that changed nothing? | `disk`, `order: wasted_bytes` |
