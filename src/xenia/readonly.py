@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -11,6 +12,13 @@ DEFAULT_LIMIT = 200
 
 SUMMARY_CHARS = 160
 EXAMPLE_CHARS = 320
+# An error is the one field on a failure an agent can act on, and the half it
+# acts on is usually the last sentence — "ACTION: retry this tool", the path
+# that was refused, the flag that was wrong. Cutting a long error from the tail
+# throws exactly that away, so errors are cut from the middle instead.
+ERROR_CHARS = 240
+# How much of a normalised error is enough to call two failures the same cause.
+CAUSE_CHARS = 90
 
 SORTABLE = {
     "at": "a.started_at",
@@ -31,11 +39,56 @@ KINDS = ("remote_call", "fs_change", "fs_read", "exec", "other")
 # as one nowhere.
 STATUSES = ("started", "ok", "error", "blocked", "unanswered")
 FAILED_STATUSES = ("error", "blocked")
-# Who refused a blocked call, when the runtime said so. A blocked call with
-# neither is one the transcript did not explain.
-BLOCKED_BY = ("rule", "user")
+# Who refused a call. 'rule' and 'user' are what the runtime itself recorded.
+# 'unattributed' is not a stored value: it is a refusal nothing named an owner
+# for, read off the error text — see REFUSAL_PHRASES.
+BLOCKED_BY = ("rule", "user", "unattributed")
 TASK_STATUSES = ("open", "achieved", "partial", "failed", "no_action", "abandoned")
 TASK_SOURCES = ("plan", "intent", "signature")
+TASK_ORDERS = ("significance", "at")
+
+# What a task row is worth reading. A window with no filter is mostly
+# one-action successes, and putting them first buries the three rows the
+# question was about under fifty-five that answer nothing — and then the reply
+# ceiling drops the interesting tail. Failure first, then the outcomes that
+# disagree with themselves, then the rest; recency only decides ties.
+TASK_SIGNIFICANCE = """CASE
+    WHEN t.status = 'failed'                          THEN 0
+    WHEN t.status = 'partial' OR t.overstated = 1     THEN 1
+    WHEN t.status = 'abandoned'                       THEN 2
+    WHEN t.status = 'no_action'                       THEN 3
+    WHEN t.status = 'achieved'                        THEN 4
+    ELSE 5 END"""
+TASK_ORDER_SQL = {
+    "significance": f"{TASK_SIGNIFICANCE}, t.at DESC",
+    "at": "t.at DESC",
+}
+#: What each ordering is, in words, for the reply to say out loud.
+TASK_ORDER_NOTE = {
+    "significance": "failed and overstated first, then partial, abandoned, "
+                    "no_action, achieved, open — most recent first within each",
+    "at": "most recent first",
+}
+
+FAILURE_GROUPS = ("signature", "cause")
+
+# A refusal nothing recorded an owner for. The runtime sets blocked_by only
+# for what *it* refused, so a daemon or an MCP server saying no — the most
+# actionable failure class on a machine with brokered tools — arrives as an
+# ordinary tool error and is invisible to both refusal counts; so does a
+# refusal this record could only infer from a missing completion.
+#
+# Matched on the error text, which is the only evidence there is, and left
+# unattributed rather than guessed at: which of the two it was is in the error
+# itself, and a wrong attribution here sends the reader to the wrong file.
+# Deliberately phrases and not single words: 'refused' alone reads
+# ECONNREFUSED as a policy decision, which is the opposite kind of problem.
+REFUSAL_PHRASES = (
+    "approval", "not permitted", "not allowed", "permission denied",
+    "denied by", "denied —", "access denied", "declined", "refused by",
+    "refused this", "forbidden", "unauthorized", "unauthorised",
+    "blocked by", "requires confirmation", "was rejected",
+)
 
 GROUPABLE = {
     "tool": "a.tool",
@@ -182,8 +235,71 @@ def _rows(cursor) -> list[dict[str, Any]]:
 
 
 def _brief(column: str, chars: int) -> str:
-    return (f"CASE WHEN length({column}) > {int(chars)} "
-            f"THEN substr({column}, 1, {int(chars)}) || '…' ELSE {column} END")
+    """Head of a long value, saying how much of it is not here.
+
+    A bare ellipsis leaves the reader guessing whether four characters went or
+    four hundred, which is the difference between reading on and drilling in.
+    Same marker the capture side uses, so one cut is not two notations.
+    """
+    chars = int(chars)
+    return (f"CASE WHEN length({column}) > {chars} "
+            f"THEN substr({column}, 1, {chars}) || '…[+' || "
+            f"(length({column}) - {chars}) || ' chars]' "
+            f"ELSE {column} END")
+
+
+def _brief_ends(column: str, chars: int) -> str:
+    """Both ends of a long value, with the middle marked and counted.
+
+    For errors. A message that runs long is a sentence saying what failed
+    followed, often enough, by one saying what to do about it, and a cut from
+    the tail keeps the half the agent already knows and drops the half it
+    needs.
+    """
+    chars = int(chars)
+    head, tail = chars * 2 // 3, chars - chars * 2 // 3
+    return (f"CASE WHEN length({column}) > {chars} "
+            f"THEN substr({column}, 1, {head}) || '…[+' || "
+            f"(length({column}) - {chars}) || ' chars]…' || "
+            f"substr({column}, length({column}) - {tail} + 1) "
+            f"ELSE {column} END")
+
+
+def _refused_unattributed() -> str:
+    """SQL for: nothing recorded a block, but the error is itself a refusal."""
+    tests = " OR ".join(f"lower(a.error) LIKE '%{phrase}%'"
+                        for phrase in REFUSAL_PHRASES)
+    return f"(a.blocked_by IS NULL AND a.error IS NOT NULL AND ({tests}))"
+
+
+#: What varies between two reports of the same cause, and has to go before
+#: they will group: the host, the pid, the byte offset, the temp directory.
+_VOLATILE_TEXT = (
+    (re.compile(r"https?://\S+"), "<url>"),
+    (re.compile(r"(?:/[\w.+-]+){2,}/?"), "<path>"),
+    (re.compile(r"\b[0-9a-f]{8,}\b", re.IGNORECASE), "<id>"),
+    (re.compile(r"\d+"), "N"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def _cause_key(error: str | None) -> str:
+    """What two failures have to share to be the same cause.
+
+    The signature is the identity of the *work* — one host, one command, one
+    endpoint — so eight calls refused for one reason arrive as six rows that
+    have to be read one at a time before the reason is visible. The error text
+    is the other key, and normalising it groups them into the row that was
+    always the answer.
+    """
+    if not error:
+        return "(no error text)"
+    # Lowercased first, so what is left standing in upper case is a
+    # placeholder and reads as one.
+    text = str(error).strip().lower()
+    for pattern, placeholder in _VOLATILE_TEXT:
+        text = pattern.sub(placeholder, text)
+    return text[:CAUSE_CHARS] if len(text) > CAUSE_CHARS else text
 
 
 def _is_glob(value: str) -> bool:
@@ -270,7 +386,9 @@ def calls(conn: sqlite3.Connection, *, since: str | None = None,
     where, params = _action_filters(
         since=since, repo=repo, tool=tool, via=via, session=session,
         signature=signature, status=status, kind=kind, agent=agent)
-    if blocked_by:
+    if blocked_by == "unattributed":
+        where.append(_refused_unattributed())
+    elif blocked_by:
         where.append("a.blocked_by = :blocked_by")
         params["blocked_by"] = blocked_by
     column = SORTABLE.get(order, "a.result_bytes")
@@ -291,7 +409,11 @@ def calls(conn: sqlite3.Connection, *, since: str | None = None,
                a.result_bytes  AS result_bytes,
                r.via           AS via,
                r.host          AS host,
-               {_brief("a.detail", CALL_CHARS)} AS detail
+               {_brief("a.detail", CALL_CHARS)} AS detail,
+               -- The reason a failed row failed. Absent everywhere else, so it
+               -- costs nothing on the rows that worked, and the one thing a
+               -- drill-down onto a failure exists to show.
+               {_brief_ends("a.error", ERROR_CHARS)} AS error
         FROM action a
         JOIN session s ON s.id = a.session_id
         LEFT JOIN remote_call r ON r.action_id = a.id
@@ -301,10 +423,11 @@ def calls(conn: sqlite3.Connection, *, since: str | None = None,
     """, params))
 
     # This view carries nothing that repeats identically down the rows, and
-    # blocked_by is null on every call that completed.
+    # blocked_by and error are both null on every call that completed.
     for row in rows:
-        if row.get("blocked_by") is None:
-            row.pop("blocked_by", None)
+        for empty in ("blocked_by", "error"):
+            if row.get(empty) is None:
+                row.pop(empty, None)
     return rows
 
 
@@ -476,7 +599,7 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
           repo: str | None = None, status: str | None = None,
           source: str | None = None, agent: str | None = None,
           goal: int | None = None, overstated_only: bool = False,
-          search: str | None = None,
+          search: str | None = None, order: str = "significance",
           limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
     where = ["1=1"]
     params: dict[str, Any] = {}
@@ -505,6 +628,8 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
         where.append("(label LIKE :q OR goal_prompt LIKE :q)")
         params["q"] = f"%{search}%"
     params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
+    sort = TASK_ORDER_SQL.get(order or "significance",
+                              TASK_ORDER_SQL["significance"])
 
     return _rows(conn.execute(f"""
         SELECT t.task_id, t.at, t.ended_at, t.repo, t.agent, t.session, t.goal_id,
@@ -527,12 +652,13 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
             GROUP BY a.task_id
         ) w ON w.task_id = t.task_id
         WHERE {' AND '.join(where)}
-        ORDER BY t.at DESC LIMIT :limit
+        ORDER BY {sort} LIMIT :limit
     """, params))
 
 
 def friction(conn: sqlite3.Connection, *, since: str | None = None,
-             repo: str | None = None, min_failures: int = 2,
+             repo: str | None = None, search: str | None = None,
+             group_by: str = "signature", min_failures: int = 2,
              limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
     where = ["1=1"]
     params: dict[str, Any] = {}
@@ -543,8 +669,15 @@ def friction(conn: sqlite3.Connection, *, since: str | None = None,
     if repo:
         where.append("s.repo = :repo")
         params["repo"] = repo
+    if search:
+        where.append("(a.error LIKE :q OR a.detail LIKE :q "
+                     "OR a.intent LIKE :q OR a.signature LIKE :q)")
+        params["q"] = f"%{search}%"
     params["min_failures"] = max(1, int(min_failures or 1))
     params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
+
+    if group_by == "cause":
+        return _causes(conn, where, params)
 
     # The window immediately before this one, same length. A count from it
     # turns "8 failures" into "8 failures, none last week" — which is the
@@ -574,8 +707,16 @@ def friction(conn: sqlite3.Connection, *, since: str | None = None,
                -- in a repo, so a row that says '2' sends the reader back for
                -- another query before they can act on it.
                GROUP_CONCAT(DISTINCT s.repo)            AS repos,
-               SUM(a.blocked_by = 'rule')               AS refused_by_rule,
-               SUM(a.blocked_by = 'user')               AS declined_by_user,
+               -- Zero, not null, when nothing in the group was refused.
+               -- SUM over a column that is null on every row is null, and a
+               -- null reads as "cannot tell" on the one question this split
+               -- exists to answer.
+               COALESCE(SUM(a.blocked_by = 'rule'), 0)  AS refused_by_rule,
+               COALESCE(SUM(a.blocked_by = 'user'), 0)  AS declined_by_user,
+               -- The refusals the runtime never saw: something said no and
+               -- it came back as an ordinary error. Which something is in
+               -- 'example_error', and is not guessed at here.
+               SUM({_refused_unattributed()})           AS refused_unattributed,
                SUM(a.resolved_by_action_id IS NOT NULL) AS recovered,
                SUM(a.crossed_goal)                      AS needed_new_instruction,
                SUM(a.crossed_session)                   AS needed_new_session,
@@ -603,7 +744,7 @@ def friction(conn: sqlite3.Connection, *, since: str | None = None,
                -- 1,700-character example per row buries the counts that are the
                -- reason to read this report at all.
                {_brief("MAX(a.detail)", EXAMPLE_CHARS)} AS example,
-               {_brief("MAX(a.error)", EXAMPLE_CHARS)}  AS example_error
+               {_brief_ends("MAX(a.error)", EXAMPLE_CHARS)} AS example_error
         FROM action a
         JOIN session s ON s.id = a.session_id
         LEFT JOIN task t ON t.id = a.task_id
@@ -614,6 +755,110 @@ def friction(conn: sqlite3.Connection, *, since: str | None = None,
                  COUNT(*) DESC
         LIMIT :limit
     """, params))
+
+
+#: How many names a cause row will list before it stops naming them.
+CAUSE_NAMES = 8
+
+
+def _names(seen: list[str]) -> str | None:
+    """The distinct names in a group, listed rather than counted.
+
+    A cause spanning six signatures is the finding; '6' is not, and sends the
+    reader back for another query to learn which six.
+    """
+    if not seen:
+        return None
+    if len(seen) <= CAUSE_NAMES:
+        return ",".join(seen)
+    return ",".join(seen[:CAUSE_NAMES]) + f",+{len(seen) - CAUSE_NAMES} more"
+
+
+def _causes(conn: sqlite3.Connection, where: list[str],
+            params: dict[str, Any]) -> list[dict[str, Any]]:
+    """The same failures, keyed on why they failed rather than on what failed.
+
+    Grouped here rather than in SQL because the key is a normalised error and
+    SQLite has no regex: the read is one pass over the window's failures, which
+    is the same scan the signature grouping does.
+    """
+    rows = _rows(conn.execute(f"""
+        SELECT a.id                                   AS action_id,
+               a.error                                AS full_error,
+               {_brief_ends("a.error", EXAMPLE_CHARS)} AS example_error,
+               {_brief("a.detail", EXAMPLE_CHARS)}    AS example,
+               a.signature, a.tool, a.session_id, a.attempt_no,
+               a.started_at                           AS at,
+               a.blocked_by                           AS blocked_by,
+               {_refused_unattributed()}              AS refused_unattributed,
+               a.resolved_by_action_id IS NOT NULL    AS recovered,
+               a.crossed_goal, a.crossed_session,
+               s.repo                                 AS repo,
+               t.label                                AS task
+        FROM action a
+        JOIN session s ON s.id = a.session_id
+        LEFT JOIN task t ON t.id = a.task_id
+        WHERE a.status IN ('error', 'blocked') AND {' AND '.join(where)}
+        ORDER BY a.id
+    """, params))
+
+    groups: dict[str, dict[str, Any]] = {}
+    members: dict[str, dict[str, list[Any]]] = {}
+    for row in rows:
+        key = _cause_key(row.pop("full_error"))
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {
+                "cause": key, "failures": 0, "sessions": 0, "repos": None,
+                "signatures": None, "tools": None,
+                "refused_by_rule": 0, "declined_by_user": 0,
+                "refused_unattributed": 0, "recovered": 0,
+                "needed_new_instruction": 0, "needed_new_session": 0,
+                "worst_attempt": 0, "first_at": row["at"], "last_at": row["at"],
+                "example_task": row["task"], "example_action_id": row["action_id"],
+                "example": row["example"], "example_error": row["example_error"],
+            }
+            members[key] = {"repos": [], "signatures": [], "tools": [],
+                            "sessions": []}
+
+        seen = members[key]
+        for field, value in (("repos", row["repo"]), ("tools", row["tool"]),
+                             ("signatures", row["signature"]),
+                             ("sessions", row["session_id"])):
+            if value is not None and value not in seen[field]:
+                seen[field].append(value)
+
+        group["failures"] += 1
+        group["refused_by_rule"] += row["blocked_by"] == "rule"
+        group["declined_by_user"] += row["blocked_by"] == "user"
+        group["refused_unattributed"] += row["refused_unattributed"]
+        group["recovered"] += row["recovered"]
+        group["needed_new_instruction"] += row["crossed_goal"]
+        group["needed_new_session"] += row["crossed_session"]
+        group["worst_attempt"] = max(group["worst_attempt"], row["attempt_no"])
+        group["last_at"] = row["at"]
+        # A failure that was recovered is the one worth handing to trace: it
+        # is the one with a series to show. Same preference the signature
+        # grouping makes, for the same reason.
+        if row["recovered"]:
+            group["example_action_id"] = row["action_id"]
+            group["example"] = row["example"]
+            group["example_error"] = row["example_error"]
+            group["example_task"] = row["task"]
+
+    for key, group in groups.items():
+        seen = members[key]
+        group["sessions"] = len(seen["sessions"])
+        group["repos"] = _names(seen["repos"])
+        group["signatures"] = _names(seen["signatures"])
+        group["tools"] = _names(seen["tools"])
+
+    ordered = sorted(groups.values(),
+                     key=lambda g: (g["failures"] - g["recovered"],
+                                    g["failures"]), reverse=True)
+    floor = int(params.get("min_failures") or 1)
+    kept = [g for g in ordered if g["failures"] >= floor]
+    return kept[:int(params.get("limit") or DEFAULT_LIMIT)]
 
 
 def tool_stats(
@@ -917,7 +1162,17 @@ def trace(conn: sqlite3.Connection, action_id: int) -> dict[str, Any]:
                s.session_uid AS session, a.session_id AS session_row,
                a.tool, a.kind, a.status, a.intent, a.detail, a.error,
                a.attempt_no, a.resolved_by_action_id AS resolved_by,
-               a.resolution_span, a.crossed_goal, a.crossed_session,
+               -- Two different measures of "how long until this was put
+               -- right", because one of them alone misleads. The span counts
+               -- what the session did in between, so it is 0 for a fix that
+               -- took seven minutes of the agent waiting and nothing else;
+               -- the seconds are the clock.
+               a.resolution_span, (
+                   SELECT ROUND((julianday(w.started_at)
+                                 - julianday(a.started_at)) * 86400, 1)
+                   FROM action w WHERE w.id = a.resolved_by_action_id
+               ) AS resolution_seconds,
+               a.crossed_goal, a.crossed_session,
                a.task_id, t.label AS task, t.status AS task_status,
                a.goal_id, g.prompt AS goal_prompt
         FROM action a
