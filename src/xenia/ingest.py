@@ -911,7 +911,25 @@ def _elapsed_ms(start: str | None, end: str) -> int | None:
     return int((finished - began).total_seconds() * 1000)
 
 
-DENIED_ERROR = (
+# A call with no completion event that the transcript does not explain
+# either. It failed — no completion hook fires for a tool error, so an
+# ordinary non-zero exit lands here — and that is all this record can say. It
+# used to say more: "denied — a PreToolUse hook refused this one, or it was
+# declined at the permission prompt", asserted from nothing but the missing
+# completion. That put fabricated refusals in the refusals column and told
+# whoever read one to go and look at a permission rule that had never fired.
+# `cat CLAUDE.md 2>/dev/null` on a file that was not there was reported as a
+# policy decision. So the wording now claims only what is known, and carries
+# none of the phrases the refusal counts are read off.
+UNEXPLAINED_ERROR = (
+    "failed — no completion event, and the transcript did not explain this one "
+    "either; the agent went on to make further calls. What ended it is not in "
+    "this record, and most calls that arrive here exited non-zero"
+)
+
+#: The old text, kept only so the rows still carrying it are recognised as
+#: xenia's own guess and can be replaced by the runtime's own words.
+_WAS_DENIED = (
     "denied — no completion event, and the agent went on to make further calls: "
     "a PreToolUse hook refused this one, or it was declined at the permission "
     "prompt, and the agent carried on around it"
@@ -1033,6 +1051,11 @@ OUTSTANDING_ERROR = (
     "came or on a runtime that exited under it"
 )
 
+#: Every text xenia writes about a call it had to settle itself. These are
+#: the only error messages it will overwrite: anything else on an action came
+#: from the runtime, and is better than anything inferable here.
+INFERRED_ERRORS = (UNEXPLAINED_ERROR, OUTSTANDING_ERROR, _WAS_DENIED)
+
 
 def apply_outcomes(conn: sqlite3.Connection, session_id: int,
                    transcript: str | None, *, whole: bool = False) -> int:
@@ -1046,7 +1069,10 @@ def apply_outcomes(conn: sqlite3.Connection, session_id: int,
 
     The inferred texts are placeholders and give way to the real message;
     anything else on the row came from somewhere better and is left alone.
+    Which text it is also decides whether the row is xenia's own guess at all,
+    now that a guess can be an 'error' as readily as a 'blocked'.
     """
+    placeholders = ", ".join("?" for _ in INFERRED_ERRORS)
     settled = 0
     for use_id, (status, blocked_by, why) in outcomes_in(
             transcript, whole=whole).items():
@@ -1054,17 +1080,26 @@ def apply_outcomes(conn: sqlite3.Connection, session_id: int,
             "UPDATE action SET status = ?, "
             "                  ended_at = COALESCE(ended_at, ?), "
             "                  blocked_by = ?, "
-            "                  error = CASE WHEN error IS NULL "
-            "                                 OR error IN (?, ?) "
+            f"                 error = CASE WHEN error IS NULL "
+            f"                                OR error IN ({placeholders}) "
             "                               THEN ? ELSE error END "
             "WHERE session_id = ? AND corr_key = ? "
             "  AND (status = 'started' "
             "       OR (blocked_by IS NULL "
-            "           AND status IN ('blocked', 'unanswered')))",
-            (status, utcnow(), blocked_by, DENIED_ERROR, OUTSTANDING_ERROR,
-             why, session_id, f"id:{use_id}"),
+            f"          AND (status IN ('blocked', 'unanswered') "
+            f"               OR error IN ({placeholders}))))",
+            (status, utcnow(), blocked_by, *INFERRED_ERRORS, why,
+             session_id, f"id:{use_id}", *INFERRED_ERRORS),
         ).rowcount
     return settled
+
+
+def _dangling(conn: sqlite3.Connection, session_id: int) -> bool:
+    """Whether this session still has a call nothing has accounted for."""
+    return conn.execute(
+        "SELECT 1 FROM action WHERE session_id = ? AND status = 'started' "
+        "LIMIT 1", (session_id,)
+    ).fetchone() is not None
 
 
 def close_session(conn: sqlite3.Connection, session_id: int, reason: str,
@@ -1072,20 +1107,33 @@ def close_session(conn: sqlite3.Connection, session_id: int, reason: str,
     from . import resolve
 
     # What the runtime said, before what xenia can infer. A refused call is
-    # only ever settled here — no PostToolUse fires for one — so this is the
-    # last chance to record why, and 'denied' below is the fallback for the
-    # ones the transcript does not explain.
+    # only ever settled here — no PostToolUse fires for one, nor for one that
+    # simply failed — so this is the last chance to record why, and the sweeps
+    # below are the fallback for the ones the transcript does not explain.
     apply_outcomes(conn, session_id, transcript)
 
+    # A long session's answer is not always in the tail: the reader stops
+    # 2 MB from the end, and these transcripts run to ten times that. So when
+    # the tail left calls dangling, the whole file is worth the read — it is
+    # the difference between the runtime's own words and a guess, and it costs
+    # nothing in the ordinary case, where nothing is dangling to look for.
+    if _dangling(conn, session_id):
+        apply_outcomes(conn, session_id, transcript, whole=True)
+
+    # Not 'blocked'. Nothing here says anything refused these — the completion
+    # hook does not fire for a tool error either, and reading a missing
+    # completion as a refusal is what filled the refusals column with calls
+    # nothing had refused. An ordinary failure is both the honest reading and
+    # the overwhelmingly common one.
     conn.execute(
-        "UPDATE action SET status = 'blocked', ended_at = ?, "
+        "UPDATE action SET status = 'error', ended_at = ?, "
         "                  error = COALESCE(error, ?) "
         "WHERE session_id = ? AND status = 'started' "
         "  AND EXISTS (SELECT 1 FROM action later "
         "               WHERE later.session_id = action.session_id "
         "                 AND later.seq > action.seq "
         "                 AND later.status IN ('ok', 'error'))",
-        (utcnow(), DENIED_ERROR, session_id),
+        (utcnow(), UNEXPLAINED_ERROR, session_id),
     )
     # Not 'blocked'. Nothing refused these — the session ended with the call
     # still in flight, usually on an approval prompt nobody answered before

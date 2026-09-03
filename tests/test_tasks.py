@@ -417,3 +417,74 @@ def test_work_under_a_task_the_agent_named_is_still_inherited(conn, clock):
 
     row = tasks(conn)["get the suite green"]
     assert row["actions"] == 3, "two attempts and the edit between them"
+
+
+def test_a_failed_task_says_what_went_wrong_not_how_many_things_did(conn, clock):
+    """The note is the only place the reason can go, and it held a count.
+
+    "All 1 action(s) failed with no successful retry." was the note on 564
+    tasks in this record, because most tasks are one action and the sentence
+    has nothing in it that 'actions' and 'failures' do not already carry. An
+    agent read a page of those rows, concluded the classifier was stuck on
+    one string and the status field was worthless, and went and read the work
+    by hand instead.
+    """
+    args = {"command": "cat CLAUDE.md", "description": "Read project CLAUDE.md"}
+    run(conn, clock, pre("Bash", args),
+        post("Bash", args, response={"is_error": True, "error": "Exit code 1"}))
+    stop(conn, clock)
+
+    row = tasks(conn)["Read project CLAUDE.md"]
+    assert row["status"] == "failed"
+    assert "Exit code 1" in row["note"], "the reason, not the arithmetic"
+    assert "1 action(s)" not in row["note"]
+
+
+def test_two_failed_tasks_do_not_get_the_same_note(conn, clock):
+    for i, error in enumerate(("Exit code 127", "Exit code 143")):
+        args = {"command": f"./run-{i}", "description": f"Run job {i}"}
+        run(conn, clock, pre("Bash", args),
+            post("Bash", args, response={"is_error": True, "error": error}))
+    stop(conn, clock)
+
+    notes = {row["note"] for row in tasks(conn).values()}
+    assert len(notes) == 2, f"one note per reason, got {notes}"
+
+
+def test_a_page_of_task_rows_carries_the_window_it_is_a_slice_of(conn, clock,
+                                                                 tmp_path):
+    """Worst-first ordering means the top of a page is every failure there is.
+
+    Which reads as a window where everything failed, and was read that way: a
+    1.5% task failure rate was reported back as "xenia marks 100% of tasks
+    failed — that's a broken classifier", from thirty rows off the top of
+    twelve thousand. The rows were right. What was missing was the
+    denominator, so it ships with them.
+    """
+    bad = {"command": "./flaky", "description": "The one that failed"}
+    run(conn, clock, pre("Bash", bad),
+        post("Bash", bad, response={"is_error": True, "error": "Exit code 1"}))
+    for i in range(4):
+        args = {"command": f"echo {i}", "description": f"Fine {i}"}
+        run(conn, clock, pre("Bash", args), post("Bash", args))
+    stop(conn, clock)
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        totals = readonly.task_totals(ro)
+        assert totals["tasks_in_window"] == 5
+        assert totals["by_status"] == {"achieved": 4, "failed": 1}
+        assert totals["matched_by_this_query"] == 5
+
+        # The rows a caller actually gets first are all failures — which is
+        # the whole reason the totals have to travel with them.
+        rows = readonly.tasks(ro, limit=1)
+        assert [r["status"] for r in rows] == ["failed"]
+
+        # And a filter narrows 'matched' without hiding the window it came from.
+        narrowed = readonly.task_totals(ro, status="failed")
+        assert narrowed["matched_by_this_query"] == 1
+        assert narrowed["tasks_in_window"] == 5
+    finally:
+        ro.close()

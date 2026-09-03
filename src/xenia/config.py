@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 GENERAL_REPO = "general"
 

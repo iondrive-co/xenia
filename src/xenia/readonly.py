@@ -75,12 +75,15 @@ FAILURE_GROUPS = ("signature", "cause")
 # A refusal nothing recorded an owner for. The runtime sets blocked_by only
 # for what *it* refused, so a daemon or an MCP server saying no — the most
 # actionable failure class on a machine with brokered tools — arrives as an
-# ordinary tool error and is invisible to both refusal counts; so does a
-# refusal this record could only infer from a missing completion.
+# ordinary tool error and is invisible to both refusal counts.
 #
 # Matched on the error text, which is the only evidence there is, and left
-# unattributed rather than guessed at: which of the two it was is in the error
-# itself, and a wrong attribution here sends the reader to the wrong file.
+# unattributed rather than guessed at: who refused it is in the error itself,
+# and a wrong attribution here sends the reader to the wrong file. Only ever
+# text something else wrote, too. These phrases used to match xenia's own
+# guess about a call with no completion event, which put 542 rows nothing had
+# refused into this count; a guess is not evidence, and no longer says any of
+# the words below.
 # Deliberately phrases and not single words: 'refused' alone reads
 # ECONNREFUSED as a policy decision, which is the opposite kind of problem.
 REFUSAL_PHRASES = (
@@ -192,20 +195,63 @@ def reader_retirements(conn: sqlite3.Connection, *, limit: int = 3) -> list[dict
 
 
 def parse_since(since: str | None) -> str | None:
+    """A window, as a cutoff string that compares against a stored timestamp.
+
+    Every timestamp in this record is one shape — `2026-09-02T05:08:07.645+00:00`
+    — and every window is a string comparison against it, so a cutoff that is
+    not in that shape does not error, it silently selects the wrong rows.
+    Which is what happened: `since` lower-cased its whole argument, and a
+    perfectly ordinary `2026-09-02T00:00:00Z` became `...t00:00:00z`, whose
+    lower-case `t` sorts *after* the `T` in every timestamp of that day. The
+    query matched nothing, said so, and read as "no work happened" — a whole
+    day of it. So an absolute cutoff is parsed and re-emitted here, never
+    passed through.
+
+    Unparseable is an error, not an empty window. `1w` used to fall through as
+    a literal, comparing below every timestamp there is and quietly meaning
+    all time; `yesterday` became None, which means all time on purpose. Both
+    read as an answer. Raising names the forms that work instead.
+    """
     if not since:
         return None
-    text = str(since).strip().lower()
+    text = str(since).strip()
     now = datetime.now(timezone.utc)
+
+    unit = {"h": "hours", "d": "days", "m": "minutes", "w": "weeks"}.get(
+        text[-1:].lower())
+    if unit:
+        try:
+            return (now - timedelta(**{unit: float(text[:-1])})).isoformat()
+        except ValueError:
+            pass
+
+    moment = _moment(text)
+    if moment is not None:
+        return moment
+    raise KeyError(
+        f"since: cannot read {since!r} as a window. Give a length back from "
+        "now — '30m', '4h', '7d', '2w' — or a moment to start from: "
+        "'2026-09-02', '2026-09-02T04:30' or '2026-09-02T04:30:00Z'."
+    )
+
+
+def _moment(text: str) -> str | None:
+    """An absolute cutoff, in the shape the stored timestamps are in.
+
+    Tolerates what people and agents actually type — a trailing `Z`, a space
+    for the `T`, a bare date — and normalises all of it, because the
+    comparison is textual and only the normalised form is right. A bare date
+    is midnight UTC, and a moment with no offset is read as UTC, which is the
+    only clock this record keeps.
+    """
+    candidate = text[:-1] + "+00:00" if text[-1:] in ("Z", "z") else text
     try:
-        if text.endswith("h"):
-            return (now - timedelta(hours=float(text[:-1]))).isoformat()
-        if text.endswith("d"):
-            return (now - timedelta(days=float(text[:-1]))).isoformat()
-        if text.endswith("m"):
-            return (now - timedelta(minutes=float(text[:-1]))).isoformat()
+        stamp = datetime.fromisoformat(candidate.replace(" ", "T", 1))
     except ValueError:
         return None
-    return text if text[:1].isdigit() else None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _window_before(cutoff: str) -> str:
@@ -595,12 +641,15 @@ def goals(conn: sqlite3.Connection, *, since: str | None = None,
     """, params))
 
 
-def tasks(conn: sqlite3.Connection, *, since: str | None = None,
-          repo: str | None = None, status: str | None = None,
-          source: str | None = None, agent: str | None = None,
-          goal: int | None = None, overstated_only: bool = False,
-          search: str | None = None, order: str = "significance",
-          limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+def _task_scope(since: str | None, repo: str | None, source: str | None,
+                agent: str | None, goal: int | None,
+                search: str | None) -> tuple[list[str], dict[str, Any]]:
+    """Which tasks the question is about, before any outcome narrows it.
+
+    Split out from the outcome filters on purpose: this is the population a
+    row has to be read against, and `task_totals` counts it while `tasks`
+    returns a page of it.
+    """
     where = ["1=1"]
     params: dict[str, Any] = {}
     cutoff = parse_since(since)
@@ -610,9 +659,6 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
     if repo:
         where.append("repo = :repo")
         params["repo"] = repo
-    if status in TASK_STATUSES:
-        where.append("status = :status")
-        params["status"] = status
     if source in TASK_SOURCES:
         where.append("source = :source")
         params["source"] = source
@@ -622,11 +668,75 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
     if goal:
         where.append("goal_id = :goal")
         params["goal"] = int(goal)
-    if overstated_only:
-        where.append("overstated = 1")
     if search:
         where.append("(label LIKE :q OR goal_prompt LIKE :q)")
         params["q"] = f"%{search}%"
+    return where, params
+
+
+def _task_outcome_filter(status: str | None,
+                         overstated_only: bool) -> tuple[list[str], dict[str, Any]]:
+    """The part of a task query that selects on how the work turned out."""
+    where: list[str] = []
+    params: dict[str, Any] = {}
+    if status in TASK_STATUSES:
+        where.append("status = :status")
+        params["status"] = status
+    if overstated_only:
+        where.append("overstated = 1")
+    return where, params
+
+
+def task_totals(conn: sqlite3.Connection, *, since: str | None = None,
+                repo: str | None = None, status: str | None = None,
+                source: str | None = None, agent: str | None = None,
+                goal: int | None = None, overstated_only: bool = False,
+                search: str | None = None) -> dict[str, Any]:
+    """The denominator for a page of task rows.
+
+    The tasks view is ordered worst-first by design, so the top of it is all
+    failures whenever there are any — and a client that reads a page of it
+    and nothing else concludes the window is all failures. One did: it called
+    a 1.5% failure rate "100% of tasks failed with an identical note", decided
+    the classifier was broken, and went and read the work by hand instead.
+    It was reading thirty rows off the top of twelve thousand.
+
+    So the shape of the whole window ships with the page. `by_status` is
+    counted over the window and its subject filters but *not* over the
+    outcome ones, because it is there to say what the rows returned are a
+    slice of; `matched` is the same count with the whole query applied.
+    """
+    where, params = _task_scope(since, repo, source, agent, goal, search)
+    outcome, outcome_params = _task_outcome_filter(status, overstated_only)
+    params.update(outcome_params)
+    # One scan, not two: a second query for the matched count can disagree
+    # with the breakdown it is printed beside if a session closes between them.
+    matched = f"SUM({' AND '.join(outcome)})" if outcome else "COUNT(*)"
+
+    rows = conn.execute(f"""
+        SELECT status, COUNT(*) AS tasks, {matched} AS matched
+        FROM v_task_outcomes
+        WHERE {' AND '.join(where)}
+        GROUP BY status ORDER BY tasks DESC
+    """, params).fetchall()
+
+    return {
+        "tasks_in_window": sum(r["tasks"] for r in rows),
+        "matched_by_this_query": sum(r["matched"] or 0 for r in rows),
+        "by_status": {r["status"]: r["tasks"] for r in rows},
+    }
+
+
+def tasks(conn: sqlite3.Connection, *, since: str | None = None,
+          repo: str | None = None, status: str | None = None,
+          source: str | None = None, agent: str | None = None,
+          goal: int | None = None, overstated_only: bool = False,
+          search: str | None = None, order: str = "significance",
+          limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    where, params = _task_scope(since, repo, source, agent, goal, search)
+    outcome, outcome_params = _task_outcome_filter(status, overstated_only)
+    where += outcome
+    params.update(outcome_params)
     params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
     sort = TASK_ORDER_SQL.get(order or "significance",
                               TASK_ORDER_SQL["significance"])

@@ -96,20 +96,22 @@ def test_an_earlier_success_cannot_resolve_a_later_failure(conn, clock):
     assert rows[1]["resolved_by_action_id"] is None
 
 
-def test_a_blocked_call_counts_as_a_failure_to_resolve(conn, clock):
+def test_a_call_nothing_explained_counts_as_a_failure_to_resolve(conn, clock):
     prompt(conn, clock, "Check the prod box")
     clock()
     ingest.record(conn, pre("Bash", {"command": "ssh monitoring-prod-1 uptime"}))
-    # Something followed it, so the agent was refused and carried on around it.
+    # Something followed it, so the call ended somehow and the agent carried
+    # on around it. Which of failing and being refused it was, nothing here
+    # says — but either way it did not do what it was for.
     clock()
     ingest.record(conn, pre("Bash", {"command": "curl https://broker.test/uptime"}))
     clock()
     ingest.record(conn, post("Bash", {"command": "curl https://broker.test/uptime"}))
     stop(conn, clock)
 
-    blocked = actions(conn)[0]
-    assert blocked["status"] == "blocked"
-    assert blocked["resolved_by_action_id"] is None
+    unexplained = actions(conn)[0]
+    assert unexplained["status"] == "error"
+    assert unexplained["resolved_by_action_id"] is None
 
 
 def test_a_call_nobody_answered_does_not_fail_the_instruction(conn, clock):

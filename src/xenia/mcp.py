@@ -14,8 +14,12 @@ SERVER_INFO = {"name": "xenia", "version": "0.1.0"}
 
 _SINCE = {
     "type": "string",
-    "description": "Window to look back over: '24h', '7d', '30m', or a date "
-                   "like '2026-07-01'. Omit for all time.",
+    "description": "Window to look back over. Either a length back from now "
+                   "— '30m', '4h', '7d', '2w' — or a moment to start from: "
+                   "'2026-07-01', '2026-07-01T04:30', "
+                   "'2026-07-01T04:30:00Z'. The record is UTC and a moment "
+                   "with no offset is read as UTC. Omit for all time; "
+                   "anything else is an error rather than a silent window.",
 }
 _REPO = {
     "type": "string",
@@ -96,8 +100,11 @@ TOOLS: list[dict[str, Any]] = [
             "Ordered by what went wrong — failed, then overstated and partial, "
             "then the rest, most recent first inside each — because an "
             "unfiltered window is mostly one-action successes and they are "
-            "not the answer to anything. Pass order='at' for a timeline "
-            "instead. Start here.\n"
+            "not the answer to anything. Which means the top of any page is "
+            "every failure there is: read 'totals' before concluding anything "
+            "from the mix of rows, because it counts the whole window by "
+            "status and the rows are a worst-first slice of it. Pass "
+            "order='at' for a timeline instead. Start here.\n"
             "  instructions  the same question one level up: one thing the "
             "*user* asked for, and how it turned out. The only view that "
             "carries whole prompts, which is why the rest carry a 'goal_id' — "
@@ -114,9 +121,9 @@ TOOLS: list[dict[str, Any]] = [
             "permission rule, and the reason is in 'example_error' — a config "
             "or code fix; 'declined_by_user' is a person saying no at the "
             "prompt, which is not yours to change; 'refused_unattributed' is a "
-            "refusal nothing recorded an owner for — usually a daemon or an "
-            "MCP server saying no in a reply the runtime read as an ordinary "
-            "error, sometimes one this record could only infer. That is the "
+            "refusal nothing recorded an owner for — a daemon or an MCP "
+            "server saying no in a reply the runtime read as an ordinary "
+            "error. That is the "
             "class neither other count can see and the one most often "
             "fixable, and 'example_error' says which it was and what it "
             "wanted. Group by 'cause' instead of by signature "
@@ -455,6 +462,12 @@ def _trim(payload: dict[str, Any], key: str, rows: list[Any],
                   f"by the client rather than shortened",
         "advice": _cut_note(payload),
     }
+    # A count of the rows sent has to survive being one of the things that
+    # changed. It is in the reply to stop a page being read as the whole
+    # window, so a stale one is worse than none: it would claim 500 rows in
+    # the very reply that carries 48.
+    if isinstance(out.get("totals"), dict):
+        out["totals"] = dict(out["totals"], rows_returned=kept)
     # The tasks view carries one copy of each instruction its rows sat under.
     # Dropping rows can orphan those, and an instruction nothing now refers to
     # is the most expensive kind of dead weight — it is whole prompt text.
@@ -518,14 +531,24 @@ def _report(conn, args: dict[str, Any]) -> Any:
     if view == "tasks":
         order = _one_of("order", args.get("order"),
                         readonly.TASK_ORDERS) or "significance"
-        rows = readonly.tasks(
-            conn, since=since, repo=repo,
-            status=_one_of("status", args.get("status"), readonly.TASK_STATUSES),
-            source=_one_of("source", args.get("source"), readonly.TASK_SOURCES),
-            agent=args.get("agent"), search=args.get("search"), order=order,
-            overstated_only=bool(args.get("overstated_only")), limit=limit)
+        scope = {
+            "since": since, "repo": repo,
+            "status": _one_of("status", args.get("status"),
+                              readonly.TASK_STATUSES),
+            "source": _one_of("source", args.get("source"),
+                              readonly.TASK_SOURCES),
+            "agent": args.get("agent"), "search": args.get("search"),
+            "overstated_only": bool(args.get("overstated_only")),
+        }
+        rows = readonly.tasks(conn, order=order, limit=limit, **scope)
         out: dict[str, Any] = {"view": view,
                                "ordered_by": readonly.TASK_ORDER_NOTE[order]}
+        # Before the rows, because it is what the rows have to be read
+        # against: worst-first ordering means the top of any page is every
+        # failure there is, and a page read without its denominator reads as
+        # a window where everything failed.
+        out["totals"] = dict(readonly.task_totals(conn, **scope),
+                             rows_returned=len(rows))
         under = _lift(rows, "goal_id", "goal_summary")
         if under:
             out["instructions"] = under

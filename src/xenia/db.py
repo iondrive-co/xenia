@@ -38,6 +38,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     _agree_on_the_agent(conn)
     _separate_the_unanswered(conn)
     _settle_guessed_calls(conn)
+    _stop_calling_them_refusals(conn)
+    _say_what_went_wrong(conn)
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -138,8 +140,9 @@ def _settle_guessed_calls(conn: sqlite3.Connection) -> None:
     """
     from . import ingest
 
+    placeholders = ", ".join("?" for _ in ingest.INFERRED_ERRORS)
     try:
-        sessions = conn.execute("""
+        sessions = conn.execute(f"""
             SELECT a.session_id AS session_id,
                    (SELECT e.payload FROM event e
                     WHERE e.session_uid = s.session_uid
@@ -147,9 +150,11 @@ def _settle_guessed_calls(conn: sqlite3.Connection) -> None:
                     LIMIT 1)          AS payload
             FROM action a
             JOIN session s ON s.id = a.session_id
-            WHERE a.status IN ('blocked', 'unanswered') AND a.blocked_by IS NULL
+            WHERE a.blocked_by IS NULL
+              AND (a.status IN ('blocked', 'unanswered')
+                   OR a.error IN ({placeholders}))
             GROUP BY a.session_id
-        """).fetchall()
+        """, ingest.INFERRED_ERRORS).fetchall()
     except sqlite3.OperationalError:
         return
 
@@ -165,6 +170,75 @@ def _settle_guessed_calls(conn: sqlite3.Connection) -> None:
             # ended long ago and their answers sit wherever they happened.
             ingest.apply_outcomes(conn, row["session_id"], transcript,
                                   whole=True)
+        except sqlite3.OperationalError:
+            continue
+
+
+def _stop_calling_them_refusals(conn: sqlite3.Connection) -> None:
+    """Take the calls nothing refused back out of the refusals column.
+
+    Whatever `_settle_guessed_calls` could not find the runtime's own words
+    for is still carrying xenia's guess — "denied — a PreToolUse hook refused
+    this one, or it was declined at the permission prompt" — and the refusal
+    counts are read off the error text, so 542 rows that nothing had refused
+    were being reported as refusals with no owner. That is the class the
+    failures view calls out as the most often fixable one, and it was mostly
+    `cat` on a file that was not there.
+
+    The guess is not narrowed here either. A missing completion says the call
+    did not report back; it does not say who stopped it, and no completion
+    fires for an ordinary tool error. So these become failures whose cause
+    this record does not know, which is what they always were.
+    """
+    from . import ingest
+
+    try:
+        conn.execute(
+            "UPDATE action SET status = 'error', error = ? "
+            "WHERE status = 'blocked' AND blocked_by IS NULL AND error = ?",
+            (ingest.UNEXPLAINED_ERROR, ingest._WAS_DENIED),
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _say_what_went_wrong(conn: sqlite3.Connection) -> None:
+    """Re-score the tasks whose outcome note was only ever a count.
+
+    "All 1 action(s) failed with no successful retry." was the note on 564
+    tasks, and it says nothing that 'actions' and 'failures' do not already
+    carry. Scoring reads the reason off the actions now, so the sessions
+    holding those tasks are scored again — only those, since the note itself
+    identifies them and re-resolving 1,825 sessions to fix 564 rows is a
+    migration nobody would wait for.
+
+    A note is a copy, taken when the task was scored, so it also has to be
+    retaken wherever the action underneath it has since been re-settled — the
+    quoted reason is otherwise a sentence this record no longer says
+    anywhere. Which is not hypothetical: two hooks migrating at once got the
+    two steps in the other order and left three notes quoting the guess the
+    step before had just removed.
+    """
+    from . import ingest, resolve
+
+    # A prefix, because the note quotes a *capped* reason: a guess long
+    # enough to be worth removing is long enough to have been cut short in
+    # the note, and matching the whole sentence finds none of them.
+    quotes_a_guess = " OR ".join(
+        "outcome_note LIKE '%' || substr(?, 1, 60) || '%'"
+        for _ in ingest.INFERRED_ERRORS)
+    try:
+        sessions = [row["session_id"] for row in conn.execute(
+            "SELECT DISTINCT session_id FROM task "
+            "WHERE outcome_note LIKE 'All % action(s) failed with no "
+            f"       successful retry.' OR {quotes_a_guess}",
+            ingest.INFERRED_ERRORS)]
+    except sqlite3.OperationalError:
+        return
+
+    for session_id in sessions:
+        try:
+            resolve._score_tasks(conn, session_id)
         except sqlite3.OperationalError:
             continue
 

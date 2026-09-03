@@ -6,7 +6,7 @@ import pytest
 
 from conftest import CORE, FAKE_GITLAB_PAT, OPS, make_repo, post, pre
 
-from xenia import classify, ingest
+from xenia import classify, ingest, readonly
 
 
 def one(conn, sql, params=()):
@@ -177,7 +177,16 @@ def test_a_call_with_no_completion_is_still_settled(conn, clock):
     assert action["ended_at"] is not None
 
 
-def test_a_call_the_agent_worked_around_reads_as_a_denial(conn, clock):
+def test_a_call_the_agent_worked_around_is_a_failure_nobody_explained(conn, clock):
+    """A missing completion is not evidence of a refusal.
+
+    It used to be read as one — "a PreToolUse hook refused this one, or it
+    was declined at the permission prompt" — from nothing but the gap. No
+    completion hook fires for an ordinary tool error either, so that filled
+    the refusals column with 542 calls nothing had refused, most of them
+    `cat` on a file that was not there, and sent whoever read one looking for
+    a permission rule that had never fired.
+    """
     clock()
     ingest.record(conn, pre("Bash", {"command": "ssh monitoring-prod-1 uptime"}))
     clock()
@@ -189,9 +198,14 @@ def test_a_call_the_agent_worked_around_reads_as_a_denial(conn, clock):
                          "cwd": CORE})
 
     rows = conn.execute("SELECT status, error FROM action ORDER BY seq").fetchall()
-    assert rows[0]["status"] == "blocked"
-    assert rows[0]["error"].startswith("denied —")
+    assert rows[0]["status"] == "error", "a failure, and still a failure"
+    assert rows[0]["error"].startswith("failed —")
     assert rows[1]["status"] == "ok"
+
+    # And it says none of the words the unattributed-refusal count is read
+    # off, which is the half of this that fed the wrong number.
+    said = rows[0]["error"].lower()
+    assert not [p for p in readonly.REFUSAL_PHRASES if p in said]
 
 
 def test_a_call_still_in_flight_at_the_end_is_not_called_a_denial(conn, clock):
@@ -798,8 +812,9 @@ def test_a_refusal_is_explained_after_the_fact_too(conn, clock, tmp_path):
 
     inferred = one(conn, "SELECT status, blocked_by, error FROM action "
                          "WHERE detail = 'ssh prod-1 uptime'")
-    assert (inferred["status"], inferred["blocked_by"]) == ("blocked", None)
-    assert "denied" in inferred["error"], "inference is all it had"
+    assert (inferred["status"], inferred["blocked_by"]) == ("error", None)
+    assert "did not explain" in inferred["error"], \
+        "a failure of unknown cause is all it had — and all it should claim"
 
     settled = ingest.apply_outcomes(conn, 1, _transcript(
         tmp_path,
