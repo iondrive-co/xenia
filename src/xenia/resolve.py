@@ -108,6 +108,41 @@ def _score_goals(conn: sqlite3.Connection, session_id: int) -> None:
         )
 
 
+#: How much of an error belongs in a one-line outcome note. Long enough for
+#: an exit code, a refused path or the first sentence of a traceback; short
+#: enough that a page of task rows is still scannable.
+REASON_CHARS = 140
+
+
+def _reason(conn: sqlite3.Connection, task_id: int) -> str | None:
+    """What actually went wrong, for the note to say instead of the count.
+
+    "All 1 action(s) failed with no successful retry." has nothing in it but
+    the count — which 'actions' and 'failures' already carry, and most tasks
+    are one action.
+
+    The last unresolved failure, because that is the one still standing when
+    the task ended. First line only: an error is stored up to 1,000
+    characters and a note is a line.
+    """
+    row = conn.execute(
+        "SELECT tool, error FROM action "
+        "WHERE task_id = ? AND status IN ('error', 'blocked') "
+        "      AND resolved_by_action_id IS NULL "
+        "ORDER BY seq DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    lines = [line.strip() for line in (row["error"] or "").splitlines()]
+    text = next((line for line in lines if line), "")
+    if len(text) > REASON_CHARS:
+        text = text[:REASON_CHARS - 1].rstrip() + "…"
+    tool = row["tool"] or "the call"
+    return f"{tool}: {text}" if text else f"{tool}, with no error recorded"
+
+
 def _score_tasks(conn: sqlite3.Connection, session_id: int) -> None:
     session = conn.execute(
         "SELECT ended_at FROM session WHERE id = ?", (session_id,)
@@ -153,9 +188,20 @@ def _score_tasks(conn: sqlite3.Connection, session_id: int) -> None:
             status = "partial"
             note = (f"{ok} action(s) succeeded but {unresolved} of {failed} "
                     "failure(s) were never resolved.")
+            why = _reason(conn, task["id"])
+            if why:
+                note += f" Last of them — {why}"
         else:
             status = "failed"
-            note = f"All {failed} action(s) failed with no successful retry."
+            why = _reason(conn, task["id"])
+            if total == 1:
+                note = (f"The one action failed and was not retried — {why}"
+                        if why else
+                        "The one action failed and was not retried.")
+            else:
+                note = f"All {failed} action(s) failed with no successful retry."
+                if why:
+                    note += f" Last of them — {why}"
 
         if ended and total == 0 and declared in ("in_progress", "dropped"):
             status = "abandoned"

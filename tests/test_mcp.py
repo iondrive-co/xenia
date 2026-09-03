@@ -361,3 +361,24 @@ def test_a_grouping_no_view_offers_is_still_refused(server):
                    "arguments": {"view": "failures", "group_by": "host"}},
     })
     assert "cause" in reply["error"]["message"]
+
+
+def test_a_cut_reply_does_not_still_claim_the_rows_it_dropped():
+    """The row count is there to stop a page reading as the whole window.
+
+    So it has to survive being one of the things the cut changed: a reply
+    trimmed from 500 rows to 48 that still says 500 is worse than one that
+    says nothing, because the number is the part a reader trusts.
+    """
+    payload = {
+        "view": "tasks",
+        "ordered_by": "failed first",
+        "totals": {"tasks_in_window": 900, "matched_by_this_query": 500,
+                   "rows_returned": 500},
+        "rows": [{"task_id": i, "note": "x" * 200} for i in range(500)],
+    }
+    cut = mcp._fit(payload, 4000)
+
+    assert "truncated" in cut
+    assert cut["totals"]["rows_returned"] == len(cut["rows"]) < 500
+    assert cut["totals"]["tasks_in_window"] == 900, "the window itself is unchanged"

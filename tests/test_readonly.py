@@ -110,8 +110,40 @@ def test_the_limit_is_capped(ro):
 def test_since_accepts_relative_windows():
     assert readonly.parse_since("24h")
     assert readonly.parse_since("7d")
+    assert readonly.parse_since("30m")
+    assert readonly.parse_since("2w")
     assert readonly.parse_since(None) is None
-    assert readonly.parse_since("nonsense") is None
+
+
+def test_since_normalises_a_moment_to_the_shape_a_timestamp_is_stored_in():
+    """A window is a string comparison, so an unnormalised cutoff is wrong.
+
+    A lower-case `t` sorts *after* the upper-case one, so a cutoff with its
+    `T` lower-cased would exclude every row recorded on that day.
+    """
+    stored = "2026-09-02T05:08:07.645+00:00"
+
+    for equivalent in ("2026-09-02T00:00:00Z", "2026-09-02t00:00:00z",
+                       "2026-09-02T00:00:00+00:00", "2026-09-02T00:00",
+                       "2026-09-02 00:00:00", "2026-09-02"):
+        cutoff = readonly.parse_since(equivalent)
+        assert cutoff == "2026-09-02T00:00:00.000+00:00", equivalent
+        assert stored >= cutoff, f"{equivalent} excluded a row inside it"
+
+    # An offset is honoured rather than dropped: 04:00+05:00 is the previous
+    # day in the only clock this record keeps.
+    assert readonly.parse_since("2026-09-02T04:00:00+05:00").startswith("2026-09-01T23:00")
+
+
+def test_since_says_so_rather_than_quietly_meaning_all_time():
+    """An unreadable window is an error, not an answer.
+
+    A literal that compares below every timestamp there is means all time,
+    and so does None. Either would read as a result.
+    """
+    for unreadable in ("1weekago", "yesterday", "last tuesday", "7", "now"):
+        with pytest.raises(KeyError, match="cannot read"):
+            readonly.parse_since(unreadable)
 
 
 def test_summary_counts_match_the_rows(ro):
@@ -332,7 +364,8 @@ def test_tool_stats_counts_without_returning_rows(brokered):
         assert row["failure_rate"] == 0.0
 
 
-def test_tool_stats_rates_blocked_calls_as_failures(conn, clock, tmp_path):
+def test_tool_stats_rates_a_call_that_never_reported_back_as_a_failure(
+        conn, clock, tmp_path):
     clock()
     ingest.record(conn, pre("Bash", {"command": "ssh prod-1 uptime"}))
     clock()
@@ -346,7 +379,11 @@ def test_tool_stats_rates_blocked_calls_as_failures(conn, clock, tmp_path):
     ro = readonly.connect(tmp_path / "audit.db")
     try:
         row = readonly.tool_stats(ro)[0]
-        assert (row["calls"], row["ok"], row["blocked"]) == (2, 1, 1)
+        # 'error', not 'blocked': nothing recorded a refusal, and the failure
+        # rate is the same either way — which is the point. The column it
+        # lands in decides whether a reader goes looking for a permission
+        # rule.
+        assert (row["calls"], row["ok"], row["failed"], row["blocked"]) == (2, 1, 1, 0)
         assert row["failure_rate"] == 0.5
     finally:
         ro.close()
