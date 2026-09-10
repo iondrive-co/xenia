@@ -8,7 +8,8 @@ import time
 import webbrowser
 from pathlib import Path
 
-from . import config, db, install, readers, report as report_mod, service
+from . import broker as broker_mod, config, db, install, readers, \
+    report as report_mod, service
 
 STATE_DIR_NAME = "xenia"
 
@@ -246,6 +247,7 @@ def _come_back_on_retirement() -> None:
 class App:
     def __init__(self) -> None:
         self.report = report_mod.Report()
+        self.broker = broker_mod.Server()
         self.tray = None
 
 
@@ -253,14 +255,37 @@ class App:
         from .tray import MenuItem
         return [
             MenuItem("Show Report", self.show_report),
+            MenuItem("Credentials", items=[
+                MenuItem("Add…", self.add_credential),
+                MenuItem("List", self.list_credentials),
+            ]),
             MenuItem("Quit xenia", self.quit),
         ]
 
     def show_report(self) -> None:
         webbrowser.open(self.report.url)
 
+    def add_credential(self) -> None:
+        """Set the store up if it needs it, then take a credential in a terminal window
+        """
+        self._in_terminal(["secret", "new"], "xenia secret new")
+
+    def list_credentials(self) -> None:
+        self._in_terminal(["secret", "list", "--wait"], "xenia secret list")
+
+    def _in_terminal(self, args: list[str], command: str) -> None:
+        from . import secrets as secrets_cli
+
+        if secrets_cli.open_in_terminal(
+                [secrets_cli.entry_point(), *args]):
+            return
+        from . import broker as broker_module
+        broker_module._notify("xenia: no terminal to open",
+                              f"Run `{command}` yourself.")
+
     def quit(self) -> None:
         _release_runtime()
+        self.broker.stop()
         self.report.stop()
         if self.tray is not None:
             self.tray.stop()
@@ -282,11 +307,26 @@ class App:
         from . import tray as tray_mod
 
         self.report.start()
+        try:
+            self.broker.start()
+        except OSError as exc:
+            # No socket is a smaller failure than no service: the record and
+            # the report are the job, and brokered calls simply refuse with a
+            # reason until this is fixed.
+            print(f"xenia: no credential broker ({exc}) — xenia_fetch will "
+                  f"refuse until this is sorted", file=sys.stderr)
         readers.register(config.SCHEMA_VERSION)
         _come_back_on_retirement()
-        runtime_file().write_text(json.dumps({
+        # 0600: this file carries the report's auth token, and every process
+        # on the machine could read it.
+        path = runtime_file()
+        path.write_text(json.dumps({
             "pid": os.getpid(), "url": self.report.url,
         }, indent=2) + "\n")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
         if show_report:
             self.show_report()
 
@@ -308,13 +348,23 @@ class App:
         return 0
 
 
+SUBCOMMANDS = ("secret", "secrets", "grant", "grants", "revoke")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in SUBCOMMANDS:
+        from . import secrets as secrets_cli
+        return secrets_cli.main(argv)
     if argv:
         print("xenia takes no arguments.\n\n"
               "  xenia            set up on first run, restart what is already "
               "running,\n"
               "                   then open the report\n\n"
+              "  xenia secrets    the credential store: setup, entry, and "
+              "approvals\n"
+              "                   (`xenia secrets` on its own explains "
+              "itself)\n\n"
               "Everything else is in the report itself, or in the read-only "
               "MCP server (xenia-mcp).", file=sys.stderr)
         return 2

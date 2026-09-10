@@ -9,9 +9,13 @@ class Unavailable(RuntimeError):
 
 
 class MenuItem:
-    def __init__(self, label: str, action: Callable[[], None]) -> None:
+    """One entry. With `items` it is a submenu and its own action is unused."""
+
+    def __init__(self, label: str, action: Callable[[], None] | None = None,
+                 items: "list[MenuItem] | None" = None) -> None:
         self.label = label
-        self.action = action
+        self.action = action or (lambda: None)
+        self.items = items or []
 
 
 class Tray:
@@ -21,9 +25,44 @@ class Tray:
         self._backend = None
         self._timers: list[tuple[int, Callable[[], bool]]] = []
 
+    def numbered(self) -> list[tuple[int, "MenuItem", int]]:
+        """Every entry as (id, item, parent id), depth first.
+
+        One flat numbering across the whole tree, because a click arrives as
+        an id and nothing else.
+        """
+        out: list[tuple[int, MenuItem, int]] = []
+
+        def walk(items: list[MenuItem], parent: int) -> None:
+            for item in items:
+                identifier = len(out) + 1
+                out.append((identifier, item, parent))
+                walk(item.items, identifier)
+
+        walk(self.items, 0)
+        return out
+
+    def flattened(self) -> list[MenuItem]:
+        """The tree as one list, for a backend that cannot nest."""
+        out: list[MenuItem] = []
+        for item in self.items:
+            if not item.items:
+                out.append(item)
+                continue
+            out.extend(MenuItem(f"{item.label}: {child.label}", child.action)
+                       for child in item.items)
+        return out
+
+    def find(self, item_id: int) -> "MenuItem | None":
+        for identifier, item, _parent in self.numbered():
+            if identifier == item_id:
+                return item
+        return None
+
     def click(self, item_id: int) -> None:
-        if 1 <= item_id <= len(self.items):
-            self.items[item_id - 1].action()
+        item = self.find(item_id)
+        if item is not None and not item.items:
+            item.action()
 
     def fire_default(self) -> None:
         if self.items:

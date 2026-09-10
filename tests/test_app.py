@@ -22,8 +22,37 @@ def test_the_dbus_pixmap_is_argb_of_the_right_size():
     assert len(argb) == icon.SIZE * icon.SIZE * 4
 
 
-def test_the_tray_menu_has_exactly_two_entries(fake_home):
-    assert [item.label for item in app.App().menu()] == ["Show Report", "Quit xenia"]
+def test_the_tray_menu_is_the_three_things_it_can_do(fake_home):
+    menu = app.App().menu()
+
+    assert [item.label for item in menu] == [
+        "Show Report", "Credentials", "Quit xenia"]
+    assert [item.label for item in menu[1].items] == ["Add…", "List"]
+
+
+def test_a_submenu_is_numbered_flat_because_a_click_is_only_an_id(fake_home):
+    from xenia.tray import Tray
+
+    tray = Tray("xenia", app.App().menu())
+    numbered = tray.numbered()
+
+    assert [(i, item.label, parent) for i, item, parent in numbered] == [
+        (1, "Show Report", 0), (2, "Credentials", 0),
+        (3, "Add…", 2), (4, "List", 2), (5, "Quit xenia", 0)]
+
+
+def test_clicking_a_submenu_header_does_nothing(fake_home, monkeypatch):
+    from xenia.tray import MenuItem, Tray
+
+    fired = []
+    tray = Tray("xenia", [
+        MenuItem("Credentials", lambda: fired.append("header"),
+                 items=[MenuItem("Add", lambda: fired.append("add"))])])
+
+    tray.click(1)
+    tray.click(2)
+
+    assert fired == ["add"]
 
 
 def test_show_report_opens_the_served_page(fake_home, monkeypatch):
@@ -33,7 +62,7 @@ def test_show_report_opens_the_served_page(fake_home, monkeypatch):
     monkeypatch.setattr(app.webbrowser, "open", opened.append)
     try:
         url = instance.report.url
-        show, quit_ = instance.menu()
+        show, _credentials, quit_ = instance.menu()
         show.action()
     finally:
         instance.report.stop()
@@ -272,3 +301,47 @@ def test_the_entry_points_resolve_symlinks(fake_home):
         body = (app._entry_point().parent / name).read_text()
         assert "os.path.realpath(__file__)" in body
         assert "os.path.abspath(__file__)" not in body
+
+
+def test_the_credentials_item_opens_the_wizard_not_the_report(fake_home,
+                                                              monkeypatch):
+    """The value has to be typed unechoed, and the report page is read-only."""
+    from xenia import secrets as secrets_cli
+
+    opened, launched = [], []
+    monkeypatch.setattr(app.webbrowser, "open", opened.append)
+    monkeypatch.setattr(secrets_cli, "open_in_terminal",
+                        lambda command: launched.append(command) or True)
+
+    add, listing = app.App().menu()[1].items
+    add.action()
+
+    assert opened == [], "the report page is not the credentials surface"
+    assert launched and launched[0][-2:] == ["secret", "new"]
+
+    listing.action()
+    assert launched[1][-3:-1] == ["secret", "list"]
+
+
+def test_no_terminal_says_what_to_run_instead(fake_home, monkeypatch):
+    from xenia import broker as broker_module
+    from xenia import secrets as secrets_cli
+
+    told = []
+    monkeypatch.setattr(secrets_cli, "open_in_terminal", lambda command: False)
+    monkeypatch.setattr(broker_module, "_notify",
+                        lambda summary, body: told.append(body))
+
+    app.App().menu()[1].items[0].action()
+
+    assert told and "xenia secret new" in told[0]
+
+
+def test_a_backend_that_cannot_nest_gets_the_tree_flattened(fake_home):
+    """The mac status item has no submenus, so it shows the leaves."""
+    from xenia.tray import Tray
+
+    labels = [item.label for item in Tray("xenia", app.App().menu()).flattened()]
+
+    assert labels == ["Show Report", "Credentials: Add…",
+                      "Credentials: List", "Quit xenia"]

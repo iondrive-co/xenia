@@ -13,10 +13,11 @@ from xenia import app, tray
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "xenia"
 
 STDLIB = {
-    "argparse", "ast", "contextlib", "ctypes", "dataclasses", "datetime",
-    "fnmatch", "hashlib", "hmac", "http", "io", "json", "os", "pathlib", "platform",
+    "argparse", "ast", "base64", "contextlib", "ctypes", "dataclasses",
+    "datetime", "decimal", "fnmatch", "getpass", "hashlib", "hmac", "http", "io",
+    "ipaddress", "json", "os", "pathlib", "platform",
     "plistlib", "posixpath", "re", "secrets", "shlex", "shutil", "signal",
-    "socket",
+    "socket", "ssl",
     "sqlite3", "struct", "subprocess", "sys", "threading", "time", "typing",
     "urllib", "webbrowser", "zlib",
 }

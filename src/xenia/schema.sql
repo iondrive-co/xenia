@@ -163,6 +163,97 @@ CREATE INDEX IF NOT EXISTS fs_path_idx   ON fs_change (path);
 CREATE INDEX IF NOT EXISTS fs_sens_idx   ON fs_change (sensitivity);
 CREATE INDEX IF NOT EXISTS fs_action_idx ON fs_change (action_id);
 
+-- A credential xenia may use on an agent's behalf. The value is not here: it
+-- lives in the operating system's own store. This row is the name, and the
+-- rules bounding where it may be sent.
+CREATE TABLE IF NOT EXISTS secret (
+    name         TEXT PRIMARY KEY,
+    backend      TEXT NOT NULL,
+    hosts        TEXT NOT NULL,          -- JSON array of host globs
+    methods      TEXT NOT NULL,          -- JSON array of HTTP methods
+    paths        TEXT,                   -- JSON array of path globs, NULL = any
+    note         TEXT,
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    -- Signing profiles, as JSON: {"default": {"scheme": "hmac", ...}}. Both
+    -- the scheme and the string it signs live here rather than in the
+    -- caller's request.
+    schemes      TEXT,
+    -- A strictly increasing counter, for APIs that require one. The broker
+    -- sees every call for a credential, so it is the only thing that can keep
+    -- one. Persisted: a restart that reset it would break every later call.
+    last_nonce   INTEGER,
+    -- What this credential is for, and what it was proven able to do. A scope
+    -- nobody checked with the far side is a claim rather than a fact, and it
+    -- goes stale.
+    -- The allowlist of actions this credential may take, as JSON: which
+    -- endpoints, and what the request is allowed to say. Required for any
+    -- credential that names a service, where a route alone cannot separate a
+    -- harmless call from a damaging one.
+    body_policy       TEXT,
+    service           TEXT,
+    scope             TEXT,
+    scope_verified_at TEXT,
+    expires_hint      TEXT
+);
+
+-- One approval, by a human, for one credential against one host. Two clocks:
+-- expires_at slides forward on every use, ceiling_at never moves.
+CREATE TABLE IF NOT EXISTS secret_grant (
+    id           INTEGER PRIMARY KEY,
+    name         TEXT    NOT NULL REFERENCES secret (name) ON DELETE CASCADE,
+    host         TEXT    NOT NULL,
+    mutating     INTEGER NOT NULL DEFAULT 0,
+    granted_at   TEXT    NOT NULL,
+    -- The sliding window this grant was given, in seconds. It belongs to the
+    -- grant rather than to the config, or `--for 60s` slides out to the
+    -- default on first use.
+    window_s     INTEGER,
+    expires_at   TEXT    NOT NULL,
+    ceiling_at   TEXT    NOT NULL,
+    last_used_at TEXT,
+    uses         INTEGER NOT NULL DEFAULT 0,
+    source       TEXT    NOT NULL,
+    revoked_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS secret_grant_idx ON secret_grant (name, host, mutating);
+
+-- Every request a credential was asked for, allowed or refused. `url` is the
+-- template the agent wrote, placeholder still in it: the filled-in string is
+-- never formed anywhere that outlives the request.
+CREATE TABLE IF NOT EXISTS secret_use (
+    id          INTEGER PRIMARY KEY,
+    at          TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    client      TEXT,
+    host        TEXT,
+    method      TEXT,
+    url         TEXT,
+    placed      TEXT,
+    decision    TEXT    NOT NULL,       -- 'allowed' | 'refused'
+    reason      TEXT,
+    grant_id    INTEGER,
+    status      INTEGER,
+    bytes       INTEGER,
+    duration_ms INTEGER,
+    -- 1 when the far side sent the credential back in its own response, which
+    -- is not a redaction problem but a rotation one.
+    echoed      INTEGER NOT NULL DEFAULT 0,
+    -- The machine-readable half of a refusal; the prose beside it is what
+    -- makes one actionable for an agent.
+    code        TEXT,
+    -- What was sent and what came back, scrubbed and kept whole on disk past
+    -- any reply cap.
+    request_path     TEXT,
+    response_path    TEXT,
+    request_sha256   TEXT,
+    response_sha256  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS secret_use_idx      ON secret_use (at);
+CREATE INDEX IF NOT EXISTS secret_use_name_idx ON secret_use (name, at);
+
 DROP VIEW IF EXISTS v_remote_calls;
 CREATE VIEW v_remote_calls AS
 SELECT a.id            AS action_id,

@@ -4,8 +4,8 @@
 
 | | |
 | --- | --- |
-| `bin/xenia` | the command — sets up, starts the service (restarting one already running, so it picks up the code on disk), opens the report, exits |
-| `bin/xenia-service` | the long-running process: tray and report |
+| `bin/xenia` | the command — sets up, starts the service (restarting one already running, so it picks up the code on disk), opens the report, exits. Also the credential commands: `secret`, `secrets`, `grant`, `grants`, `revoke` |
+| `bin/xenia-service` | the long-running process: tray, report and the credential broker |
 | `bin/xenia-hook` | hook entry point — fails soft, always exits 0 |
 | `bin/xenia-mcp` | the read-only MCP server, over stdio |
 
@@ -31,6 +31,20 @@ which is why every part of it fails soft.
 | `db.py` | connection, and the migrations that reach an old file |
 | `chain.py` | the hash chain and its verification — `Break`, `VerifyResult` |
 
+## Credentials
+
+Values live in the operating system's store; xenia holds the name, the policy
+and the record. Only the service ever reads a value, and only for the length of
+one outbound request.
+
+| Module | What is in it |
+| --- | --- |
+| `vault.py` | the OS stores — Secret Service over `dbus.py`, Keychain over `security` — behind `get`/`set`/`delete` |
+| `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing — `Refusal`, `Scrubber`, `Server`, `OPS`, `CODES` |
+| `signing.py` | how a credential authenticates a request without appearing in it — `Context`, `SCHEMES`, `SchemeError` |
+| `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
+| `secrets.py` | first-use setup for the store, and the commands that enter and approve credentials |
+
 ## Read
 
 Two front ends over one read path. Neither can write, and neither returns file
@@ -39,7 +53,7 @@ content.
 | Module | What is in it |
 | --- | --- |
 | `readonly.py` | every query there is, and the credential boundary — `StaleReader` |
-| `mcp.py` | the MCP protocol and the three tool definitions — `Server` |
+| `mcp.py` | the MCP protocol and the four tool definitions — `Server`. `xenia_fetch` is forwarded to the broker's socket: this server makes no request, opens no store and holds no value |
 | `report.py` | the local page and its JSON API — `Report` |
 | `readers.py` | the register of long-lived readers, and retiring them on a migration |
 
@@ -67,8 +81,6 @@ content.
 | | |
 | --- | --- |
 | `demo/seed_demo.py` | seeded sessions, driven through the real hook binary |
-| `docs/DESIGN.md` | why it is built this way |
-| `docs/SCHEMA.md` | the tables, column by column |
 
 ```bash
 python3 -m pytest -q

@@ -124,6 +124,8 @@ class Report:
                 return {"rows": readonly.goals(
                     conn, since=one("since"), repo=one("repo"),
                     status=one("status"))}
+            if path == "/api/secrets":
+                return {"rows": readonly.credentials(conn)}
             if path == "/api/disk":
                 return {"rows": readonly.disk_churn(
                     conn, since=one("since"), repo=one("repo"),
@@ -210,7 +212,7 @@ _PAGE = r"""<!doctype html>
     <div class="stats" id="stats"></div>
   </div>
   <nav class="tabs">
-    <button id="tab-tasks" class="on">Tasks<span class="n" id="n-tasks"></span></button><button id="tab-friction">Failed</button><button id="tab-goals">Instructions</button>
+    <button id="tab-tasks" class="on">Tasks<span class="n" id="n-tasks"></span></button><button id="tab-friction">Failed</button><button id="tab-goals">Instructions</button><button id="tab-credentials">Credentials</button>
   </nav>
 </header>
 <div class="bar">
@@ -268,6 +270,7 @@ const COLS = [
 ];
 const TCOLS = ['Started','Repo','What it was trying to do','Written','Outcome',''];
 const XCOLS = ['Kind of work','Failed','Recovered','Sessions','Worst run','Example',''];
+const SCOLS = ['Credential','May be sent to','Methods','Signs','Approved now','Used','Last used'];
 const GCOLS = ['Started','Repo','Outcome','Actions','Instruction',''];
 let order = 'at', dir = 'desc', timer = null, tab = 'tasks';
 let goalFilter = null, taskFilter = null;
@@ -292,7 +295,7 @@ function bytes(n){
 }
 
 function head(){
-  const fixed = {tasks:TCOLS, friction:XCOLS, goals:GCOLS}[tab];
+  const fixed = {tasks:TCOLS, friction:XCOLS, goals:GCOLS, credentials:SCOLS}[tab];
   if(fixed){ el('head').innerHTML = fixed.map(l=>`<th>${l}</th>`).join(''); return; }
   el('head').innerHTML = COLS.map(([k,label])=>{
     const on = k===order, sortable = k!=='detail' && k!=='goal';
@@ -429,6 +432,43 @@ async function load(){
     + ` · secrets redacted at capture`;
 }
 
+async function loadSecrets(){
+  const rows = await rowsFrom('/api/secrets', new URLSearchParams({t:T}));
+
+  el('rows').innerHTML = rows.map(s=>{
+    const grants = (s.approved_for||[]).map(g=>
+      `<span class="pill ${g.writes?'elevated':'achieved'}">${esc(g.host)}`
+      + `${g.writes?' + writes':''} until ${esc(timeOf(g.until))}</span>`).join(' ');
+    const worry = s.echoed
+      ? ` <span class="pill critical" title="the far side sent the credential back — rotate it">echoed ${s.echoed}×</span>` : '';
+    const refused = s.refused
+      ? ` <span class="pill warn" title="${esc(s.last_refusal||'')}">${s.refused} refused</span>` : '';
+    const acts = (s.actions||[]).length
+      ? `<br><span class="normal" style="font-size:11px">may: `
+        + esc(s.actions.join(' · ')) + `</span>`
+      : '';
+    const service = s.service
+      ? `<br><span class="pill ${s.scope_stale?'critical':'normal'}">${esc(s.service)}: `
+        + `${esc((s.scope||['no scope recorded']).join(', '))}`
+        + `${s.scope_stale?' — scope not verified':''}</span>` : '';
+    return `<tr>
+      <td class="mono">${esc(s.name)}${worry}${service}${acts}</td>
+      <td class="detail">${esc((s.hosts||[]).join(', '))}</td>
+      <td class="mono">${esc((s.methods||[]).join(','))}</td>
+      <td class="mono">${esc((s.schemes||[]).join(','))||'—'}</td>
+      <td>${grants || '<span class="normal">not approved</span>'}</td>
+      <td class="mono">${s.uses||0}${refused}</td>
+      <td class="mono">${esc(timeOf(s.last_used_at)||'never')}</td></tr>`;
+  }).join('');
+
+  el('empty').hidden = rows.length > 0;
+  const waiting = rows.filter(r => !(r.hosts||[]).length).length;
+  el('foot').textContent = `${rows.length} credential${rows.length===1?'':'s'}`
+    + ` ·`
+    + (waiting ? ` · ${waiting} not used anywhere yet, you will be asked when it is needed`
+      : ` · a use somewhere new raises a prompt before it is allowed`);
+}
+
 async function loadGoals(){
   const rows = await rowsFrom('/api/goals', filters());
 
@@ -467,7 +507,7 @@ function drawChip(){
   chip(el('taskChip'), taskFilter, 'task', ()=>{ taskFilter = null; });
 }
 
-const TABS = ['tasks','friction','goals'];
+const TABS = ['tasks','friction','goals','credentials'];
 const VIEWS = TABS.concat(['activity']);
 
 function setTab(name){
@@ -475,6 +515,7 @@ function setTab(name){
   for(const t of TABS) el('tab-'+t).className = (t===name) ? 'on' : '';
   for(const id of ['kind','status']) el(id).hidden = name!=='activity';
   for(const id of ['tstatus','source']) el(id).hidden = name!=='tasks';
+  for(const id of ['since','repo']) el(id).hidden = name==='credentials';
   el('overstatedWrap').hidden = name!=='tasks';
   el('q').hidden = !(name==='activity' || name==='tasks');
   drawChip(); head(); refresh();
@@ -483,7 +524,7 @@ function setTab(name){
 function refresh(){
   stats();
   ({tasks:loadTasks, friction:loadFriction, goals:loadGoals,
-    activity:load}[tab] || load)();
+    credentials:loadSecrets, activity:load}[tab] || load)();
 }
 
 async function stats(){
