@@ -151,7 +151,9 @@ def test_the_page_offers_three_tabs():
 
 def test_the_drill_down_survives_losing_its_tab():
     assert "setTab('activity')" in report_mod._PAGE
-    assert "const TABS = ['tasks','friction','goals']" in report_mod._PAGE
+    # A prefix, not the whole line: the subject here is the drill-down, and
+    # a tab added beside these three is not a regression in it.
+    assert "const TABS = ['tasks','friction','goals'" in report_mod._PAGE
     assert "VIEWS.includes(HASH_TAB)" in report_mod._PAGE
 
 
@@ -171,3 +173,31 @@ def test_the_panel_refuses_to_serve_from_a_newer_database(served, conn):
     assert "error" in payload, f"served anyway: {list(payload)}"
     assert "restarted" in payload["error"]
     assert "rows" not in payload
+
+
+def test_the_credentials_api_reports_policy_and_approval(served, conn):
+    from xenia import broker
+
+    broker.register(conn, "gitlab-pat", backend="memory",
+                    hosts=["gitlab.example.com"], methods=["GET"])
+    broker.grant(conn, "gitlab-pat", "gitlab.example.com", source="test")
+    conn.commit()
+
+    rows = api(served, "/api/secrets")["rows"]
+    assert rows[0]["name"] == "gitlab-pat"
+    assert rows[0]["approved_for"][0]["host"] == "gitlab.example.com"
+
+
+def test_the_page_offers_a_credentials_tab(served):
+    page = fetch(served, f"/?t={served.token}").decode()
+    assert 'id="tab-credentials"' in page
+    assert "/api/secrets" in page
+
+
+def test_the_report_still_cannot_be_written_to(served):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{served.port}/api/secrets?t={served.token}",
+        data=b"{}", method="POST")
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        urllib.request.urlopen(request)
+    assert raised.value.code == 501

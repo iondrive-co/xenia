@@ -145,17 +145,26 @@ class Backend:
         return "", []
 
     def _item_properties_for(self, item):
-        return {
+        props = {
             "label": dbus.Variant("s", item.label),
             "enabled": dbus.Variant("b", True),
             "visible": dbus.Variant("b", True),
         }
+        if item.items:
+            props["children-display"] = dbus.Variant("s", "submenu")
+        return props
+
+    def _branch(self, identifier, item):
+        return dbus.Variant("(ia{sv}av)", (
+            identifier, self._item_properties_for(item),
+            [self._branch(child_id, child)
+             for child_id, child, parent in self.owner.numbered()
+             if parent == identifier]))
 
     def _layout(self):
-        children = [
-            dbus.Variant("(ia{sv}av)", (index, self._item_properties_for(item), []))
-            for index, item in enumerate(self.owner.items, start=1)
-        ]
+        children = [self._branch(identifier, item)
+                    for identifier, item, parent in self.owner.numbered()
+                    if parent == 0]
         return (0, {"children-display": dbus.Variant("s", "submenu")}, children)
 
     def _menu_method(self, message):
@@ -166,15 +175,14 @@ class Backend:
 
         if member == "GetGroupProperties":
             return "a(ia{sv})", [[
-                (index, self._item_properties_for(item))
-                for index, item in enumerate(self.owner.items, start=1)
+                (identifier, self._item_properties_for(item))
+                for identifier, item, _parent in self.owner.numbered()
             ]]
 
         if member == "GetProperty":
             item_id, name = message.body
-            props = {}
-            if 1 <= item_id <= len(self.owner.items):
-                props = self._item_properties_for(self.owner.items[item_id - 1])
+            item = self.owner.find(item_id)
+            props = self._item_properties_for(item) if item else {}
             return "v", [props.get(name, dbus.Variant("s", ""))]
 
         if member == "Event":

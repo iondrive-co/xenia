@@ -332,6 +332,7 @@ class Connection:
         self._lock = threading.Lock()
         self._replies: dict[int, list] = {}
         self._handlers: dict[tuple[str, str], Callable] = {}
+        self._signals: dict[tuple[str, str, str], Callable] = {}
         self._running = False
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -406,6 +407,16 @@ class Connection:
             if slot is not None:
                 slot[0] = message
                 slot[1].set()
+            return
+
+        if message.kind == SIGNAL:
+            handler = self._signals.get(
+                (message.path, message.interface, message.member))
+            if handler is not None:
+                try:
+                    handler(message)
+                except Exception:
+                    pass
             return
 
         if message.kind == METHOD_CALL:
@@ -486,6 +497,20 @@ class Connection:
 
     def export(self, path: str, interface: str, handler: Callable) -> None:
         self._handlers[(path, interface)] = handler
+
+    def on_signal(self, path: str, interface: str, member: str,
+                  handler: Callable) -> None:
+        """Route one signal to handler, and ask the bus to deliver it.
+
+        Signals are not sent to a connection unless it has matched them, so
+        the AddMatch is not optional bookkeeping — without it the reader
+        simply never sees the message it is waiting for.
+        """
+        self._signals[(path, interface, member)] = handler
+        self.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                  "org.freedesktop.DBus", "AddMatch", "s",
+                  [f"type='signal',path='{path}',interface='{interface}',"
+                   f"member='{member}'"])
 
     def request_name(self, name: str) -> int:
         return self.call("org.freedesktop.DBus", "/org/freedesktop/DBus",

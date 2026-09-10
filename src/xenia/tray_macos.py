@@ -164,7 +164,7 @@ class Backend:
         rt.send(menu, "setAutoenablesItems:", ctypes.c_bool(False),
                 restype=None, argtypes=[ctypes.c_bool])
 
-        for index, item in enumerate(self.owner.items):
+        for index, item in enumerate(self.owner.flattened()):
             entry = rt.send(
                 rt.send(rt.cls("NSMenuItem"), "alloc"),
                 "initWithTitle:action:keyEquivalent:",

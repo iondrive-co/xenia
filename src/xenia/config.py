@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 20
 
 GENERAL_REPO = "general"
 
@@ -40,6 +40,20 @@ def ledger_key_path() -> Path:
 def ledger_anchor_path() -> Path | None:
     explicit = os.environ.get("XENIA_LEDGER_ANCHOR")
     return Path(explicit).expanduser() if explicit else None
+
+
+def broker_socket() -> Path:
+    """Where the service listens for credential requests.
+
+    A runtime directory when there is one: per-user, 0700 and cleared on
+    logout. macOS has none, so the state directory stands in.
+    """
+    explicit = os.environ.get("XENIA_BROKER_SOCKET")
+    if explicit:
+        return Path(explicit).expanduser()
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime else _xdg("XDG_STATE_HOME", ".local/state")
+    return base / "xenia" / "broker.sock"
 
 
 def site_config_path() -> Path:
@@ -102,6 +116,40 @@ REPLY_LIMIT = int(os.environ.get("XENIA_REPLY_LIMIT", "32000"))
 TASK_IDLE_MINUTES = float(os.environ.get("XENIA_TASK_IDLE_MINUTES", "20"))
 
 BUSY_TIMEOUT_MS = int(os.environ.get("XENIA_BUSY_TIMEOUT_MS", "5000"))
+
+# How long one approval lasts. Reads get the long window, writes the short
+# one, and no approval outlives the ceiling however much work happens inside
+# it. Thirty minutes was measured to be too short for reads: most prompts it
+# raised were a window reopening mid-task rather than a real decision.
+GRANT_READ_SECONDS = int(os.environ.get("XENIA_GRANT_READ_SECONDS", 4 * 3600))
+GRANT_WRITE_SECONDS = int(os.environ.get("XENIA_GRANT_WRITE_SECONDS", 30 * 60))
+GRANT_CEILING_SECONDS = int(os.environ.get("XENIA_GRANT_CEILING_SECONDS", 4 * 3600))
+
+# What one brokered response may cost. The read cap is what xenia pulls off
+# the wire; the returned body is cut well below it so the reply still fits
+# inside REPLY_LIMIT.
+FETCH_MAX_BYTES = int(os.environ.get("XENIA_FETCH_MAX_BYTES", 1_048_576))
+FETCH_BODY_CHARS = int(os.environ.get("XENIA_FETCH_BODY_CHARS", 20_000))
+FETCH_TIMEOUT = float(os.environ.get("XENIA_FETCH_TIMEOUT", 30))
+FETCH_MAX_TIMEOUT = float(os.environ.get("XENIA_FETCH_MAX_TIMEOUT", 120))
+FETCH_MAX_REDIRECTS = int(os.environ.get("XENIA_FETCH_MAX_REDIRECTS", 3))
+
+# The socket contract's version. Something outside this repo parses these
+# replies, so it rises when a field changes meaning or leaves, never for an
+# addition.
+PROTOCOL_VERSION = 1
+
+# Where a whole response may be written. The caller is the agent, so it gives
+# a name under this directory rather than a path.
+def capture_dir() -> Path:
+    explicit = os.environ.get("XENIA_CAPTURE_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    return _xdg("XDG_DATA_HOME", ".local/share") / "xenia" / "captures"
+
+
+# How long a verified scope is believed before it counts as stale.
+SCOPE_MAX_AGE_DAYS = int(os.environ.get("XENIA_SCOPE_MAX_AGE_DAYS", 90))
 
 ENV_PATTERNS: tuple[tuple[str, str], ...] = (
     ("prod", "production"),

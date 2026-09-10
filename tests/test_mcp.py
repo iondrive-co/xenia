@@ -72,7 +72,7 @@ def test_unknown_method_is_a_jsonrpc_error(server):
 def test_every_tool_is_listed_with_a_schema(server):
     tools = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
     assert {t["name"] for t in tools} == {
-        "xenia_report", "xenia_calls", "xenia_trace",
+        "xenia_report", "xenia_calls", "xenia_trace", "xenia_fetch",
     }
     for tool in tools:
         assert tool["description"]
@@ -382,3 +382,77 @@ def test_a_cut_reply_does_not_still_claim_the_rows_it_dropped():
     assert "truncated" in cut
     assert cut["totals"]["rows_returned"] == len(cut["rows"]) < 500
     assert cut["totals"]["tasks_in_window"] == 900, "the window itself is unchanged"
+
+
+# -- credentials ------------------------------------------------------------
+
+def test_the_credentials_view_reports_policy_without_any_value(server, conn):
+    from xenia import broker
+
+    broker.register(conn, "gitlab-pat", backend="memory",
+                    hosts=["gitlab.example.com"], methods=["GET"])
+    broker.grant(conn, "gitlab-pat", "gitlab.example.com", source="test")
+    conn.commit()
+
+    answer = json.loads(call(server, "xenia_report",
+                             {"view": "credentials"})["content"][0]["text"])
+    row = answer["rows"][0]
+    assert row["name"] == "gitlab-pat"
+    assert row["hosts"] == ["gitlab.example.com"]
+    assert row["usable_now"] is True
+    assert "value" not in row
+
+
+def test_the_credentials_view_takes_no_filters(server):
+    reply = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "xenia_report",
+                   "arguments": {"view": "credentials", "session": "s1"}}})
+
+    assert "session" in reply["error"]["message"]
+
+
+def test_fetch_asks_for_a_url_and_a_name_and_explains_the_placeholder():
+    tool = next(t for t in mcp.TOOLS if t["name"] == "xenia_fetch")
+
+    assert tool["inputSchema"]["required"] == ["url", "secret"]
+    assert "{{secret}}" in tool["description"]
+    assert "{{sign}}" in tool["description"]
+    # Short enough to be read: this was 2,900 characters of prose once.
+    assert len(tool["description"]) < 1200
+
+
+def test_fetch_goes_to_the_service_and_never_opens_the_store(server, monkeypatch):
+    from xenia import broker
+
+    seen = {}
+
+    def pretend(payload, **kwargs):
+        seen.update(payload)
+        return {"status": 200, "body": "{}", "url": payload["url"]}
+
+    monkeypatch.setattr(broker, "request", pretend)
+    answer = json.loads(call(server, "xenia_fetch", {
+        "url": "https://gitlab.example.com/api/v4/user",
+        "secret": "gitlab-pat",
+        "headers": {"PRIVATE-TOKEN": "{{secret}}"},
+    })["content"][0]["text"])
+
+    assert seen["op"] == "fetch"
+    assert seen["secret"] == "gitlab-pat"
+    assert answer["status"] == 200
+
+
+def test_fetch_says_plainly_when_the_service_is_not_running(server, monkeypatch):
+    from xenia import broker
+
+    def absent(payload, **kwargs):
+        raise broker.BrokerError("the xenia service is not listening at /x")
+
+    monkeypatch.setattr(broker, "request", absent)
+    answer = json.loads(call(server, "xenia_fetch", {
+        "url": "https://gitlab.example.com/api/v4/user",
+        "secret": "gitlab-pat",
+    })["content"][0]["text"])
+
+    assert "not listening" in answer["refused"]

@@ -62,7 +62,8 @@ _SIGNATURE = {
                    "from one of those rows into the calls behind it.",
 }
 
-VIEWS = ("tasks", "instructions", "failures", "repeats", "tools", "disk")
+VIEWS = ("tasks", "instructions", "failures", "repeats", "tools", "disk",
+         "credentials")
 
 UNIVERSAL_PARAMS = frozenset({"view", "since", "repo", "limit"})
 VIEW_PARAMS: dict[str, frozenset[str]] = {
@@ -77,6 +78,7 @@ VIEW_PARAMS: dict[str, frozenset[str]] = {
                         "min_count"}),
     "disk": frozenset({"agent", "tool", "session", "path", "group_by", "order",
                        "min_count"}),
+    "credentials": frozenset(),
 }
 
 
@@ -145,6 +147,10 @@ TOOLS: list[dict[str, Any]] = [
             "written to it, how often it was rewritten, and how much of that "
             "hashed to what was already there — 'unchanged' is bytes that "
             "reached the drive and changed nothing.\n"
+            "  credentials   one credential the user has given xenia to use "
+            "on your behalf: what it is called, where it may be sent, whether "
+            "it is approved right now, and how it has been used. The values "
+            "are not here and cannot be read through this server.\n"
             "\n"
             "Rows come back under 'rows'. The tasks view also returns "
             "'instructions', the text of each instruction its rows sat under, "
@@ -360,6 +366,57 @@ TOOLS: list[dict[str, Any]] = [
                               "description": "The action to trace."},
             },
             "required": ["action_id"],
+        },
+    },
+    {
+        "name": "xenia_fetch",
+        "description": (
+            "Make an HTTP request that needs one of the user's credentials, "
+            "without being given the credential. Name it in 'secret' and "
+            "write {{secret}} wherever it belongs — a header, the query, the "
+            "body, or the URL's userinfo for basic auth. Use "
+            "{{secret:other-name}} for a second credential in the same call, "
+            "and {{sign}} where the far side wants a signature over the "
+            "request rather than the credential itself.\n"
+            "\n"
+            "A refusal carries a 'code'. 'unapproved' means ask the user to "
+            "run the command in the message and then retry; every other code "
+            "means retrying will not help. Nothing is sent when a call is "
+            "refused.\n"
+            "\n"
+            "Cookies are dropped, redirects are followed only within one "
+            "origin, and the body is truncated — pass 'capture' with a short "
+            "name to have the whole response written to a file instead. "
+            "xenia_report(view='credentials') lists what is available and "
+            "what is approved. The xenia service must be running: it holds "
+            "the credentials and this server does not."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string",
+                        "description": "The full https URL."},
+                "secret": {"type": "string",
+                           "description": "Which credential, by the name the "
+                                          "user registered it under. See "
+                                          "xenia_report(view='credentials')."},
+                "method": {"type": "string",
+                           "description": "GET (default), HEAD, POST, PUT, "
+                                          "PATCH or DELETE. Anything that "
+                                          "writes needs its own approval."},
+                "headers": {"type": "object",
+                            "description": "Request headers."},
+                "body": {"description": "Request body — a string, or an "
+                                        "object sent as JSON."},
+                "timeout": {"type": "number",
+                            "description": "Seconds to wait (default 30)."},
+                "capture": {"type": "string",
+                            "description": "A short name. The whole response "
+                                           "is written to a file and the reply "
+                                           "carries its path and sha256, for "
+                                           "when a truncated body would be "
+                                           "parsed as if it were whole."},
+            },
+            "required": ["url", "secret"],
         },
     },
 ]
@@ -606,6 +663,10 @@ def _report(conn, args: dict[str, Any]) -> Any:
                     min_calls=int(args.get("min_count") or 1), order=order,
                     limit=limit)}
 
+    if view == "credentials":
+        return {"view": view, "ordered_by": "name",
+                "rows": readonly.credentials(conn)}
+
     group_by = _one_of(
         "group_by", args.get("group_by"), readonly.DISK_GROUPS) or "path"
     order = _one_of("order", args.get("order"),
@@ -619,7 +680,34 @@ def _report(conn, args: dict[str, Any]) -> Any:
                 limit=limit)}
 
 
+def _fetch(args: dict[str, Any]) -> Any:
+    """Hand the call to the service, which is the only process that can make it.
+
+    Nothing here reads a credential, opens the store or touches the network.
+    This server is spawned by the agent's own client; the broker is in the
+    process the user started, and the socket is the whole of the boundary
+    between them.
+    """
+    from . import broker
+
+    try:
+        return broker.request({
+            "op": "fetch",
+            "url": args.get("url"),
+            "secret": args.get("secret"),
+            "method": args.get("method"),
+            "headers": args.get("headers"),
+            "body": args.get("body"),
+            "timeout": args.get("timeout"),
+        })
+    except broker.BrokerError as exc:
+        return {"refused": str(exc)}
+
+
 def _dispatch(name: str, args: dict[str, Any], db_path=None) -> Any:
+    if name == "xenia_fetch":
+        return _fetch(args)
+
     conn = readonly.connect(db_path)
     try:
         readonly.require_current(conn)
@@ -673,7 +761,7 @@ class Server:
                         "Read-only record of how coding agents have been "
                         "getting on with their work on this machine.\n"
                         "\n"
-                        "xenia_report answers it, in six views: 'tasks' (what "
+                        "xenia_report answers it, in seven views: 'tasks' (what "
                         "agents were trying to do, and whether it worked — "
                         "start here), 'instructions' (what the user asked for), "
                         "'failures' (kinds of work that keep failing), "
@@ -681,7 +769,13 @@ class Server:
                         "(counts, failure rates, latency and reply bytes — ask "
                         "for these rather than totalling rows yourself) and "
                         "'disk' (what was written, and how much of it changed "
-                        "nothing).\n"
+                        "nothing) and 'credentials' (what the user has given "
+                        "xenia to use on your behalf).\n"
+                        "\n"
+                        "xenia_fetch makes an HTTP call with one of those "
+                        "credentials without being handed it: write "
+                        "{{secret}} where the credential belongs and xenia "
+                        "fills it in, then takes it back out of the reply.\n"
                         "\n"
                         "Every view groups. xenia_calls is the drill-down to "
                         "the individual calls behind one of their rows, and "

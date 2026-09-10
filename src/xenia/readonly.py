@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -1264,6 +1265,100 @@ def disk_churn(
 
 
 SERIES_LIMIT = 200
+
+
+def _now() -> str:
+    """Now, in the shape the grant clocks are written in — the same clock the
+    broker stamps them with, which a test can freeze."""
+    from . import ingest
+    return ingest.utcnow()
+
+
+def _scope_stale(verified_at: str | None) -> bool:
+    """Whether a scope check is old enough to have stopped being evidence.
+    Never verified counts as stale."""
+    if not verified_at:
+        return True
+    try:
+        age = (datetime.fromisoformat(_now())
+               - datetime.fromisoformat(verified_at))
+    except (TypeError, ValueError):
+        return True
+    return age > timedelta(days=config.SCOPE_MAX_AGE_DAYS)
+
+
+def credentials(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """What the user has given xenia to use, and how it has been used.
+
+    Names and policy only: the values are in the operating system's store and
+    this module cannot reach it.
+    """
+    now = _now()
+    rows = _rows(conn.execute("""
+        SELECT s.name        AS name,
+               s.backend     AS backend,
+               s.hosts       AS hosts,
+               s.methods     AS methods,
+               s.paths       AS paths,
+               s.note        AS note,
+               s.service     AS service,
+               s.scope       AS scope,
+               s.scope_verified_at AS scope_verified_at,
+               s.expires_hint AS expires_hint,
+               s.schemes     AS schemes,
+               s.body_policy AS body_policy,
+               s.created_at  AS created_at,
+               s.last_used_at AS last_used_at,
+               (SELECT COUNT(*) FROM secret_use u
+                 WHERE u.name = s.name AND u.decision = 'allowed') AS uses,
+               (SELECT COUNT(*) FROM secret_use u
+                 WHERE u.name = s.name AND u.decision = 'refused') AS refused,
+               (SELECT COUNT(*) FROM secret_use u
+                 WHERE u.name = s.name AND u.echoed = 1)           AS echoed,
+               (SELECT reason FROM secret_use u
+                 WHERE u.name = s.name AND u.decision = 'refused'
+                 ORDER BY u.at DESC LIMIT 1)                       AS last_refusal
+        FROM secret s ORDER BY s.name
+    """))
+
+    live = {}
+    for row in _rows(conn.execute("""
+        SELECT name, host, mutating, expires_at, ceiling_at, uses
+        FROM secret_grant
+        WHERE revoked_at IS NULL AND expires_at > :now AND ceiling_at > :now
+        ORDER BY name, host
+    """, {"now": now})):
+        live.setdefault(row["name"], []).append(row)
+
+    for row in rows:
+        row["scope_stale"] = _scope_stale(row.get("scope_verified_at"))
+        try:
+            from . import policy as bodies
+            row["actions"] = bodies.describe(
+                json.loads(row["body_policy"]) if row.get("body_policy")
+                else {})
+        except (TypeError, ValueError):
+            row["actions"] = []
+        row.pop("body_policy", None)
+        try:
+            row["schemes"] = (sorted(json.loads(row["schemes"]))
+                              if row.get("schemes") else [])
+        except (TypeError, ValueError):
+            row["schemes"] = []
+        for key in ("hosts", "methods", "paths", "scope"):
+            try:
+                row[key] = json.loads(row[key]) if row[key] else None
+            except (TypeError, ValueError):
+                pass
+        approvals = live.get(row["name"], [])
+        row["approved_for"] = [
+            {"host": grant["host"],
+             "writes": bool(grant["mutating"]),
+             "until": grant["expires_at"],
+             "ceiling": grant["ceiling_at"]}
+            for grant in approvals]
+        row["usable_now"] = bool(approvals)
+    return rows
 
 
 def trace(conn: sqlite3.Connection, action_id: int) -> dict[str, Any]:
