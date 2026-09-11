@@ -33,6 +33,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 from . import config, policy as bodies, signing, vault
@@ -754,6 +755,15 @@ class Scrubber:
     def echoed(self, text: str) -> bool:
         return any(form in text for form, _ in self._forms)
 
+    def echoed_bytes(self, payload: bytes) -> bool:
+        """The same question over bytes nothing has decoded.
+
+        A binary body is never turned into text, so `echoed` cannot see it.
+        Encoding the forms is right where decoding the body would be wrong.
+        """
+        return any(form.encode("utf-8", "ignore") in payload
+                   for form, _ in self._forms)
+
 
 # --------------------------------------------------------------------------
 # The request itself
@@ -817,7 +827,8 @@ def _origin(url: str) -> tuple[str, str, int | None]:
 
 
 def _send(target: str, method: str, headers: dict, data: bytes | None,
-          timeout: float, opener=None, pinned: str = "") -> dict:
+          timeout: float, opener=None, pinned: str = "",
+          sink: Path | None = None, watch=None) -> dict:
     request = urllib.request.Request(target, data=data, method=method)
     for key, value in headers.items():
         request.add_header(key, value)
@@ -825,12 +836,23 @@ def _send(target: str, method: str, headers: dict, data: bytes | None,
     opener = opener or _opener(pinned)
     try:
         response = opener.open(request, timeout=timeout)
+        # ONLY a success is streamed. A redirect's body is routing, not
+        # content, and has to stay in `raw` for the hop loop to read; an error
+        # body is the reason the call failed, and a caller handed a file path
+        # instead of it is left guessing. Both are small and both are text.
+        if sink is not None and 200 <= response.status < 300:
+            return {"status": response.status, "reason": response.reason or "",
+                    "headers": dict(response.headers.items()), "raw": b"",
+                    "streamed": _drain_to_file(response, sink, watch)}
         raw = response.read(config.FETCH_MAX_BYTES + 1)
         return {"status": response.status, "reason": response.reason or "",
                 "headers": dict(response.headers.items()), "raw": raw}
     except urllib.error.HTTPError as exc:
         # An HTTPError *is* the response — status, headers and body — and for
-        # a brokered call it is usually the interesting one.
+        # a brokered call it is usually the interesting one. It is never
+        # streamed, whatever the caller asked for: an error body is small and
+        # is text, and a caller handed a file path instead of the reason is
+        # left guessing why its download failed.
         raw = exc.read(config.FETCH_MAX_BYTES + 1)
         return {"status": exc.code, "reason": exc.reason or "",
                 "headers": dict(exc.headers.items()), "raw": raw}
@@ -900,14 +922,15 @@ def profiles_for(row, method: str) -> dict[str, dict]:
             for key, profile in loaded.items()}
 
 
-def _capture(name: str, kind: str, payload: bytes) -> tuple[str, str]:
-    """Write whole bytes where a program can read them, and return where.
+#: How much of a binary body is read at a time, and how much of the previous
+#: chunk each echo check sees again — a credential could straddle the boundary.
+BINARY_CHUNK = 1 << 20
+ECHO_OVERLAP = 512
 
-    The reply caps exist because a client discards an over-large reply; a
-    program parsing one has the opposite problem, since a truncated body does
-    not fail loudly. The name is a name and not a path: the caller is the
-    agent.
-    """
+
+def _capture_target(name: str, kind: str) -> Path:
+    """Where a capture goes. The name is a name and not a path: the caller is
+    the agent, and it does not choose where xenia writes."""
     safe = re.sub(r"[^A-Za-z0-9_.\-]", "_", name)[:80] or "capture"
     root = config.capture_dir()
     root.mkdir(parents=True, exist_ok=True)
@@ -915,13 +938,71 @@ def _capture(name: str, kind: str, payload: bytes) -> tuple[str, str]:
         root.chmod(0o700)
     except OSError:
         pass
-    target = root / f"{safe}.{kind}"
+    return root / f"{safe}.{kind}"
+
+
+def _capture(name: str, kind: str, payload: bytes) -> tuple[str, str]:
+    """Write whole bytes where a program can read them, and return where.
+
+    The reply caps exist because a client discards an over-large reply; a
+    program parsing one has the opposite problem, since a truncated body does
+    not fail loudly.
+    """
+    target = _capture_target(name, kind)
     target.write_bytes(payload)
     try:
         target.chmod(0o600)
     except OSError:
         pass
     return str(target), hashlib.sha256(payload).hexdigest()
+
+
+def _drain_to_file(response, target: Path, watch) -> dict:
+    """Stream a response body to disk without decoding it, and without holding it.
+
+    THE DECODE IS THE BUG THIS EXISTS TO AVOID. The text path does
+    `raw[:FETCH_MAX_BYTES].decode("utf-8", "replace")`, which is right for a
+    reply a person reads and fatal for bytes: every invalid byte becomes U+FFFD
+    and the object can never be reconstructed. Splitting a download into
+    sub-cap Range requests does not rescue it either, because the loss is in
+    the decode and not in the length. So nothing here decodes, nothing here
+    holds the whole body, and the caller gets a path, a length and a digest
+    rather than a string.
+    """
+    digest = hashlib.sha256()
+    written = 0
+    truncated = False
+    tail = b""
+    ceiling = config.FETCH_MAX_BINARY_BYTES
+    try:
+        with target.open("wb") as handle:
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+            while True:
+                chunk = response.read(BINARY_CHUNK)
+                if not chunk:
+                    break
+                if written + len(chunk) > ceiling:
+                    chunk = chunk[:max(0, ceiling - written)]
+                    truncated = True
+                if chunk:
+                    if watch is not None:
+                        watch(tail + chunk)
+                        tail = chunk[-ECHO_OVERLAP:]
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+                if truncated:
+                    break
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    return {"path": str(target), "bytes": written,
+            "sha256": digest.hexdigest(), "truncated": truncated}
 
 
 def fetch(conn, request: dict, *, store=None, opener=None,
@@ -935,6 +1016,7 @@ def fetch(conn, request: dict, *, store=None, opener=None,
     body = request.get("body")
     client = request.get("client")
     capture = request.get("capture")
+    binary = bool(request.get("binary"))
     timeout = min(float(request.get("timeout") or config.FETCH_TIMEOUT),
                   config.FETCH_MAX_TIMEOUT)
     mutating = method in MUTATING
@@ -956,6 +1038,12 @@ def fetch(conn, request: dict, *, store=None, opener=None,
         if method not in METHODS:
             raise Refusal(f"not an HTTP method xenia will send: {method}",
                           code="malformed")
+        if binary and not capture:
+            raise Refusal(
+                "a binary response needs 'capture' to name it: xenia will not "
+                "decode these bytes, so there is nowhere in the reply to put "
+                "them and a file is the only answer that keeps them whole",
+                code="malformed")
         forbidden = [key for key in (headers or {})
                      if str(key).lower() in CALLER_MAY_NOT_SET]
         if forbidden:
@@ -1039,10 +1127,24 @@ def fetch(conn, request: dict, *, store=None, opener=None,
 
     redirects: list[str] = []
     sent = False
+    echoed_binary = False
+    sink = _capture_target(str(capture), "response") if binary else None
+
+    def watch(payload: bytes) -> None:
+        """The echo check, over bytes, while they go past.
+
+        A streamed body is never decoded and never held, so the text check at
+        the end cannot see it. This is the only chance to notice a far side
+        handing the credential back.
+        """
+        nonlocal echoed_binary
+        if not echoed_binary and scrubber.echoed_bytes(payload):
+            echoed_binary = True
+
     try:
         sent = True
         answer = _send(target, method, sent_headers, data, timeout, opener,
-                       pinned)
+                       pinned, sink=sink, watch=watch)
         for _hop in range(config.FETCH_MAX_REDIRECTS):
             location = answer["headers"].get("Location") or \
                 answer["headers"].get("location")
@@ -1072,7 +1174,7 @@ def fetch(conn, request: dict, *, store=None, opener=None,
                 break
             target = following
             answer = _send(target, method, sent_headers, data, timeout, opener,
-                           pinned)
+                           pinned, sink=sink, watch=watch)
     except Exception as exc:
         detail = scrubber.text(f"{type(exc).__name__}: {exc}")
         # After the bytes went out a timeout is not a failure but an unknown:
@@ -1088,14 +1190,21 @@ def fetch(conn, request: dict, *, store=None, opener=None,
                 "warnings": warnings, "signed": signed}
 
     raw: bytes = answer["raw"]
-    truncated_bytes = len(raw) > config.FETCH_MAX_BYTES
-    text = raw[:config.FETCH_MAX_BYTES].decode("utf-8", "replace")
+    streamed = answer.get("streamed")
+    if streamed:
+        # Nothing was decoded and nothing is held: the body is already on disk.
+        truncated_bytes = streamed["truncated"]
+        text = ""
+    else:
+        truncated_bytes = len(raw) > config.FETCH_MAX_BYTES
+        text = raw[:config.FETCH_MAX_BYTES].decode("utf-8", "replace")
+    size = streamed["bytes"] if streamed else len(raw)
 
     out_headers = {k: v for k, v in answer["headers"].items()
                    if k.lower() not in DROPPED_HEADERS}
     cookies = [k for k in answer["headers"] if k.lower() in DROPPED_HEADERS]
 
-    echoed = scrubber.echoed(text) or any(
+    echoed = echoed_binary or scrubber.echoed(text) or any(
         scrubber.echoed(str(v)) for v in out_headers.values())
     if echoed:
         warnings.append(
@@ -1112,16 +1221,31 @@ def fetch(conn, request: dict, *, store=None, opener=None,
                     {k: v for k, v in (headers or {}).items()}, indent=1)
                 + "\n\n" + (_json_body(body)[0] if body is not None else "")
             ).encode())
-        response_path, response_digest = _capture(
-            str(capture), "response", scrubbed.encode())
+        if streamed:
+            # Already written, byte for byte, by the drain. It is NOT scrubbed:
+            # these bytes are the object the caller asked for, and rewriting
+            # them would corrupt it as surely as decoding would. `echoed` is
+            # how a credential in there is reported instead.
+            response_path = streamed["path"]
+            response_digest = streamed["sha256"]
+            response_bytes = streamed["bytes"]
+        else:
+            response_path, response_digest = _capture(
+                str(capture), "response", scrubbed.encode())
+            response_bytes = len(scrubbed.encode())
         captured = {"request_path": request_path,
                     "request_sha256": request_digest,
                     "response_path": response_path,
                     "response_sha256": response_digest,
-                    "response_bytes": len(scrubbed.encode())}
+                    "response_bytes": response_bytes}
 
     body_text = scrubbed
-    if len(body_text) > config.FETCH_BODY_CHARS:
+    if streamed:
+        body_text = (f"[{streamed['bytes']:,} bytes written undecoded to "
+                     f"{streamed['path']}; sha256 {streamed['sha256']}"
+                     + ("; TRUNCATED at the binary ceiling]" if truncated_bytes
+                        else "]"))
+    elif len(body_text) > config.FETCH_BODY_CHARS:
         kept = f"…[+{len(body_text) - config.FETCH_BODY_CHARS} chars"
         kept += f"; whole response at {captured['response_path']}]" if captured \
             else ("; pass 'capture' for the whole response in a file, since a "
@@ -1139,7 +1263,7 @@ def fetch(conn, request: dict, *, store=None, opener=None,
             decision="allowed", reason=(f"action: {permitted[0]}"
                                         if permitted else None),
             code=None, grant_id=approval["id"], status=answer["status"],
-            size=len(raw), duration_ms=duration, echoed=echoed, **{
+            size=size, duration_ms=duration, echoed=echoed, **{
                 key: captured.get(key) for key in
                 ("request_path", "response_path", "request_sha256",
                  "response_sha256")})
@@ -1155,7 +1279,8 @@ def fetch(conn, request: dict, *, store=None, opener=None,
         "headers": {scrubber.text(k): scrubber.text(v)
                     for k, v in out_headers.items()},
         "body": body_text,
-        "bytes": len(raw),
+        "bytes": size,
+        "binary": bool(streamed),
         "duration_ms": duration,
         # The template, not the request that was sent. They differ by exactly
         # the credential.
@@ -1561,13 +1686,16 @@ OPS = {
     "ops": "this contract, the refusal codes, and which signing schemes are "
            "available on this machine. -> {ops, codes, schemes}",
     "fetch": "make one authenticated HTTP request. Takes {secret, url, "
-             "method, headers, body, timeout, capture}; credentials go where "
-             "{{secret}} / {{secret:name}} appear and signatures where "
+             "method, headers, body, timeout, capture, binary}; credentials go "
+             "where {{secret}} / {{secret:name}} appear and signatures where "
              "{{sign}} / {{sign:profile}} do. -> {status, reason, headers, "
              "body, bytes, duration_ms, url, used, signed, placed, redirects, "
-             "warnings} or {refused, code} or {error, code}. With 'capture', "
-             "also {request_path, response_path, request_sha256, "
-             "response_sha256}.",
+             "warnings, binary} or {refused, code} or {error, code}. With "
+             "'capture', also {request_path, response_path, request_sha256, "
+             "response_sha256}. 'binary' needs 'capture' and streams the body "
+             "to that file undecoded and uncut, up to FETCH_MAX_BINARY_BYTES: "
+             "the ordinary path decodes as UTF-8 with 'replace', which "
+             "silently corrupts anything that is not text.",
     "sign": "sign a payload xenia will not send, for a chain the caller "
             "broadcasts to itself. Takes {secret, profile, payload}. -> "
             "{signature, nonce, signed_bytes} or {refused, code}.",
@@ -1653,12 +1781,22 @@ class Server:
                 who = _peer(client)
                 if who.get("uid") not in (None, os.getuid()):
                     client.sendall(json.dumps(
-                        {"error": "not your socket"}).encode() + b"\n")
+                        {"protocol": config.PROTOCOL_VERSION,
+                         "error": "not your socket",
+                         "code": "off-policy"}).encode() + b"\n")
                     return
                 payload = _read_line(client)
                 reply = self.handle(json.loads(payload), who)
             except Exception as exc:
-                reply = {"error": f"{type(exc).__name__}: {exc}"}
+                # PROTOCOL BELONGS ON THIS REPLY TOO. Without it a caller that
+                # checks the version — which it must, since that is what the
+                # number is for — reads every server-side crash as "your client
+                # is out of date" and reports that instead of the actual error.
+                # Measured 2026-09-11: a real exception during a download came
+                # back to hermes as "broker speaks protocol None".
+                reply = {"protocol": config.PROTOCOL_VERSION,
+                         "error": f"{type(exc).__name__}: {exc}",
+                         "code": "unknown"}
             try:
                 client.sendall(json.dumps(reply, default=str).encode() + b"\n")
             except OSError:

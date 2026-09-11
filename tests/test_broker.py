@@ -1563,3 +1563,126 @@ def test_a_real_decline_is_not_dressed_up_as_a_timeout(conn, monkeypatch):
     assert "was declined" in answer["refused"]
     assert "xenia grant" not in answer["refused"], \
         "going around a no is not the next step"
+
+
+# -- binary responses -------------------------------------------------------
+#
+# The text path decodes with "replace", which is right for a reply a person
+# reads and fatal for bytes. These hold the other path: whole, undecoded, on
+# disk, and still watched for a credential handed back.
+
+class Stream(Reply):
+    """A response that is CONSUMED as it is read, the way a real one is.
+
+    `Reply.read(size)` returns the same prefix every time, which is fine for a
+    body read once and an infinite loop for a body drained in chunks.
+    """
+
+    def __init__(self, status=200, body=b"", headers=None, reason="OK"):
+        super().__init__(status, body, headers, reason)
+        self._at = 0
+
+    def read(self, size=None):
+        if size is None:
+            size = len(self._body) - self._at
+        chunk = self._body[self._at:self._at + size]
+        self._at += len(chunk)
+        return chunk
+
+    def close(self):
+        pass
+
+
+LZ4ISH = bytes(range(256)) * 64          # every byte value: never valid UTF-8
+
+
+def test_a_binary_response_is_written_undecoded(wired, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+
+    answer = call(wired, opener=Opener(Stream(200, LZ4ISH)),
+                  capture="object", binary=True)
+
+    assert answer["binary"] is True
+    kept = Path(answer["response_path"]).read_bytes()
+    assert kept == LZ4ISH, "a decode would have replaced every invalid byte"
+    assert answer["response_sha256"] == hashlib.sha256(LZ4ISH).hexdigest()
+    assert answer["bytes"] == len(LZ4ISH)
+
+
+def test_a_binary_response_needs_somewhere_to_put_the_bytes(wired):
+    allow(wired)
+    answer = call(wired, opener=Opener(Stream(200, LZ4ISH)), binary=True)
+
+    assert answer["code"] == "malformed"
+    assert "capture" in answer["refused"]
+
+
+def test_a_binary_body_is_not_cut_at_the_text_cap(wired, monkeypatch, tmp_path):
+    """The 1 MiB read cap exists so a REPLY stays small. Nothing replies here."""
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(config, "FETCH_MAX_BYTES", 1024)
+    allow(wired)
+    payload = LZ4ISH * 40                                    # 640 KiB, >> 1 KiB
+
+    answer = call(wired, opener=Opener(Stream(200, payload)),
+                  capture="big", binary=True)
+
+    assert Path(answer["response_path"]).read_bytes() == payload
+
+
+def test_a_binary_response_stops_at_its_own_ceiling(wired, monkeypatch,
+                                                    tmp_path):
+    """Unbounded would be an OOM in the process that holds the credentials."""
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(config, "FETCH_MAX_BINARY_BYTES", 100)
+    allow(wired)
+
+    answer = call(wired, opener=Opener(Stream(200, LZ4ISH)),
+                  capture="runaway", binary=True)
+
+    assert answer["bytes"] == 100
+    assert Path(answer["response_path"]).read_bytes() == LZ4ISH[:100]
+    assert "TRUNCATED" in answer["body"]
+
+
+def test_a_credential_echoed_in_binary_bytes_is_still_noticed(wired, monkeypatch,
+                                                              tmp_path):
+    """Scrubbing the file would corrupt the object; saying so is the answer."""
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    payload = LZ4ISH + VALUE.encode() + LZ4ISH
+
+    answer = call(wired, opener=Opener(Stream(200, payload)),
+                  capture="leaky", binary=True)
+
+    assert any("rotate" in w for w in answer["warnings"])
+    assert Path(answer["response_path"]).read_bytes() == payload
+
+
+def test_a_credential_split_across_two_chunks_is_still_noticed(wired, monkeypatch,
+                                                               tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(broker, "BINARY_CHUNK", 64)
+    allow(wired)
+    # Land the credential astride a 64-byte boundary.
+    payload = b"a" * 50 + VALUE.encode() + b"b" * 50
+
+    answer = call(wired, opener=Opener(Stream(200, payload)),
+                  capture="astride", binary=True)
+
+    assert any("rotate" in w for w in answer["warnings"])
+
+
+def test_an_error_body_is_never_streamed_away(wired, monkeypatch, tmp_path):
+    """A caller handed a file path instead of the reason cannot see why it failed."""
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    denied = b"<Error><Code>AccessDenied</Code></Error>"
+
+    answer = call(wired, opener=Opener(Stream(403, denied, reason="Forbidden")),
+                  capture="denied", binary=True)
+
+    assert answer["status"] == 403
+    assert "AccessDenied" in answer["body"]
+    assert answer["binary"] is False

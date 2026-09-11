@@ -129,6 +129,11 @@ GRANT_CEILING_SECONDS = int(os.environ.get("XENIA_GRANT_CEILING_SECONDS", 4 * 36
 # the wire; the returned body is cut well below it so the reply still fits
 # inside REPLY_LIMIT.
 FETCH_MAX_BYTES = int(os.environ.get("XENIA_FETCH_MAX_BYTES", 1_048_576))
+# What a BINARY response may cost instead. It is not decoded and never enters a
+# reply, so the read cap above — sized so a reply still fits — does not bind it.
+# This one exists only so a runaway download cannot fill the disk.
+FETCH_MAX_BINARY_BYTES = int(
+    os.environ.get("XENIA_FETCH_MAX_BINARY_BYTES", 256 * 1_048_576))
 FETCH_BODY_CHARS = int(os.environ.get("XENIA_FETCH_BODY_CHARS", 20_000))
 FETCH_TIMEOUT = float(os.environ.get("XENIA_FETCH_TIMEOUT", 30))
 FETCH_MAX_TIMEOUT = float(os.environ.get("XENIA_FETCH_MAX_TIMEOUT", 120))

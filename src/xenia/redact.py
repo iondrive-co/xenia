@@ -28,7 +28,13 @@ RULES: tuple[Rule, ...] = (
         "GITHUB_TOKEN",
     ),
     Rule("slack_token", re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"), "SLACK_TOKEN"),
-    Rule("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS_KEY"),
+    # There is deliberately no rule for an AWS access key id (AKIA…, ASIA…).
+    # It is an identifier, not a secret: SigV4 puts it in the clear in the
+    # Authorization header of every signed request, CloudTrail records it, and
+    # it opens nothing without the secret access key — which `assigned_secret`
+    # below does catch wherever it is written beside its own name. Redacting it
+    # only blanked the places it was being read on purpose: a credential named
+    # after the key it holds, and a reply the caller fetched to see it.
     Rule("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "GOOGLE_API_KEY"),
     Rule("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}"), "OPENAI_KEY"),
     Rule("anthropic_key", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}"), "ANTHROPIC_KEY"),

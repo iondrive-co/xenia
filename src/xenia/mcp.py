@@ -386,7 +386,9 @@ TOOLS: list[dict[str, Any]] = [
             "\n"
             "Cookies are dropped, redirects are followed only within one "
             "origin, and the body is truncated — pass 'capture' with a short "
-            "name to have the whole response written to a file instead. "
+            "name to have the whole response written to a file instead, and "
+            "'binary' alongside it for a body that is not text, which is then "
+            "written undecoded and uncut. "
             "xenia_report(view='credentials') lists what is available and "
             "what is approved. The xenia service must be running: it holds "
             "the credentials and this server does not."),
@@ -415,6 +417,18 @@ TOOLS: list[dict[str, Any]] = [
                                            "carries its path and sha256, for "
                                            "when a truncated body would be "
                                            "parsed as if it were whole."},
+                "binary": {"type": "boolean",
+                           "description": "The response is NOT text: write it "
+                                          "to the 'capture' file byte for "
+                                          "byte, undecoded and uncut, and "
+                                          "return its path, size and sha256 "
+                                          "instead of a body. Needs "
+                                          "'capture'. Use it for anything "
+                                          "that is not text — an archive, an "
+                                          "image, a compressed object — "
+                                          "because the ordinary path decodes "
+                                          "as UTF-8 and would silently "
+                                          "corrupt it."},
             },
             "required": ["url", "secret"],
         },
@@ -422,8 +436,25 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+#: Keys a scrub leaves alone. A credential's name is the handle the caller has
+#: to type back to use it — `readonly.credentials` keeps it for that reason,
+#: and this pass runs over the whole reply afterwards, so it has to agree.
+UNSCRUBBED = frozenset({"name"})
+
+
 def _scrub(payload: Any) -> Any:
-    return json.loads(redact.redact(json.dumps(payload, default=str)))
+    return _scrubbed(json.loads(json.dumps(payload, default=str)))
+
+
+def _scrubbed(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: (v if k in UNSCRUBBED and isinstance(v, str)
+                    else _scrubbed(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrubbed(item) for item in value]
+    if isinstance(value, str):
+        return redact.redact(value)
+    return value
 
 
 def _compact(payload: Any) -> str:
@@ -699,6 +730,10 @@ def _fetch(args: dict[str, Any]) -> Any:
             "headers": args.get("headers"),
             "body": args.get("body"),
             "timeout": args.get("timeout"),
+            # Both were advertised in the schema and dropped here, so a caller
+            # asking for a whole response quietly got a truncated one.
+            "capture": args.get("capture"),
+            "binary": args.get("binary"),
         })
     except broker.BrokerError as exc:
         return {"refused": str(exc)}

@@ -39,6 +39,7 @@ FAKE_GITLAB_RUNNER_TOKEN = "glrt-" + "Ab3dEf6hIj9lMn2pQr5t"
 FAKE_GITHUB_TOKEN = "ghp_" + "16CharsAndMoreABCDEFGHIJKLMNOP"
 FAKE_SLACK_TOKEN = "xoxb-" + "123456789012-abcdefghijkl"
 FAKE_AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
+FAKE_AWS_SECRET = "wJalrXUtnFEMI/" + "K7MDENG/bPxRfiCYEXAMPLEKEY"
 FAKE_ANTHROPIC_KEY = "sk-ant-" + "api03-abcdefghijklmnopqrstuvwxyz"
 FAKE_GRAFANA_TOKEN = "glsa_" + "8Kd92nQmXr4vT7wLpY1cB6hN3fJ5sZ0a"
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import pytest
-from conftest import (FAKE_ANTHROPIC_KEY, FAKE_AWS_KEY, FAKE_GITHUB_TOKEN,
-                     FAKE_GITLAB_PAT, FAKE_GITLAB_RUNNER_TOKEN,
-                     FAKE_GRAFANA_TOKEN, FAKE_SLACK_TOKEN)
+from conftest import (FAKE_ANTHROPIC_KEY, FAKE_AWS_KEY, FAKE_AWS_SECRET,
+                     FAKE_GITHUB_TOKEN, FAKE_GITLAB_PAT,
+                     FAKE_GITLAB_RUNNER_TOKEN, FAKE_GRAFANA_TOKEN,
+                     FAKE_SLACK_TOKEN)
 
 from xenia import redact
 
@@ -15,7 +16,6 @@ from xenia import redact
         (f"runner token {FAKE_GITLAB_RUNNER_TOKEN}", "GITLAB_RUNNER_TOKEN"),
         (FAKE_GITHUB_TOKEN, "GITHUB_TOKEN"),
         (FAKE_SLACK_TOKEN, "SLACK_TOKEN"),
-        (FAKE_AWS_KEY, "AWS_KEY"),
         (FAKE_ANTHROPIC_KEY, "ANTHROPIC_KEY"),
         ("-----BEGIN OPENSSH PRIVATE KEY-----", "PRIVATE_KEY"),
         ("$ANSIBLE_VAULT;1.1;AES256", "ANSIBLE_VAULT_BLOB"),
@@ -50,6 +50,21 @@ def test_ordinary_text_is_left_alone(text):
     assert redact.redact(text) == text
 
 
+def test_an_aws_key_id_is_an_identifier_and_stays_readable():
+    """SigV4 sends the id in the clear and the secret never leaves the store.
+
+    A credential here is often named after the key id it holds, and replies get
+    fetched to read one back, so blanking it hid it from the only readers who
+    had a use for it. The secret access key beside it is still caught.
+    """
+    assert redact.redact(f"AWS {FAKE_AWS_KEY}") == f"AWS {FAKE_AWS_KEY}"
+
+    out = redact.redact(f"aws_access_key_id={FAKE_AWS_KEY}\n"
+                        f"aws_secret_access_key={FAKE_AWS_SECRET}")
+    assert FAKE_AWS_KEY in out
+    assert FAKE_AWS_SECRET not in out
+
+
 def test_the_most_specific_rule_wins():
     hits = redact.scan(f"PRIVATE_TOKEN={FAKE_GITLAB_PAT}")
     assert [h.label for h in hits] == ["GITLAB_PAT"]
@@ -73,14 +88,14 @@ def test_redaction_keeps_the_surrounding_text_intact():
 def test_nested_structures_are_walked():
     payload = {
         "tool_input": {"command": "curl -u admin:realpassword123 https://x.test"},
-        "list": [FAKE_GITLAB_PAT, {"deep": FAKE_AWS_KEY}],
+        "list": [FAKE_GITLAB_PAT, {"deep": FAKE_SLACK_TOKEN}],
         "count": 3,
         "flag": True,
     }
     out = redact.redact_obj(payload)
     text = str(out)
     assert "glpat-" not in text
-    assert FAKE_AWS_KEY not in text
+    assert FAKE_SLACK_TOKEN not in text
     assert out["count"] == 3 and out["flag"] is True
 
 

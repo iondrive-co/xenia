@@ -277,8 +277,16 @@ def _clean(value: Any) -> Any:
     return value
 
 
-def _rows(cursor) -> list[dict[str, Any]]:
-    return [{k: _clean(row[k]) for k in row.keys()} for row in cursor]
+def _rows(cursor, keep: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+    """Every row, redacted — apart from the columns named in `keep`.
+
+    A column is kept when its value is a handle rather than something an agent
+    said: a name the caller has to say back to use the thing it names is not
+    improved by being unreadable, and it is in the database in the clear
+    either way.
+    """
+    return [{k: (row[k] if k in keep else _clean(row[k])) for k in row.keys()}
+            for row in cursor]
 
 
 def _brief(column: str, chars: int) -> str:
@@ -1292,6 +1300,10 @@ def credentials(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
     Names and policy only: the values are in the operating system's store and
     this module cannot reach it.
+
+    The name comes back exactly as the user typed it. It is how a caller asks
+    for the credential and how the page asks to rename or remove one, so a
+    name that has been through the redactor names nothing.
     """
     now = _now()
     rows = _rows(conn.execute("""
@@ -1319,7 +1331,7 @@ def credentials(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                  WHERE u.name = s.name AND u.decision = 'refused'
                  ORDER BY u.at DESC LIMIT 1)                       AS last_refusal
         FROM secret s ORDER BY s.name
-    """))
+    """), keep=frozenset({"name"}))
 
     live = {}
     for row in _rows(conn.execute("""
