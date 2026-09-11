@@ -8,6 +8,16 @@ from urllib.parse import parse_qs, urlparse
 
 from . import readonly
 
+#: The only things a POST here may change, all three of them one credential.
+#: The record itself is never one of them: what an agent did is not editable
+#: from the page that reports it.
+WRITES = ("/api/secrets/add", "/api/secrets/remove", "/api/secrets/rename")
+
+#: A credential is a line, not a file. Anything larger is a mistake or an
+#: attempt to fill memory, and is refused before it is read.
+MAX_POST = 64 * 1024
+
+
 class Report:
     def __init__(self, db_path=None, host: str = "127.0.0.1") -> None:
         self.db_path = db_path
@@ -23,6 +33,10 @@ class Report:
     @property
     def url(self) -> str:
         return f"http://{self.host}:{self.port}/?t={self.token}"
+
+    def tab(self, name: str) -> str:
+        """The page, opened on one of its tabs. See HASH_TAB in the page."""
+        return f"{self.url}#{name}"
 
     def start(self) -> str:
         report = self
@@ -70,6 +84,69 @@ class Report:
                     return
 
                 self._send(404, b"not found", "text/plain; charset=utf-8")
+
+            def do_POST(self):
+                parsed = urlparse(self.path)
+                query = parse_qs(parsed.query)
+
+                if not secrets.compare_digest(
+                    (query.get("t") or [""])[0], report.token
+                ):
+                    self._send(403, b"forbidden", "text/plain; charset=utf-8")
+                    return
+
+                if parsed.path not in WRITES:
+                    # Everything else is still read-only, and says so rather
+                    # than 404ing: there is no write path to find.
+                    self._send(501, b"not implemented",
+                               "text/plain; charset=utf-8")
+                    return
+
+                if not self._from_the_page():
+                    self._send(403, b"forbidden", "text/plain; charset=utf-8")
+                    return
+
+                try:
+                    payload = self._payload()
+                except ValueError as exc:
+                    self.close_connection = True
+                    self._send(400, str(exc).encode(),
+                               "text/plain; charset=utf-8")
+                    return
+
+                try:
+                    answer = report.write(parsed.path, payload)
+                except Exception as exc:
+                    answer = {"error": f"{type(exc).__name__}: {exc}"}
+                self._send(200, json.dumps(answer, default=str).encode(),
+                           "application/json; charset=utf-8")
+
+            def _payload(self) -> dict:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0:
+                    raise ValueError("empty request")
+                if length > MAX_POST:
+                    raise ValueError("request too large")
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("expected a JSON object")
+                return body
+
+            def _from_the_page(self) -> bool:
+                """Whether this write came from the page this process serves.
+
+                The token is what a caller has to know, and a page that cannot
+                read it cannot post here. These two are for the case where it
+                learned it anyway: a Host of someone else's name resolved to
+                loopback, or a cross-origin page holding a pasted URL.
+                """
+                host = (self.headers.get("Host") or "").strip()
+                mine = {f"{report.host}:{report.port}",
+                        f"localhost:{report.port}"}
+                if host not in mine:
+                    return False
+                origin = self.headers.get("Origin")
+                return origin is None or origin == f"http://{host}"
 
         self._server = ThreadingHTTPServer((self.host, 0), Handler)
         self._server.daemon_threads = True
@@ -134,6 +211,87 @@ class Report:
         finally:
             conn.close()
 
+    def write(self, path: str, payload: dict) -> dict:
+        """Add, rename or remove one credential. Every write the page can make.
+
+        Credentials are the one thing here a person owns rather than the
+        record does, so this is deliberately narrow: it opens its own writable
+        handle, touches the secret tables through `secrets` and nothing else,
+        and leaves the read path — and the connection every view is served
+        from — read-only.
+
+        The value posted is put straight into the OS store and never reaches
+        the database, this reply, or the log: the server keeps no access log,
+        and a credential is not a row.
+        """
+        from . import broker, db, secrets as secrets_cli, vault
+
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            return {"error": "a credential needs a name"}
+
+        # A process older than the database must not write to it, for the same
+        # reason it must not report from it.
+        probe = readonly.connect(self.db_path)
+        try:
+            readonly.require_current(probe)
+        finally:
+            probe.close()
+
+        conn = db.connect(self.db_path)
+        try:
+            if path == "/api/secrets/rename":
+                try:
+                    outcome = secrets_cli.rename(
+                        conn, name, str(payload.get("to") or "").strip())
+                except (ValueError, vault.VaultError) as exc:
+                    return {"error": str(exc)}
+                if outcome["store_error"]:
+                    return {"error": f"'{name}' is now '{outcome['to']}', but "
+                                     f"its old value could not be deleted from "
+                                     f"the store: {outcome['store_error']}"}
+                return {"ok": True, **outcome}
+
+            if path == "/api/secrets/remove":
+                outcome = secrets_cli.remove(conn, name)
+                if outcome["store_error"]:
+                    return {"error": f"the policy for '{name}' is gone, but "
+                                     f"the store said: {outcome['store_error']}"}
+                if not (outcome["policy"] or outcome["value"]):
+                    return {"error": f"no credential called '{name}'"}
+                return {"ok": True, **outcome}
+
+            existing = broker.entry(conn, name)
+            hosts = _as_list(payload.get("hosts"))
+            if existing is not None and not hosts:
+                # Replacing the value is not a reason to forget where the
+                # credential was already allowed to go.
+                hosts = json.loads(existing["hosts"])
+
+            value = str(payload.get("value") or "")
+            try:
+                secrets_cli.add(
+                    conn, name, value, hosts=hosts,
+                    methods=_as_list(payload.get("methods")) or None,
+                    note=str(payload.get("note") or "").strip() or None)
+            except (ValueError, vault.VaultError) as exc:
+                return {"error": str(exc)}
+            finally:
+                del value
+            return {"ok": True, "name": name, "store": vault.configured_kind()}
+        finally:
+            conn.close()
+
+
+def _as_list(value) -> list[str]:
+    """A comma-separated field, or a JSON list, as a list either way."""
+    if isinstance(value, list):
+        items = [str(item) for item in value]
+    else:
+        items = str(value or "").replace("\n", ",").split(",")
+    return [item.strip() for item in items if item.strip()]
+
+
 _PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -146,6 +304,7 @@ _PAGE = r"""<!doctype html>
     --bg:#15181c;--fg:#e6e9ed;--muted:#9aa3ad;--line:#2a2f36;--card:#1b1f24;
     --crit:#ef5350;--elev:#ffb300;--ok:#66bb6a}}
   *{box-sizing:border-box}
+  [hidden]{display:none !important}
   body{margin:0;background:var(--bg);color:var(--fg);
     font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   header{padding:12px 18px 0;border-bottom:1px solid var(--line);
@@ -202,6 +361,14 @@ _PAGE = r"""<!doctype html>
     border:1px solid var(--line);border-radius:999px;padding:3px 6px 3px 12px;
     font-size:12px;max-width:520px}
   .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .entry{align-items:center}
+  .entry input{min-width:180px}
+  .entry input#s-value{min-width:260px;flex:1}
+  .entry b{font-weight:600;margin-right:4px}
+  .msg{padding:9px 18px;font-size:13px;border-bottom:1px solid var(--line);
+    background:color-mix(in srgb,var(--ok) 8%,transparent)}
+  .msg.bad{background:color-mix(in srgb,var(--crit) 10%,transparent);
+    color:var(--crit)}
   .empty{padding:34px 18px;color:var(--muted)}
   footer{padding:10px 18px;color:var(--muted);font-size:12px;
     border-top:1px solid var(--line)}
@@ -252,7 +419,21 @@ _PAGE = r"""<!doctype html>
   <label style="color:var(--muted);font-size:12px">
     <input type="checkbox" id="live" checked style="min-width:auto"> live
   </label>
+  <button class="act" id="newSecret" hidden>Add a credential</button>
 </div>
+<div class="bar entry" id="secretForm" hidden>
+  <b>New credential</b>
+  <input id="s-name" placeholder="Name — e.g. gitlab-pat" autocomplete="off"
+    spellcheck="false">
+  <input id="s-value" type="password" autocomplete="new-password"
+    spellcheck="false" placeholder="Value — goes to the OS keyring, not here">
+  <input id="s-hosts" autocomplete="off" spellcheck="false"
+    placeholder="Allowed at (optional) — gitlab.example.com">
+  <input id="s-note" autocomplete="off" placeholder="Note (optional)">
+  <button class="act" id="s-save">Store</button>
+  <button class="act" id="s-cancel">Cancel</button>
+</div>
+<div class="msg" id="msg" hidden></div>
 <div class="wrap"><table>
   <thead><tr id="head"></tr></thead>
   <tbody id="rows"></tbody>
@@ -270,10 +451,11 @@ const COLS = [
 ];
 const TCOLS = ['Started','Repo','What it was trying to do','Written','Outcome',''];
 const XCOLS = ['Kind of work','Failed','Recovered','Sessions','Worst run','Example',''];
-const SCOLS = ['Credential','May be sent to','Methods','Signs','Approved now','Used','Last used'];
+const SCOLS = ['Credential','May be sent to','Methods','Signs','Approved now','Used','Last used',''];
 const GCOLS = ['Started','Repo','Outcome','Actions','Instruction',''];
 let order = 'at', dir = 'desc', timer = null, tab = 'tasks';
 let goalFilter = null, taskFilter = null;
+let known = new Set();
 
 function el(id){ return document.getElementById(id); }
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,
@@ -458,15 +640,88 @@ async function loadSecrets(){
       <td class="mono">${esc((s.schemes||[]).join(','))||'—'}</td>
       <td>${grants || '<span class="normal">not approved</span>'}</td>
       <td class="mono">${s.uses||0}${refused}</td>
-      <td class="mono">${esc(timeOf(s.last_used_at)||'never')}</td></tr>`;
+      <td class="mono">${esc(timeOf(s.last_used_at)||'never')}</td>
+      <td><button class="act mv" data-n="${esc(s.name)}">Rename</button>
+        <button class="act rm" data-n="${esc(s.name)}">Remove</button></td></tr>`;
   }).join('');
+
+  known = new Set(rows.map(r=>r.name));
+  el('rows').querySelectorAll('button.rm').forEach(b=>{
+    b.onclick = ()=>removeSecret(b.dataset.n);
+  });
+  el('rows').querySelectorAll('button.mv').forEach(b=>{
+    b.onclick = ()=>renameSecret(b.dataset.n);
+  });
 
   el('empty').hidden = rows.length > 0;
   const waiting = rows.filter(r => !(r.hosts||[]).length).length;
   el('foot').textContent = `${rows.length} credential${rows.length===1?'':'s'}`
-    + ` ·`
     + (waiting ? ` · ${waiting} not used anywhere yet, you will be asked when it is needed`
-      : ` · a use somewhere new raises a prompt before it is allowed`);
+      : ` · a use somewhere new raises a prompt before it is allowed`)
+    + ` · the value of one is in the OS keyring, and nothing here can read it`;
+}
+
+function note(text, bad){
+  const box = el('msg');
+  box.textContent = text || '';
+  box.className = 'msg' + (bad ? ' bad' : '');
+  box.hidden = !text;
+}
+
+async function post(path, body){
+  try{
+    const r = await fetch(path + '?t=' + encodeURIComponent(T), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)});
+    if(!r.ok) return {error:`the report answered ${r.status}`};
+    return await r.json();
+  }catch(err){ return {error:String(err)}; }
+}
+
+function showForm(on){
+  el('secretForm').hidden = !on;
+  if(on){ note(''); el('s-name').focus(); }
+}
+
+function clearForm(){
+  for(const id of ['s-name','s-value','s-hosts','s-note']) el(id).value = '';
+}
+
+async function saveSecret(){
+  const name = el('s-name').value.trim(), value = el('s-value').value;
+  if(!name || !value){ note('A credential needs a name and a value.', true); return; }
+  if(known.has(name) && !confirm(
+      `'${name}' already exists. Replace the value in the keyring?`)) return;
+  const out = await post('/api/secrets/add', {name, value,
+    hosts: el('s-hosts').value, note: el('s-note').value});
+  el('s-value').value = '';
+  if(out.error){ note(out.error, true); return; }
+  clearForm(); showForm(false);
+  note(`Stored '${name}' in the ${out.store}. Nothing can use it yet: you are`
+    + ` asked the first time something reaches for it, and that answer decides`
+    + ` where it may be sent.`);
+  loadSecrets();
+}
+
+async function renameSecret(name){
+  const to = (prompt(`Rename '${name}' to:`, name)||'').trim();
+  if(!to || to===name) return;
+  const out = await post('/api/secrets/rename', {name, to});
+  if(out.error){ note(out.error, true); return; }
+  note(`'${name}' is now '${to}'. Its approvals and its history came with it,`
+    + ` and anything that writes {{secret:${name}}} has to say`
+    + ` {{secret:${to}}} now.`);
+  loadSecrets();
+}
+
+async function removeSecret(name){
+  if(!confirm(`Remove '${name}'?\n\nThe policy here and the value in the`
+    + ` keyring both go, and the value cannot be got back.`)) return;
+  const out = await post('/api/secrets/remove', {name});
+  if(out.error){ note(out.error, true); return; }
+  note(`Removed '${name}'.`
+    + (out.value ? '' : ' There was no value in the store for it.'));
+  loadSecrets();
 }
 
 async function loadGoals(){
@@ -518,6 +773,12 @@ function setTab(name){
   for(const id of ['since','repo']) el(id).hidden = name==='credentials';
   el('overstatedWrap').hidden = name!=='tasks';
   el('q').hidden = !(name==='activity' || name==='tasks');
+  el('newSecret').hidden = name!=='credentials';
+  el('empty').textContent = name==='credentials'
+    ? 'No credentials yet. "Add a credential" puts one in the OS keyring;'
+      + ' xenia keeps its name and where it may be sent, never the value.'
+    : 'Nothing here for these filters.';
+  if(name!=='credentials'){ showForm(false); note(''); }
   drawChip(); head(); refresh();
 }
 
@@ -543,6 +804,11 @@ async function stats(){
 for(const id of ['since','repo','kind','status','tstatus','source'])
   el(id).onchange = refresh;
 el('overstated').onchange = loadTasks;
+el('newSecret').onclick = ()=>showForm(el('secretForm').hidden);
+el('s-save').onclick = saveSecret;
+el('s-cancel').onclick = ()=>{ clearForm(); showForm(false); note(''); };
+for(const id of ['s-name','s-value','s-hosts','s-note'])
+  el(id).onkeydown = e=>{ if(e.key==='Enter') saveSecret(); };
 let deb; el('q').oninput = ()=>{ clearTimeout(deb); deb=setTimeout(refresh,220); };
 el('live').onchange = ()=>{ clearInterval(timer);
   if(el('live').checked) timer = setInterval(refresh, 5000); };

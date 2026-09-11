@@ -348,7 +348,7 @@ def entry_point() -> str:
 
 
 def open_dialogue() -> bool:
-    """What the tray's Credentials item does: setup if needed, then add one."""
+    """What the tray's Credentials → Add… does: setup if needed, then add one."""
     return open_in_terminal([entry_point(), "secret", "new"])
 
 
@@ -433,13 +433,121 @@ def wizard(argv: list[str]) -> int:
               "it may go.\n  The first time something reaches for it you "
               "will be asked, and the\n  answer is what decides where it "
               "can be used from then on.\n")
-        print("  See what it has been allowed with `xenia secret list`.\n")
+        print("  See what it has been allowed with `xenia secret list`, or "
+              "in the\n  report's Credentials tab — the tray's Credentials → "
+              "List.\n")
     finally:
         conn.close()
 
     if sys.stdin.isatty():
         _ask("Press enter to close")
     return 0
+
+
+# --------------------------------------------------------------------------
+# Adding, renaming and removing one: what every front end does through here
+# --------------------------------------------------------------------------
+
+def add(conn, name: str, value: str, **policy) -> dict:
+    """Put a value in the store and register the policy beside it.
+
+    What `xenia secret add`, the wizard and the report page all end up in, so
+    that a credential entered from the tray and one entered in the browser are
+    the same thing afterwards.
+
+    The policy is checked before either half happens — a typo in it would
+    otherwise leave a value in the keyring with nothing here to describe it —
+    and the value goes in before the policy, so a store that refuses cannot
+    leave a widened policy in force over the value that is still there.
+    """
+    from . import broker
+
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("a credential needs a name")
+    if not value:
+        raise ValueError(f"no value given for '{name}' — nothing was changed")
+    broker.methods_for(policy.get("methods"))
+
+    vault.backend().set(name, value)
+    del value
+    return broker.register(conn, name, **policy)
+
+
+def remove(conn, name: str) -> dict:
+    """Forget a credential: the policy here, and the value in the OS store.
+
+    Both halves are reported because either can be the only one there. A
+    cancelled add leaves a value with no policy, and a value deleted from the
+    keyring by hand leaves a policy over nothing.
+    """
+    from . import broker
+
+    name = (name or "").strip()
+    out = {"name": name, "policy": broker.forget(conn, name), "value": False,
+           "store_error": None}
+    try:
+        out["value"] = bool(vault.backend().delete(name))
+    except vault.VaultError as exc:
+        out["store_error"] = str(exc)
+    return out
+
+
+def rename(conn, name: str, to: str) -> dict:
+    """Move a credential, value and all, to a different name.
+
+    The value goes to the new name first and only leaves the old one once the
+    policy has followed it: a value under a name with no policy is an orphan
+    the list flags and `secret rm` clears, where a policy with no value is a
+    credential that has quietly stopped working.
+
+    Anything that writes `{{secret:NAME}}` is naming the old one, so this
+    reports what to change them to.
+    """
+    from . import broker
+
+    name = (name or "").strip()
+    to = (to or "").strip()
+    if not to:
+        raise ValueError("a credential needs a name")
+    if to == name:
+        raise ValueError(f"'{name}' is already its name")
+    if broker.entry(conn, name) is None:
+        raise ValueError(f"no credential called '{name}'")
+    if broker.entry(conn, to) is not None:
+        raise ValueError(f"there is already a credential called '{to}'")
+
+    store = vault.backend()
+    held = store.get(name)
+    moved = held is not None
+    if moved:
+        store.set(to, held)
+    del held
+
+    try:
+        broker.rename(conn, name, to)
+    except Exception:
+        if moved:
+            try:
+                store.delete(to)
+            except vault.VaultError:
+                pass
+        raise
+
+    out = {"name": name, "to": to, "value": moved, "store_error": None}
+    try:
+        store.delete(name)
+    except vault.VaultError as exc:
+        out["store_error"] = str(exc)
+    return out
+
+
+def stored_names() -> set[str]:
+    """What the store holds, or nothing if it will not say."""
+    try:
+        return set(vault.backend().names())
+    except Exception:
+        return set()
 
 
 # --------------------------------------------------------------------------
@@ -568,8 +676,6 @@ def _secret(conn, broker, argv: list[str]) -> int:
             print(f"Policy for '{name}' saved; the stored value is unchanged.")
             return 0
 
-        # The value first, then the policy: a cancelled entry must not leave
-        # a widened policy in force over the old value.
         try:
             value = read_value(name)
         except (ValueError, EOFError, KeyboardInterrupt) as exc:
@@ -577,15 +683,21 @@ def _secret(conn, broker, argv: list[str]) -> int:
                   file=sys.stderr)
             return 1
         try:
-            vault.backend().set(name, value)
+            add(conn, name, value, hosts=hosts, methods=methods, paths=paths,
+                note=_flag_value(rest, "--note"),
+                service=_flag_value(rest, "--service"), scope=scope,
+                verified_at=(broker.stamp(broker.utcnow()) if verified
+                             else None),
+                expires_hint=_flag_value(rest, "--expires"))
         except vault.VaultError as exc:
             print(f"xenia: {exc} — nothing was changed.", file=sys.stderr)
             return 1
-        del value
+        except ValueError as exc:
+            print(f"xenia: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            del value
 
-        failed = save_policy()
-        if failed:
-            return failed
         print(f"Stored '{name}' in the {vault.configured_kind()}.")
         if hosts:
             print(f"Allowed at {', '.join(hosts)} once approved:\n"
@@ -595,20 +707,33 @@ def _secret(conn, broker, argv: list[str]) -> int:
                   "it, and\nthat answer decides where it may be used.")
         return 0
 
-    if action in ("rm", "remove", "forget"):
-        if not rest:
-            print("xenia: remove which credential?", file=sys.stderr)
+    if action in ("rename", "mv"):
+        named = [item for item in rest if not item.startswith("-")]
+        if len(named) < 2:
+            print("xenia: xenia secret rename OLD NEW", file=sys.stderr)
             return 2
-        name = rest[0]
-        gone = broker.forget(conn, name)
+        old, new = named[0], named[1]
         try:
-            vault.backend().delete(name)
-        except vault.VaultError as exc:
-            print(f"xenia: removed the policy, but the store said: {exc}",
-                  file=sys.stderr)
+            outcome = rename(conn, old, new)
+        except (ValueError, vault.VaultError) as exc:
+            print(f"xenia: {exc} — nothing was changed.", file=sys.stderr)
+            return 2
+        print(f"'{old}' is now '{new}'"
+              + ("." if outcome["value"] else
+                 " — there was no value in the store under the old name."))
+        if outcome["store_error"]:
+            print(f"xenia: the old value could not be deleted: "
+                  f"{outcome['store_error']}", file=sys.stderr)
             return 1
-        print(f"Removed '{name}'." if gone else f"No credential '{name}'.")
-        return 0 if gone else 1
+        print(f"  Anything writing {{{{secret:{old}}}}} has to say "
+              f"{{{{secret:{new}}}}} now.")
+        return 0
+
+    if action in ("rm", "remove", "forget"):
+        named = [item for item in rest if not item.startswith("-")]
+        if not named:
+            return _remove_interactively(conn, broker, wait="--wait" in rest)
+        return _remove(conn, named[0])
 
     if action == "sign":
         if len(rest) < 2:
@@ -719,12 +844,87 @@ def _secret(conn, broker, argv: list[str]) -> int:
     return _usage()
 
 
+def _remove(conn, name: str) -> int:
+    outcome = remove(conn, name)
+    if outcome["store_error"]:
+        print(f"xenia: removed the policy, but the store said: "
+              f"{outcome['store_error']}", file=sys.stderr)
+        return 1
+    if not (outcome["policy"] or outcome["value"]):
+        print(f"No credential '{name}'.")
+        return 1
+    print(f"Removed '{name}'."
+          + ("" if outcome["policy"] else
+             " (it had no policy here — a value left behind by a cancelled "
+             "add)"))
+    return 0
+
+
+def _remove_interactively(conn, broker, *, wait: bool = False) -> int:
+    """Pick one and remove it. What the tray's Delete… opens.
+
+    `rm NAME` is still the whole command for anyone who knows the name; this
+    is for the click that starts with no name at all.
+    """
+    if not sys.stdin.isatty():
+        print("xenia: remove which credential? `xenia secret rm NAME`",
+              file=sys.stderr)
+        return 2
+
+    rows = broker.registry(conn)
+    known = {row["name"] for row in rows}
+    names = [row["name"] for row in rows] + sorted(stored_names() - known)
+
+    print("\nRemove a credential from xenia\n" + "-" * 30)
+    if not names:
+        print("\nNothing to remove — no credentials are registered.\n")
+        if wait:
+            _ask("Press enter to close")
+        return 0
+
+    where = {row["name"]: (", ".join(row["hosts"]) or "nothing yet")
+             for row in rows}
+    print()
+    for index, name in enumerate(names, start=1):
+        print(f"  {index:2}  {name:24} "
+              f"{where.get(name, 'in the store, unknown to xenia')}")
+
+    answer = _ask("\nRemove which one (number or name, blank to cancel)")
+    if not answer:
+        print("Nothing was changed.")
+        if wait:
+            _ask("\nPress enter to close")
+        return 0
+
+    if answer.isdigit() and 1 <= int(answer) <= len(names):
+        name = names[int(answer) - 1]
+    elif answer in names:
+        name = answer
+    else:
+        print(f"xenia: no credential '{answer}' — nothing was changed.",
+              file=sys.stderr)
+        if wait:
+            _ask("\nPress enter to close")
+        return 2
+
+    print(f"\n  Removing '{name}' deletes the value from the "
+          f"{vault.configured_kind()} as well as the policy here, and the "
+          f"value cannot be got back.")
+    if not _ask_yes(f"  Remove '{name}'?", default=False):
+        print("Nothing was changed.")
+        if wait:
+            _ask("\nPress enter to close")
+        return 0
+
+    code = _remove(conn, name)
+    if wait:
+        _ask("\nPress enter to close")
+    return code
+
+
 def _list(conn, broker) -> int:
     rows = broker.registry(conn)
-    try:
-        stored = set(vault.backend().names())
-    except Exception:
-        stored = set()
+    stored = stored_names()
     known = {row["name"] for row in rows}
 
     if not rows and not stored:
@@ -847,9 +1047,19 @@ def _usage() -> int:
                                   damaging one
   xenia secret schemes            which signing schemes work on this machine
   xenia secret new                add and scope one, interactively — the same
-                                  thing the tray's Credentials item opens
-  xenia secret list               what is registered, and what is approved
-  xenia secret rm NAME            forget the policy and delete the value
+                                  thing the tray's Credentials → Add… opens
+  xenia secret list               what is registered, and what is approved.
+                                  The report's Credentials tab is the same
+                                  list, and is where one is added, renamed or
+                                  removed with the mouse
+  xenia secret rename OLD NEW     give one a different name, keeping its
+                                  policy, its approvals and its history.
+                                  Anything writing {{secret:OLD}} has to say
+                                  {{secret:NEW}} afterwards
+  xenia secret rm [NAME]          forget the policy and delete the value.
+                                  With no name it lists what is there and
+                                  asks which — the same thing the tray's
+                                  Credentials → Delete… opens
   xenia secret test               store, read back and delete a test value
 
   xenia grant NAME --host H [--write] [--for 4h]
