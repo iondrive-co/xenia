@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import hmac
+import json
 import sys
 import time
 from pathlib import Path
@@ -175,3 +176,30 @@ def test_every_scheme_reports_whether_it_can_run_here():
 def test_an_unknown_scheme_lists_the_known_ones():
     with pytest.raises(signing.SchemeError, match="aws-sigv4"):
         signing.sign({"scheme": "ed25519-magic"}, context())
+
+
+def test_profile_bound_eip712_signing_commits_to_the_checked_message():
+    if not signing.available("secp256k1-eip712"):
+        pytest.skip("eth-account, coincurve and msgpack are optional")
+    from eth_account import Account
+    from eth_account.messages import encode_typed_data
+
+    key = "0x" + "11" * 32
+    profile = {
+        "scheme": "secp256k1-eip712",
+        "domain": {"name": "Example", "version": "1", "chainId": 1,
+                   "verifyingContract": "0x0000000000000000000000000000000000000000"},
+        "types": {"Agent": [{"name": "nonce", "type": "uint64"}]},
+        "primary_type": "Agent",
+        "payload_policy": {"actions": {"one": {
+            "methods": ["SIGN"], "paths": ["/"],
+            "required": ["nonce"], "max": {"nonce": 100}}}},
+    }
+    message = {"nonce": 7}
+    got = signing.sign(profile, context(secret=key, body=json.dumps(message)))
+    structured = encode_typed_data(full_message={
+        "types": profile["types"], "domain": profile["domain"],
+        "primaryType": profile["primary_type"], "message": message})
+    recovered = Account.recover_message(
+        structured, signature=bytes.fromhex(got[2:]))
+    assert recovered == Account.from_key(key).address

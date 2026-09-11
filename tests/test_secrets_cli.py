@@ -492,3 +492,61 @@ def test_no_terminal_at_all_is_reported_rather_than_guessed(monkeypatch):
 
     assert secrets.terminal_for(["xenia"]) is None
     assert secrets.open_in_terminal(["xenia"]) is False
+
+
+# -- a signing profile that nests -------------------------------------------
+
+NESTED_PROFILE = {
+    "scheme": "secp256k1-eip712",
+    "domain": {"name": "Example", "version": "1", "chainId": 1,
+               "verifyingContract": "0x" + "00" * 20},
+    "types": {"Agent": [{"name": "nonce", "type": "uint64"}]},
+    "primary_type": "Agent",
+    "payload_policy": {"actions": {"one": {
+        "methods": ["SIGN"], "paths": ["/"], "required": ["nonce"]}}},
+}
+
+
+def profile_on(cli, name="wallet"):
+    conn = cli.db()
+    row = broker.entry(conn, name)
+    held = broker.profiles_for(row, "SIGN")
+    conn.close()
+    return held
+
+
+def test_a_nested_signing_profile_is_stored_as_json_not_as_strings(cli):
+    """`key=value` cannot spell a domain, a schema or a message binding.
+
+    Stringifying them would store a profile the scheme then refuses at signing
+    time — the failure arriving one operator step after the mistake.
+    """
+    assert cli("secret", "add", "wallet", "--host", "api.example.com",
+               stdin=VALUE) == 0
+    assert cli("secret", "sign", "wallet", "l1",
+               stdin=json.dumps(NESTED_PROFILE)) == 0
+
+    held = profile_on(cli)["l1"]
+    assert held["domain"] == NESTED_PROFILE["domain"]
+    assert held["types"] == NESTED_PROFILE["types"]
+    assert held["payload_policy"] == NESTED_PROFILE["payload_policy"]
+
+
+def test_the_flat_form_still_works(cli):
+    assert cli("secret", "add", "wallet", "--host", "api.example.com",
+               stdin=VALUE) == 0
+    assert cli("secret", "sign", "wallet", "hm", "scheme=hmac",
+               "template={ts}{body}", "digest=sha256") == 0
+
+    held = profile_on(cli)["hm"]
+    assert held["scheme"] == "hmac"
+    assert held["template"] == "{ts}{body}"
+
+
+def test_a_profile_that_is_not_json_is_refused_rather_than_stored(cli):
+    assert cli("secret", "add", "wallet", "--host", "api.example.com",
+               stdin=VALUE) == 0
+
+    assert cli("secret", "sign", "wallet", "l1", stdin="not json") == 2
+    assert cli("secret", "sign", "wallet", "l1", stdin="[1, 2]") == 2
+    assert profile_on(cli) == {}

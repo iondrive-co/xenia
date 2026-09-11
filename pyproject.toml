@@ -9,6 +9,14 @@ requires-python = ">=3.11"
 # recorder the thing that breaks the agent.
 dependencies = []
 
+[project.optional-dependencies]
+# `eth-utils` is imported by name for keccak, so it is declared rather than
+# taken on loan from eth-account's own requirements. eth-account pins
+# hexbytes>=1.2, where `.hex()` lost its `0x` prefix — a caller that adds one
+# is right only under that pin.
+eip712 = ["eth-account==0.13.7", "eth-utils==5.3.1", "coincurve==21.0.0",
+          "msgpack==1.2.2"]
+
 [project.scripts]
 xenia = "xenia.app:main"
 xenia-hook = "xenia.hook:main"

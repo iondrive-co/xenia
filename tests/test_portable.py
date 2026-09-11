@@ -24,14 +24,31 @@ STDLIB = {
 
 
 def imported_modules(path: pathlib.Path) -> set[str]:
-    tree = ast.parse(path.read_text())
+    """What importing this module PULLS IN, which is not every name it mentions.
+
+    An import inside a function body runs when that function is called, so it
+    cannot fail a fresh machine at import time — and a scheme that binds to a
+    reviewed cryptographic library has to reach for one somewhere. What must
+    stay clean is module scope: that is what `import xenia` executes, and an
+    absent library there is a xenia that will not start rather than a feature
+    that reports itself unavailable. So this descends into `if` and `try` at
+    module level, and stops at the first `def`.
+    """
     found = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            found.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level == 0 and node.module:
-                found.add(node.module.split(".")[0])
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(child, ast.Import):
+                found.update(alias.name.split(".")[0] for alias in child.names)
+            elif isinstance(child, ast.ImportFrom):
+                if child.level == 0 and child.module:
+                    found.add(child.module.split(".")[0])
+            else:
+                visit(child)
+
+    visit(ast.parse(path.read_text()))
     return found
 
 
@@ -39,9 +56,30 @@ def imported_modules(path: pathlib.Path) -> set[str]:
 def test_no_module_imports_anything_outside_the_standard_library(source):
     outside = imported_modules(source) - STDLIB - {"xenia", "__future__"}
     assert not outside, (
-        f"{source.name} imports {sorted(outside)}, which would make xenia "
-        f"depend on something a fresh machine may not have"
+        f"{source.name} imports {sorted(outside)} at module scope, which would "
+        f"make xenia depend on something a fresh machine may not have"
     )
+
+
+def test_a_deferred_import_is_still_caught_at_module_scope():
+    """The relaxation above is about WHERE, not about whether it is checked."""
+    written = pathlib.Path(__file__).parent / "_scratch_portable.py"
+    try:
+        written.write_text("import json\nif True:\n    import numpy\n")
+        assert imported_modules(written) == {"json", "numpy"}
+        written.write_text("def f():\n    import numpy\n    return numpy\n")
+        assert imported_modules(written) == set()
+    finally:
+        written.unlink(missing_ok=True)
+
+
+def test_every_optional_library_is_reachable_only_through_a_scheme():
+    """A library xenia does not depend on may be imported only where its
+    absence turns into `unavailable` — never where it turns into a crash."""
+    from xenia import signing
+
+    for name in signing.SCHEMES:
+        assert signing.available(name) in (True, False)
 
 
 def test_the_hook_never_reaches_for_a_desktop():
