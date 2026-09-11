@@ -258,6 +258,7 @@ class App:
             MenuItem("Credentials", items=[
                 MenuItem("Add…", self.add_credential),
                 MenuItem("List", self.list_credentials),
+                MenuItem("Delete…", self.delete_credential),
             ]),
             MenuItem("Quit xenia", self.quit),
         ]
@@ -271,7 +272,22 @@ class App:
         self._in_terminal(["secret", "new"], "xenia secret new")
 
     def list_credentials(self) -> None:
-        self._in_terminal(["secret", "list", "--wait"], "xenia secret list")
+        """The report's Credentials tab, not a terminal.
+
+        The same list, with what each credential has been used for beside it,
+        somewhere it can be read after the click that opened it — and the tab
+        is where one is added or removed now, so the list is the way in.
+        """
+        webbrowser.open(self.report.tab("credentials"))
+
+    def delete_credential(self) -> None:
+        """A terminal, because this one cannot be taken back.
+
+        With no name `secret rm` lists what is there, asks which, and asks
+        again before it deletes — a tray click is one click, and the value
+        goes out of the keyring with the policy.
+        """
+        self._in_terminal(["secret", "rm", "--wait"], "xenia secret rm")
 
     def _in_terminal(self, args: list[str], command: str) -> None:
         from . import secrets as secrets_cli

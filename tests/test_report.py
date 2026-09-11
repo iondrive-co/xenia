@@ -3,11 +3,47 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 from conftest import CORE, FAKE_GITLAB_PAT, pre
 
-from xenia import ingest, report as report_mod
+from xenia import ingest, report as report_mod, vault
+
+#: Never stored by any other test, so finding it anywhere is proof it leaked.
+TYPED = "glpat-" + "typed-into-the-page-9f2a"
+
+
+class Memory:
+    """A credential store that keeps values in this process and nowhere else."""
+
+    kind = "memory"
+
+    def __init__(self):
+        self.values: dict[str, str] = {}
+
+    def get(self, name):
+        return self.values.get(name)
+
+    def set(self, name, value):
+        self.values[name] = value
+
+    def delete(self, name):
+        return self.values.pop(name, None) is not None
+
+    def names(self):
+        return list(self.values)
+
+    def describe(self):
+        return {"kind": self.kind, "available": True, "provider": "memory"}
+
+
+@pytest.fixture
+def store(monkeypatch):
+    held = Memory()
+    monkeypatch.setattr(vault, "backend", lambda kind=None: held)
+    monkeypatch.setattr(vault, "configured_kind", lambda: held.kind)
+    return held
 
 
 @pytest.fixture
@@ -36,6 +72,17 @@ def fetch(report, path):
 def api(report, path):
     joiner = "&" if "?" in path else "?"
     return json.loads(fetch(report, f"{path}{joiner}t={report.token}"))
+
+
+def post(report, path, payload, *, token=True, headers=None):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{report.port}{path}"
+        + (f"?t={report.token}" if token else ""),
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST")
+    with urllib.request.urlopen(request) as reply:
+        return json.loads(reply.read())
 
 
 def test_it_binds_to_loopback_only(served):
@@ -116,8 +163,15 @@ def test_a_broken_query_reports_rather_than_500s(served):
     assert "error" in api(served, "/api/nonexistent")
 
 
-def test_there_is_no_write_path(served):
-    for path in ("/api/dismiss", "/api/mute", "/api/decide", "/api/summary"):
+def test_the_record_itself_has_no_write_path(served):
+    """Credentials are the user's to change. What an agent did is not.
+
+    Every view is served from a read-only connection, and the only paths that
+    answer a POST at all are the three credential ones.
+    """
+    for path in ("/api/dismiss", "/api/mute", "/api/decide", "/api/summary",
+                 "/api/tasks", "/api/interactions", "/api/goals",
+                 "/api/secrets"):
         request = urllib.request.Request(
             f"http://127.0.0.1:{served.port}{path}?t={served.token}",
             data=b"{}", headers={"Content-Type": "application/json"},
@@ -194,10 +248,153 @@ def test_the_page_offers_a_credentials_tab(served):
     assert "/api/secrets" in page
 
 
-def test_the_report_still_cannot_be_written_to(served):
+def test_the_page_offers_a_way_in_and_out(served):
+    page = fetch(served, f"/?t={served.token}").decode()
+    assert 'id="newSecret"' in page and 'id="secretForm"' in page
+    assert "/api/secrets/add" in page and "/api/secrets/remove" in page
+    assert "/api/secrets/rename" in page
+
+
+def test_a_credential_can_be_added_from_the_page(served, store, conn):
+    out = post(served, "/api/secrets/add", {
+        "name": "gitlab-pat", "value": TYPED,
+        "hosts": "gitlab.example.com, ops.example.com", "note": "read only"})
+
+    assert out["ok"] and out["store"] == "memory"
+    assert store.values == {"gitlab-pat": TYPED}
+
+    row = api(served, "/api/secrets")["rows"][0]
+    assert row["name"] == "gitlab-pat"
+    assert row["hosts"] == ["gitlab.example.com", "ops.example.com"]
+    assert row["note"] == "read only"
+    assert row["approved_for"] == [], "adding one does not approve it"
+
+
+def test_a_credential_added_with_nowhere_to_go_is_asked_about_on_first_use(
+        served, store, conn):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+
+    assert api(served, "/api/secrets")["rows"][0]["hosts"] == []
+
+
+def test_the_value_reaches_the_store_and_nothing_else(served, store, conn):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+
+    assert TYPED not in json.dumps(api(served, "/api/secrets"))
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(served.db_path) + suffix)
+        if path.exists():
+            assert TYPED.encode() not in path.read_bytes(), suffix
+
+
+def test_replacing_a_value_keeps_where_it_was_allowed_to_go(served, store, conn):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED,
+                                      "hosts": "gitlab.example.com"})
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED + "-new"})
+
+    assert store.values["pat"] == TYPED + "-new"
+    assert api(served, "/api/secrets")["rows"][0]["hosts"] == ["gitlab.example.com"]
+
+
+def test_a_credential_can_be_renamed_from_the_page(served, store, conn):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED,
+                                      "hosts": "gitlab.example.com"})
+
+    out = post(served, "/api/secrets/rename", {"name": "pat",
+                                               "to": "gitlab-pat"})
+
+    assert out["ok"] and out["to"] == "gitlab-pat"
+    assert store.values == {"gitlab-pat": TYPED}
+    row = api(served, "/api/secrets")["rows"][0]
+    assert row["name"] == "gitlab-pat"
+    assert row["hosts"] == ["gitlab.example.com"], "the policy came with it"
+
+
+def test_a_rename_carries_the_approvals_and_the_history(served, store, conn):
+    from xenia import broker
+
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED,
+                                      "hosts": "h.example"})
+    broker.grant(conn, "pat", "h.example", source="test")
+    conn.execute("INSERT INTO secret_use (at, name, host, decision) "
+                 "VALUES ('2026-07-27T09:00:00.000+00:00', 'pat', 'h.example',"
+                 " 'allowed')")
+    conn.commit()
+
+    post(served, "/api/secrets/rename", {"name": "pat", "to": "moved"})
+
+    row = api(served, "/api/secrets")["rows"][0]
+    assert row["name"] == "moved"
+    assert row["uses"] == 1, "a history left behind would say it was never used"
+    assert [g["host"] for g in row["approved_for"]] == ["h.example"]
+
+
+def test_renaming_onto_a_name_that_is_taken_is_refused(served, store, conn):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+    post(served, "/api/secrets/add", {"name": "other", "value": TYPED + "-b"})
+
+    out = post(served, "/api/secrets/rename", {"name": "pat", "to": "other"})
+
+    assert "error" in out and "already" in out["error"]
+    assert store.values == {"pat": TYPED, "other": TYPED + "-b"}
+
+
+def test_renaming_one_that_is_not_there_says_so(served, store, conn):
+    out = post(served, "/api/secrets/rename", {"name": "ghost", "to": "pat"})
+
+    assert "error" in out and "no credential" in out["error"]
+    assert store.values == {}
+
+
+def test_a_credential_can_be_removed_from_the_page(served, store, conn):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+
+    out = post(served, "/api/secrets/remove", {"name": "pat"})
+
+    assert out["ok"] and out["policy"] and out["value"]
+    assert store.values == {}
+    assert api(served, "/api/secrets")["rows"] == []
+
+
+def test_removing_one_that_is_not_there_says_so(served, store, conn):
+    out = post(served, "/api/secrets/remove", {"name": "never-existed"})
+
+    assert "error" in out and "no credential" in out["error"]
+
+
+def test_an_add_with_no_name_or_no_value_changes_nothing(served, store, conn):
+    assert "error" in post(served, "/api/secrets/add",
+                           {"name": "", "value": TYPED})
+    assert "error" in post(served, "/api/secrets/add",
+                           {"name": "pat", "value": ""})
+    assert store.values == {}
+    assert api(served, "/api/secrets")["rows"] == []
+
+
+def test_a_write_without_the_token_is_refused(served, store):
+    with pytest.raises(urllib.error.HTTPError) as raised:
+        post(served, "/api/secrets/add", {"name": "pat", "value": TYPED},
+             token=False)
+    assert raised.value.code == 403
+    assert store.values == {}
+
+
+def test_a_write_from_another_page_is_refused(served, store):
+    """The token is what a caller must know; this is for one that knows it."""
+    for headers in ({"Origin": "https://elsewhere.example"},
+                    {"Host": "rebound.example"}):
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            post(served, "/api/secrets/add", {"name": "pat", "value": TYPED},
+                 headers=headers)
+        assert raised.value.code == 403, headers
+    assert store.values == {}
+
+
+def test_a_body_that_is_not_a_credential_is_refused_before_it_is_read(served):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{served.port}/api/secrets?t={served.token}",
-        data=b"{}", method="POST")
+        f"http://127.0.0.1:{served.port}/api/secrets/add?t={served.token}",
+        data=b"[]", headers={"Content-Type": "application/json"},
+        method="POST")
     with pytest.raises(urllib.error.HTTPError) as raised:
         urllib.request.urlopen(request)
-    assert raised.value.code == 501
+    assert raised.value.code == 400

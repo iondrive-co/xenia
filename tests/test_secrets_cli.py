@@ -29,8 +29,29 @@ class Memory:
     def delete(self, name):
         return self.values.pop(name, None) is not None
 
+    def names(self):
+        return list(self.values)
+
     def describe(self):
         return {"kind": self.kind, "available": True, "provider": "memory"}
+
+
+class Tty(io.StringIO):
+    """A stdin that says it is a terminal, for the dialogues that only run there."""
+
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def answers(monkeypatch):
+    """Queue up what a person would type at the prompts, in order."""
+    def give(*replies):
+        queued = list(replies)
+        monkeypatch.setattr(sys, "stdin", Tty())
+        monkeypatch.setattr("builtins.input",
+                            lambda prompt="": queued.pop(0) if queued else "")
+    return give
 
 
 @pytest.fixture
@@ -136,6 +157,107 @@ def test_removing_takes_the_value_with_the_policy(cli):
     assert broker.registry(conn) == []
     conn.close()
     assert cli.store.values == {}
+
+
+def test_renaming_moves_the_value_and_the_policy_together(cli, capsys):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    capsys.readouterr()
+
+    assert cli("secret", "rename", "pat", "gitlab-pat") == 0
+
+    assert cli.store.values == {"gitlab-pat": VALUE}
+    conn = cli.db()
+    rows = broker.registry(conn)
+    conn.close()
+    assert [row["name"] for row in rows] == ["gitlab-pat"]
+    assert rows[0]["hosts"] == ["h.example"]
+    assert "{{secret:gitlab-pat}}" in capsys.readouterr().out
+
+
+def test_a_rename_keeps_an_approval_that_is_already_live(cli):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    cli("grant", "pat", "--host", "h.example")
+
+    assert cli("secret", "rename", "pat", "moved") == 0
+
+    conn = cli.db()
+    live = broker.grants(conn)
+    conn.close()
+    assert [row["name"] for row in live] == ["moved"]
+
+
+def test_renaming_onto_a_name_that_is_taken_changes_nothing(cli, capsys):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    cli("secret", "add", "other", "--host", "o.example", stdin=VALUE + "-b")
+    capsys.readouterr()
+
+    assert cli("secret", "rename", "pat", "other") == 2
+
+    assert "already" in capsys.readouterr().err
+    assert cli.store.values == {"pat": VALUE, "other": VALUE + "-b"}
+
+
+def test_renaming_something_that_is_not_there_says_so(cli, capsys):
+    assert cli("secret", "rename", "ghost", "pat") == 2
+    assert "no credential" in capsys.readouterr().err
+
+
+def test_removing_with_no_name_lists_them_and_asks_which(cli, answers, capsys):
+    """What the tray's Credentials → Delete… opens: a click has no name in it."""
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    cli("secret", "add", "other", "--host", "o.example", stdin=VALUE)
+    capsys.readouterr()
+
+    answers("pat", "y")
+    assert cli("secret", "rm") == 0
+
+    shown = capsys.readouterr().out
+    assert "pat" in shown and "other" in shown
+    assert "h.example" in shown, "which hosts it reaches is what tells them apart"
+    assert cli.store.values == {"other": VALUE}
+
+
+def test_one_can_be_picked_by_number(cli, answers):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    cli("secret", "add", "other", "--host", "o.example", stdin=VALUE)
+
+    answers("2", "y")  # listed by name: other, pat
+    assert cli("secret", "rm") == 0
+
+    assert cli.store.values == {"other": VALUE}
+
+
+def test_the_confirmation_is_no_by_default(cli, answers):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+
+    answers("pat", "")
+    assert cli("secret", "rm") == 0
+
+    assert cli.store.values == {"pat": VALUE}, "enter is not a yes here"
+
+
+def test_an_answer_that_names_nothing_removes_nothing(cli, answers, capsys):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+
+    answers("9", "y")
+    assert cli("secret", "rm") == 2
+
+    assert cli.store.values == {"pat": VALUE}
+    assert "nothing was changed" in capsys.readouterr().err
+
+
+def test_a_value_left_behind_by_a_cancelled_add_can_be_picked_too(cli, answers):
+    cli.store.values["orphan"] = VALUE
+
+    answers("orphan", "y")
+    assert cli("secret", "rm") == 0
+
+    assert cli.store.values == {}
+
+
+def test_removing_needs_a_name_where_nothing_can_be_asked(cli, capsys):
+    assert cli("secret", "rm") == 2
+    assert "xenia secret rm NAME" in capsys.readouterr().err
 
 
 # -- approving --------------------------------------------------------------

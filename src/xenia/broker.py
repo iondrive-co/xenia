@@ -98,6 +98,19 @@ def stamp(when: datetime) -> str:
 # The registry: which credentials exist, and where each may be sent
 # --------------------------------------------------------------------------
 
+def methods_for(methods: list[str] | None) -> list[str]:
+    """The methods a policy may name, normalised — or a refusal naming the typo.
+
+    Separate from `register` so a caller holding a value can find out whether
+    the policy will be accepted before it puts anything in the store.
+    """
+    out = [m.upper() for m in (methods or DEFAULT_METHODS)]
+    unknown = [m for m in out if m not in METHODS]
+    if unknown:
+        raise ValueError(f"not an HTTP method: {', '.join(unknown)}")
+    return out
+
+
 def register(conn, name: str, *, backend: str | None = None,
              hosts: list[str] | None = None,
              methods: list[str] | None = None,
@@ -108,10 +121,7 @@ def register(conn, name: str, *, backend: str | None = None,
     """Record a credential xenia may use. The value is not passed here."""
     if not name or not name.strip():
         raise ValueError("a credential needs a name")
-    methods = [m.upper() for m in (methods or DEFAULT_METHODS)]
-    unknown = [m for m in methods if m not in METHODS]
-    if unknown:
-        raise ValueError(f"not an HTTP method: {', '.join(unknown)}")
+    methods = methods_for(methods)
 
     if service and not body_policy_of(entry(conn, name)):
         # Naming a service says this credential does more than read: a harmless
@@ -218,6 +228,39 @@ def forget(conn, name: str) -> bool:
 
 def entry(conn, name: str):
     return conn.execute("SELECT * FROM secret WHERE name = ?", (name,)).fetchone()
+
+
+def rename(conn, name: str, to: str) -> None:
+    """Give a credential a different name, and take its history with it.
+
+    The grants and the uses move too: it is the same credential, and a history
+    left behind under a name nothing answers to would say it had never been
+    used.
+
+    The new row goes in before the old one comes out, because `secret_grant`
+    references the name and a grant orphaned for even one statement is a grant
+    the foreign key deletes.
+    """
+    to = (to or "").strip()
+    if not to:
+        raise ValueError("a credential needs a name")
+    row = entry(conn, name)
+    if row is None:
+        raise ValueError(f"no credential called '{name}'")
+    if to == name:
+        return
+    if entry(conn, to) is not None:
+        raise ValueError(f"there is already a credential called '{to}'")
+
+    columns = list(row.keys())
+    conn.execute(
+        f"INSERT INTO secret ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' * len(columns))})",
+        [to if column == "name" else row[column] for column in columns])
+    conn.execute("UPDATE secret_grant SET name = ? WHERE name = ?", (to, name))
+    conn.execute("UPDATE secret_use SET name = ? WHERE name = ?", (to, name))
+    conn.execute("DELETE FROM secret WHERE name = ?", (name,))
+    conn.commit()
 
 
 def registry(conn) -> list[dict]:
@@ -1250,30 +1293,74 @@ ASK_COOLOFF = float(os.environ.get("XENIA_ASK_COOLOFF", 60))
 _asked: dict[tuple[str, str], float] = {}
 
 
+#: How long after taking a prompt down an answer already on the wire still
+#: counts. Not politeness: the daemon sends ActionInvoked before it answers a
+#: close, so a click in that last instant is an answer xenia already has, and
+#: would otherwise throw away for having asked one moment too late.
+CLOSE_GRACE = float(os.environ.get("XENIA_PROMPT_CLOSE_GRACE", 0.75))
+
+#: What the reason in NotificationClosed means, in the words the refusal uses.
+#: 3 is "a CloseNotification call", which here is only ever xenia's own.
+CLOSED_REASONS = {1: "expired", 2: "dismissed", 3: "timed-out", 4: "dismissed"}
+
+
 def ask_to_use(name: str, host: str, method: str, *, known: bool,
-               wait: float | None = None) -> bool | None:
+               wait: float | None = None,
+               ended: dict | None = None) -> bool | None:
     """Put the decision in front of the user. True, False, or None if unasked.
 
     A notification with buttons, because it is the one dialogue this machine
     can raise without a toolkit — and dismissing it counts as no.
+
+    xenia takes the prompt down itself, on every path out of here. The
+    expire_timeout in the spec is a hint and the daemons that matter ignore it
+    for any notification carrying actions: on Xfce Notify Daemon 0.9.7 one
+    sent with a 3s hint was still on screen 13s later, at either urgency. A
+    prompt left to the daemon therefore outlives the call it belongs to, and
+    what is left on screen is Allow and Deny on a question nobody is waiting
+    on any more — a click that gets no grant, no error and no feedback at all,
+    and a refusal that then tells the agent the user declined. It is worst
+    with two calls queued: the prompts stack up on the desktop while the calls
+    run one at a time, so all but one of them is already dead.
+
+    `ended` is filled in with how it ended, which is what the refusal an agent
+    reads is written from.
     """
     from .dbus import Connection, Variant
 
+    ended = {} if ended is None else ended
+    window = APPROVAL_WAIT if wait is None else wait
+    ended["seconds"] = window
     answer: dict[str, Any] = {}
+    wanted: dict[str, Any] = {}
     done = threading.Event()
+
     try:
         conn = Connection().connect()
     except Exception:
+        ended["how"] = "unasked"
         return None
+
+    def take_down() -> None:
+        """Take the prompt off the screen, once, whatever happened to it."""
+        if not wanted.get("id") or wanted.get("gone"):
+            return
+        wanted["gone"] = True
+        try:
+            conn.call("org.freedesktop.Notifications",
+                      "/org/freedesktop/Notifications",
+                      "org.freedesktop.Notifications", "CloseNotification",
+                      "u", [wanted["id"]], timeout=2.0)
+        except Exception:
+            pass
 
     try:
         caps = conn.call("org.freedesktop.Notifications",
                          "/org/freedesktop/Notifications",
                          "org.freedesktop.Notifications", "GetCapabilities")[0]
         if "actions" not in list(caps):
+            ended["how"] = "unasked"
             return None
-
-        wanted: dict[str, Any] = {}
 
         def invoked(message) -> None:
             if message.body and message.body[0] == wanted.get("id"):
@@ -1282,6 +1369,9 @@ def ask_to_use(name: str, host: str, method: str, *, known: bool,
 
         def closed(message) -> None:
             if message.body and message.body[0] == wanted.get("id"):
+                answer.setdefault(
+                    "closed", message.body[1] if len(message.body) > 1 else 0)
+                wanted["gone"] = True
                 done.set()
 
         for member, handler in (("ActionInvoked", invoked),
@@ -1289,7 +1379,6 @@ def ask_to_use(name: str, host: str, method: str, *, known: bool,
             conn.on_signal("/org/freedesktop/Notifications",
                            "org.freedesktop.Notifications", member, handler)
 
-        seconds = int((wait if wait is not None else APPROVAL_WAIT) * 1000)
         wanted["id"] = conn.call(
             "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
             "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
@@ -1301,17 +1390,75 @@ def ask_to_use(name: str, host: str, method: str, *, known: bool,
                  f"\nAllowing also lets '{name}' be used at {host} from now "
                  f"on.")),
              ["allow", "Allow", "deny", "Deny"],
-             {"urgency": Variant("y", 2)}, seconds])[0]
+             {"urgency": Variant("y", 2)},
+             # Still sent, because a daemon that honours it is a backstop for
+             # a xenia that dies holding the prompt. Nothing here depends on
+             # it being honoured.
+             int(window * 1000)])[0]
 
-        done.wait((wait if wait is not None else APPROVAL_WAIT) + 2)
-        return answer.get("choice") == "allow"
+        if not done.wait(window):
+            take_down()
+            done.wait(CLOSE_GRACE)
+
+        if answer.get("choice"):
+            ended["how"] = ("allowed" if answer["choice"] == "allow"
+                            else "denied")
+            return answer["choice"] == "allow"
+        if "closed" in answer:
+            ended["how"] = CLOSED_REASONS.get(answer["closed"], "dismissed")
+            return False
+        ended["how"] = "timed-out"
+        return False
     except Exception:
+        ended.setdefault("how", "unasked")
         return None
     finally:
+        # Every path, including the ones that got here by raising: a prompt
+        # that outlives the call is a button with nothing behind it.
+        take_down()
         try:
             conn.close()
         except Exception:
             pass
+
+
+#: What to tell an agent about a prompt that did not come back as an approval.
+#: Which of these it was is the difference between the user having said no and
+#: the user never having been given a live prompt to say it with.
+PROMPT_ENDINGS = {
+    "allowed": "",
+    "denied": " The prompt on the user's desktop was declined.",
+    "dismissed": " The prompt on the user's desktop was dismissed without an "
+                 "answer.",
+    "expired": " The prompt on the user's desktop closed before it was "
+               "answered.",
+    "timed-out": " The prompt on the user's desktop went unanswered for "
+                 "{seconds:.0f}s and has been taken down, so there is nothing "
+                 "left on screen to click.",
+}
+
+#: What it used to say for every one of them, and still says for a caller that
+#: did not ask how it ended.
+PROMPT_ENDED_SOMEHOW = (" The prompt on the user's desktop was declined or "
+                        "went unanswered.")
+
+
+def _why_not(ended: dict, name: str, host: str, mutating: bool) -> str:
+    """The second half of an unapproved refusal: what happened, then what to do."""
+    how = ended.get("how")
+    if how is None:
+        said = PROMPT_ENDED_SOMEHOW
+    elif how == "unasked":
+        said = ""
+    else:
+        said = PROMPT_ENDINGS.get(how, PROMPT_ENDED_SOMEHOW).format(
+            seconds=ended.get("seconds") or APPROVAL_WAIT)
+
+    if how in ("denied", "dismissed"):
+        return said
+    return (f"{said} ACTION: ask the user to run `xenia grant {name} --host "
+            f"{host}{' --write' if mutating else ''}` in their own terminal, "
+            f"then retry.")
 
 
 def _approved_for(row, host: str, method: str) -> bool:
@@ -1330,19 +1477,17 @@ def _decide(conn, row, host: str, method: str, *, notify: bool = True):
     known = _approved_for(row, host, method)
     recent = _asked.get((name, host), 0.0)
     allowed = None
+    ended: dict[str, Any] = {}
 
     if notify and time.monotonic() - recent > ASK_COOLOFF:
         _asked[(name, host)] = time.monotonic()
-        allowed = ask_to_use(name, host, method, known=known)
+        allowed = ask_to_use(name, host, method, known=known, ended=ended)
 
     if not allowed:
         raise Refusal(
-            f"'{name}' is not approved for {method} {host}"
-            + (". The prompt on the user's desktop was declined or went "
-               "unanswered." if allowed is False else
-               f". ACTION: ask the user to run `xenia grant {name} --host "
-               f"{host}{' --write' if mutating else ''}` in their own "
-               f"terminal, then retry."),
+            f"'{name}' is not approved for {method} {host}."
+            + _why_not(ended if allowed is not None else {"how": "unasked"},
+                       name, host, mutating),
             code="unapproved")
 
     hosts = json.loads(row["hosts"])

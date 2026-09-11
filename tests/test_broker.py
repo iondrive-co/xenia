@@ -1365,3 +1365,201 @@ def test_a_hard_refusal_is_never_put_to_the_user(conn, monkeypatch):
 
     assert "link-local" in answer["refused"]
     assert asked == []
+
+
+# -- the prompt on the desktop ----------------------------------------------
+
+class Notified:
+    """A notification daemon that behaves like the ones people run.
+
+    It ignores expire_timeout on anything carrying actions — measured on Xfce
+    Notify Daemon 0.9.7, and the reason a prompt used to outlive the call that
+    raised it — so the only thing that ever takes one of these off the screen
+    is a CloseNotification.
+    """
+
+    def __init__(self, capabilities=("body", "actions"), on_close=None):
+        self.capabilities = list(capabilities)
+        self.calls: list[tuple[str, list]] = []
+        self.handlers: dict[str, object] = {}
+        self.on_screen: set[int] = set()
+        self.on_close = on_close
+        self.closed = False
+
+    # the bit of xenia.dbus.Connection that ask_to_use uses
+    def connect(self):
+        return self
+
+    def call(self, destination, path, interface, member, signature="",
+             body=(), timeout=5.0):
+        self.calls.append((member, list(body)))
+        if member == "GetCapabilities":
+            return [self.capabilities]
+        if member == "Notify":
+            self.on_screen.add(7)
+            return [7]
+        if member == "CloseNotification":
+            if self.on_close is not None:
+                self.on_close(self)
+            self.on_screen.discard(body[0])
+            self.fire("NotificationClosed", [body[0], 3])
+            return []
+        raise AssertionError(f"unexpected call: {member}")
+
+    def on_signal(self, path, interface, member, handler):
+        self.handlers[member] = handler
+
+    def close(self):
+        self.closed = True
+
+    # what the daemon does back
+    def fire(self, member, body):
+        handler = self.handlers.get(member)
+        if handler is not None:
+            handler(type("Signal", (), {"body": body})())
+
+    def click(self, action):
+        self.fire("ActionInvoked", [7, action])
+
+    def sent(self, member):
+        return [body for name, body in self.calls if name == member]
+
+
+@pytest.fixture
+def daemon(monkeypatch):
+    def serving(**kwargs):
+        bus = Notified(**kwargs)
+        monkeypatch.setattr("xenia.dbus.Connection", lambda *a, **kw: bus)
+        return bus
+    return serving
+
+
+def test_a_prompt_nobody_is_listening_to_is_taken_off_the_screen(daemon):
+    """The bug this exists for: the window is xenia's, not the daemon's.
+
+    Waiting on expire_timeout leaves Allow and Deny on screen after the call
+    has given up, and a click on them is discarded in silence.
+    """
+    bus = daemon()
+    ended: dict = {}
+
+    assert broker.ask_to_use("aws", HOST, "GET", known=False, wait=0.05,
+                             ended=ended) is False
+
+    assert bus.sent("CloseNotification") == [[7]]
+    assert bus.on_screen == set()
+    assert ended["how"] == "timed-out"
+    assert bus.closed, "the bus connection is closed after the prompt is"
+
+
+def test_the_prompt_is_taken_down_before_the_connection_that_would_answer_it(
+        daemon):
+    order = []
+    bus = daemon()
+    bus.close = lambda: order.append("bus")
+    original = bus.call
+
+    def watched(*args, **kwargs):
+        if args[3] == "CloseNotification":
+            order.append("close")
+        return original(*args, **kwargs)
+
+    bus.call = watched
+    broker.ask_to_use("aws", HOST, "GET", known=False, wait=0.05)
+
+    assert order == ["close", "bus"]
+
+
+def test_a_click_that_lands_as_it_gives_up_still_counts(daemon):
+    """A click already on the wire is an answer xenia has, not one it lost."""
+    bus = daemon(on_close=lambda bus: bus.click("allow"))
+    ended: dict = {}
+
+    assert broker.ask_to_use("aws", HOST, "GET", known=False, wait=0.05,
+                             ended=ended) is True
+    assert ended["how"] == "allowed"
+
+
+def test_an_answer_ends_the_wait_and_says_which_it_was(daemon):
+    for action, expected, how in (("allow", True, "allowed"),
+                                  ("deny", False, "denied")):
+        bus = daemon()
+        ended: dict = {}
+        answered = threading.Thread(target=lambda: (time.sleep(0.05),
+                                                    bus.click(action)))
+        answered.start()
+        try:
+            assert broker.ask_to_use("aws", HOST, "GET", known=False, wait=5,
+                                     ended=ended) is expected
+        finally:
+            answered.join()
+        assert ended["how"] == how
+
+
+def test_a_prompt_the_user_dismisses_is_not_recorded_as_a_decline(daemon):
+    bus = daemon()
+    ended: dict = {}
+    dismissed = threading.Thread(
+        target=lambda: (time.sleep(0.05),
+                        bus.fire("NotificationClosed", [7, 2])))
+    dismissed.start()
+    try:
+        assert broker.ask_to_use("aws", HOST, "GET", known=False, wait=5,
+                                 ended=ended) is False
+    finally:
+        dismissed.join()
+    assert ended["how"] == "dismissed"
+
+
+def test_a_daemon_that_cannot_show_buttons_is_not_asked_at_all(daemon):
+    bus = daemon(capabilities=("body",))
+    ended: dict = {}
+
+    assert broker.ask_to_use("aws", HOST, "GET", known=False, wait=0.05,
+                             ended=ended) is None
+    assert bus.sent("Notify") == []
+    assert ended["how"] == "unasked"
+
+
+def test_the_expire_hint_is_still_sent_as_a_backstop(daemon):
+    """A daemon that honours it clears a prompt xenia died holding."""
+    bus = daemon()
+    broker.ask_to_use("aws", HOST, "GET", known=False, wait=0.05)
+
+    assert bus.sent("Notify")[0][-1] == 50
+
+
+def test_an_unanswered_prompt_does_not_tell_the_agent_the_user_said_no(
+        conn, monkeypatch):
+    broker.register(conn, "fresh", backend="memory")
+    monkeypatch.setattr(
+        broker, "ask_to_use",
+        lambda name, host, method, ended=None, **kw:
+        ended.update({"how": "timed-out", "seconds": 25}) or False)
+
+    answer = broker.fetch(conn, {
+        "secret": "fresh", "url": f"https://{HOST}/api",
+        "headers": {"X": broker.PLACEHOLDER}},
+        store=Store({"fresh": VALUE}), opener=Opener())
+
+    assert "went unanswered for 25s" in answer["refused"]
+    assert "taken down" in answer["refused"]
+    assert "declined" not in answer["refused"], "nobody declined anything"
+    assert "xenia grant fresh --host" in answer["refused"]
+
+
+def test_a_real_decline_is_not_dressed_up_as_a_timeout(conn, monkeypatch):
+    broker.register(conn, "fresh", backend="memory")
+    monkeypatch.setattr(
+        broker, "ask_to_use",
+        lambda name, host, method, ended=None, **kw:
+        ended.update({"how": "denied"}) or False)
+
+    answer = broker.fetch(conn, {
+        "secret": "fresh", "url": f"https://{HOST}/api",
+        "headers": {"X": broker.PLACEHOLDER}},
+        store=Store({"fresh": VALUE}), opener=Opener())
+
+    assert "was declined" in answer["refused"]
+    assert "xenia grant" not in answer["refused"], \
+        "going around a no is not the next step"

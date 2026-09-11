@@ -27,7 +27,8 @@ def test_the_tray_menu_is_the_three_things_it_can_do(fake_home):
 
     assert [item.label for item in menu] == [
         "Show Report", "Credentials", "Quit xenia"]
-    assert [item.label for item in menu[1].items] == ["Add…", "List"]
+    assert [item.label for item in menu[1].items] == [
+        "Add…", "List", "Delete…"]
 
 
 def test_a_submenu_is_numbered_flat_because_a_click_is_only_an_id(fake_home):
@@ -38,7 +39,8 @@ def test_a_submenu_is_numbered_flat_because_a_click_is_only_an_id(fake_home):
 
     assert [(i, item.label, parent) for i, item, parent in numbered] == [
         (1, "Show Report", 0), (2, "Credentials", 0),
-        (3, "Add…", 2), (4, "List", 2), (5, "Quit xenia", 0)]
+        (3, "Add…", 2), (4, "List", 2), (5, "Delete…", 2),
+        (6, "Quit xenia", 0)]
 
 
 def test_clicking_a_submenu_header_does_nothing(fake_home, monkeypatch):
@@ -303,9 +305,8 @@ def test_the_entry_points_resolve_symlinks(fake_home):
         assert "os.path.abspath(__file__)" not in body
 
 
-def test_the_credentials_item_opens_the_wizard_not_the_report(fake_home,
-                                                              monkeypatch):
-    """The value has to be typed unechoed, and the report page is read-only."""
+def test_adding_a_credential_is_still_a_terminal(fake_home, monkeypatch):
+    """The value has to be typed without being echoed, which a menu cannot do."""
     from xenia import secrets as secrets_cli
 
     opened, launched = [], []
@@ -313,14 +314,47 @@ def test_the_credentials_item_opens_the_wizard_not_the_report(fake_home,
     monkeypatch.setattr(secrets_cli, "open_in_terminal",
                         lambda command: launched.append(command) or True)
 
-    add, listing = app.App().menu()[1].items
+    add, _listing, _delete = app.App().menu()[1].items
     add.action()
 
-    assert opened == [], "the report page is not the credentials surface"
+    assert opened == [], "a typed value does not go through the browser"
     assert launched and launched[0][-2:] == ["secret", "new"]
 
-    listing.action()
-    assert launched[1][-3:-1] == ["secret", "list"]
+
+def test_listing_credentials_opens_the_tab_that_lists_them(fake_home,
+                                                           monkeypatch):
+    """The list is a page now: it stays open, and it is where one is removed."""
+    from xenia import secrets as secrets_cli
+
+    opened, launched = [], []
+    monkeypatch.setattr(app.webbrowser, "open", opened.append)
+    monkeypatch.setattr(secrets_cli, "open_in_terminal",
+                        lambda command: launched.append(command) or True)
+
+    instance = app.App()
+    instance.report.start()
+    try:
+        wanted = instance.report.tab("credentials")
+        instance.menu()[1].items[1].action()
+    finally:
+        instance.report.stop()
+
+    assert launched == [], "no terminal window for a list"
+    assert opened == [wanted]
+    assert wanted.endswith("#credentials")
+
+
+def test_deleting_asks_in_a_terminal_because_it_cannot_be_undone(fake_home,
+                                                                 monkeypatch):
+    from xenia import secrets as secrets_cli
+
+    launched = []
+    monkeypatch.setattr(secrets_cli, "open_in_terminal",
+                        lambda command: launched.append(command) or True)
+
+    app.App().menu()[1].items[2].action()
+
+    assert launched and launched[0][-3:] == ["secret", "rm", "--wait"]
 
 
 def test_no_terminal_says_what_to_run_instead(fake_home, monkeypatch):
@@ -344,4 +378,5 @@ def test_a_backend_that_cannot_nest_gets_the_tree_flattened(fake_home):
     labels = [item.label for item in Tray("xenia", app.App().menu()).flattened()]
 
     assert labels == ["Show Report", "Credentials: Add…",
-                      "Credentials: List", "Quit xenia"]
+                      "Credentials: List", "Credentials: Delete…",
+                      "Quit xenia"]

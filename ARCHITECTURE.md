@@ -43,18 +43,21 @@ one outbound request.
 | `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing — `Refusal`, `Scrubber`, `Server`, `OPS`, `CODES` |
 | `signing.py` | how a credential authenticates a request without appearing in it — `Context`, `SCHEMES`, `SchemeError` |
 | `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
-| `secrets.py` | first-use setup for the store, and the commands that enter and approve credentials |
+| `secrets.py` | first-use setup for the store, and adding, renaming, removing and approving credentials — `add`, `rename`, `remove`, shared by the command and the page |
 
 ## Read
 
-Two front ends over one read path. Neither can write, and neither returns file
-content.
+Two front ends over one read path. Neither returns file content, and neither
+can write to the record — what an agent did is not editable from the page that
+reports it. The one exception is the credentials themselves, which are the
+user's rather than the record's: the page can add, rename and remove one, and
+does it through `secrets.py` like every other front end.
 
 | Module | What is in it |
 | --- | --- |
 | `readonly.py` | every query there is, and the credential boundary — `StaleReader` |
 | `mcp.py` | the MCP protocol and the four tool definitions — `Server`. `xenia_fetch` is forwarded to the broker's socket: this server makes no request, opens no store and holds no value |
-| `report.py` | the local page and its JSON API — `Report` |
+| `report.py` | the local page and its JSON API — `Report`. Every view is served from a read-only connection; the three paths in `WRITES` are the only ones that answer a POST at all |
 | `readers.py` | the register of long-lived readers, and retiring them on a migration |
 
 ## Desktop
