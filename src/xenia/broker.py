@@ -23,6 +23,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import socket
 import struct
 import sys
@@ -1330,12 +1331,25 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
         # the whole control here and it is required exactly as for a request.
         approval = live_grant(conn, name, SIGN_SCOPE, True)
         if approval is None:
-            _ask(name, SIGN_SCOPE, True, notify=notify)
-            raise Refusal(
-                f"'{name}' is not approved for signing right now. ACTION: ask "
-                f"the user to run `xenia grant {name} --host {SIGN_SCOPE} "
-                f"--write`, then retry.",
-                code="unapproved")
+            # ASK THE SAME WAY A REQUEST DOES. The prompt, the cool-off and the
+            # grant are the same on both.
+            ended: dict[str, Any] = {}
+            allowed = None
+            if notify and (time.monotonic()
+                           - _asked.get((name, SIGN_SCOPE), 0.0)) > ASK_COOLOFF:
+                _asked[(name, SIGN_SCOPE)] = time.monotonic()
+                allowed = ask_to_use(name, SIGN_SCOPE, "SIGN", known=False,
+                                     ended=ended)
+            if not allowed:
+                raise Refusal(
+                    f"'{name}' is not approved for signing right now."
+                    + _why_not(ended if allowed is not None
+                               else {"how": "unasked"},
+                               name, SIGN_SCOPE, True),
+                    code="unapproved")
+            approval = grant(conn, name, SIGN_SCOPE, mutating=True,
+                             source="prompt")
+            _asked.pop((name, SIGN_SCOPE), None)
 
         value = (store or vault.backend(row["backend"])).get(name)
         if value is None:
@@ -1429,6 +1443,23 @@ CLOSE_GRACE = float(os.environ.get("XENIA_PROMPT_CLOSE_GRACE", 0.75))
 CLOSED_REASONS = {1: "expired", 2: "dismissed", 3: "timed-out", 4: "dismissed"}
 
 
+def _short(text: str, limit: int = 34) -> str:
+    """A name that still fits in a notification, recognisable at both ends.
+
+    The prompt is a fixed-width box with its buttons UNDER the body, so a long
+    name grows the body until the daemon pushes Allow and Deny off the bottom
+    and the user is left holding a question they cannot answer. Eliding the
+    middle keeps the head and the tail, which is where a long identifier
+    carries its identity.
+    """
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head - 1
+    return f"{text[:head]}…{text[-tail:]}"
+
+
 def ask_to_use(name: str, host: str, method: str, *, known: bool,
                wait: float | None = None,
                ended: dict | None = None) -> bool | None:
@@ -1507,12 +1538,13 @@ def ask_to_use(name: str, host: str, method: str, *, known: bool,
             "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
             "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
             ["xenia", 0, "dialog-password",
-             f"Use '{name}' at {host}?",
-             (f"An agent wants to {'send' if method in MUTATING else 'read'} "
-              f"{method} {host} with '{name}'."
-              + ("" if known else
-                 f"\nAllowing also lets '{name}' be used at {host} from now "
-                 f"on.")),
+             # SHORT, because the buttons sit under this text. Naming the
+             # credential and the host once each is the whole message.
+             f"Use '{_short(name)}' at {_short(host, 28)}?",
+             (f"An agent wants to "
+              f"{'sign with it' if host == SIGN_SCOPE else ('send ' + method) if method in MUTATING else ('read ' + method)}"
+              f"{'' if host == SIGN_SCOPE else ' here'}."
+              + ("" if known else " Allowing also keeps it allowed.")),
              ["allow", "Allow", "deny", "Deny"],
              {"urgency": Variant("y", 2)},
              # Still sent, because a daemon that honours it is a backstop for
@@ -1579,8 +1611,13 @@ def _why_not(ended: dict, name: str, host: str, mutating: bool) -> str:
 
     if how in ("denied", "dismissed"):
         return said
-    return (f"{said} ACTION: ask the user to run `xenia grant {name} --host "
-            f"{host}{' --write' if mutating else ''}` in their own terminal, "
+    # QUOTED, because this is an instruction someone pastes. A credential named
+    # after a service has spaces in it and the signing scope is literally
+    # "(sign)", so an unquoted form is a command that fails in any shell — a
+    # parenthesis error, or a grant for the wrong name.
+    return (f"{said} ACTION: ask the user to run "
+            f"`xenia grant {shlex.quote(name)} --host {shlex.quote(host)}"
+            f"{' --write' if mutating else ''}` in their own terminal, "
             f"then retry.")
 
 
@@ -1637,9 +1674,11 @@ def _ask(name: str, host: str, mutating: bool, *, notify: bool = True) -> None:
     if not notify:
         return
     verb = "write with" if mutating else "read with"
-    _notify(f"xenia: {name} not approved",
-            f"An agent wants to {verb} '{name}' against {host}.\n"
-            f"xenia grant {name} --host {host}"
+    # The body keeps the command VERBATIM — it is there to be copied — but the
+    # summary is elided like every other prompt.
+    _notify(f"xenia: {_short(name)} not approved",
+            f"An agent wants to {verb} it against {_short(host, 28)}.\n"
+            f"xenia grant {shlex.quote(name)} --host {shlex.quote(host)}"
             f"{' --write' if mutating else ''}")
 
 
