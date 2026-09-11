@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 GENERAL_REPO = "general"
 
@@ -114,6 +114,18 @@ RESPONSE_LIMIT = int(os.environ.get("XENIA_RESPONSE_LIMIT", "400"))
 REPLY_LIMIT = int(os.environ.get("XENIA_REPLY_LIMIT", "32000"))
 
 TASK_IDLE_MINUTES = float(os.environ.get("XENIA_TASK_IDLE_MINUTES", "20"))
+
+# How long an agora claim is believed when its holder does not say. A
+# claim is released by the agent that posted it, and an agent that forgets is
+# the ordinary case rather than the exception — so a claim nobody renewed
+# stops being read as live work after this, and starts asking to be checked.
+# It is not a licence to kill: an overrun claim whose session is still alive
+# reads as 'ask', never 'yes'.
+AGORA_HOLD_MINUTES = float(os.environ.get("XENIA_AGORA_HOLD_MINUTES", "120"))
+
+# The most processes one claim may name. A claim is a handle on work, not an
+# inventory of a process tree; past this, name the parent and give a pattern.
+AGORA_MAX_PIDS = int(os.environ.get("XENIA_AGORA_MAX_PIDS", "32"))
 
 BUSY_TIMEOUT_MS = int(os.environ.get("XENIA_BUSY_TIMEOUT_MS", "5000"))
 

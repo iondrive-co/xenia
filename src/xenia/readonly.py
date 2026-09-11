@@ -1428,3 +1428,47 @@ def trace(conn: sqlite3.Connection, action_id: int) -> dict[str, Any]:
     out["series_truncated"] = len(out["series"]) > SERIES_LIMIT
     del out["series"][SERIES_LIMIT:]
     return out
+
+
+#: A claim's own words are the point of it — the resource and the pattern are
+#: what a reader has to type at `ps` or `kill` to act on the row, and a
+#: redacted one names nothing. They are agent-authored text like any other, so
+#: the rest of the row still goes through the redactor.
+CLAIM_KEEP = frozenset({"resource", "pattern"})
+
+
+def claims(conn: sqlite3.Connection, *, since: str | None = None,
+           repo: str | None = None, released: bool = False,
+           limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    """The agora, as stored. What is live about it is `agora.assess`.
+
+    Open claims by default: a released one is history, and the agora is read
+    to decide something now. Ordering here is only a tiebreak — the caller
+    ranks by what can be reclaimed, which is not a column.
+    """
+    where = ["1 = 1"]
+    params: dict[str, Any] = {}
+    if not released:
+        where.append("released_at IS NULL")
+    if since:
+        where.append("posted_at >= :since")
+        params["since"] = parse_since(since)
+    if repo:
+        where.append("repo = :repo")
+        params["repo"] = repo
+    params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
+
+    try:
+        return _rows(conn.execute(f"""
+            SELECT id, posted_at, updated_at, released_at, release_note,
+                   holder_pid, holder_start, agent, repo, resource, purpose,
+                   ram_mb, pids, pattern, expires_at, kill_note
+            FROM claim
+            WHERE {' AND '.join(where)}
+            ORDER BY posted_at DESC
+            LIMIT :limit
+        """, params), keep=CLAIM_KEEP)
+    except sqlite3.OperationalError:
+        # A database from before the agora existed has no table to read. An
+        # empty agora is the truth about it, and is what a caller can act on.
+        return []

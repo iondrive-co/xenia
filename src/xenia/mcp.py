@@ -5,9 +5,10 @@ import signal
 import sqlite3
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from . import config, readers, readonly, redact
+from . import agora, config, db, readers, readonly, redact
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_INFO = {"name": "xenia", "version": "0.1.0"}
@@ -63,7 +64,7 @@ _SIGNATURE = {
 }
 
 VIEWS = ("tasks", "instructions", "failures", "repeats", "tools", "disk",
-         "credentials")
+         "credentials", "claims")
 
 UNIVERSAL_PARAMS = frozenset({"view", "since", "repo", "limit"})
 VIEW_PARAMS: dict[str, frozenset[str]] = {
@@ -79,6 +80,7 @@ VIEW_PARAMS: dict[str, frozenset[str]] = {
     "disk": frozenset({"agent", "tool", "session", "path", "group_by", "order",
                        "min_count"}),
     "credentials": frozenset(),
+    "claims": frozenset({"state"}),
 }
 
 
@@ -151,6 +153,17 @@ TOOLS: list[dict[str, Any]] = [
             "on your behalf: what it is called, where it may be sent, whether "
             "it is approved right now, and how it has been used. The values "
             "are not here and cannot be read through this server.\n"
+            "  claims        the agora: one expensive thing an agent on "
+            "this machine said it is running, what it is for, and what it "
+            "costs. Read it BEFORE starting anything heavy, and before "
+            "killing anything you did not start. 'may_kill' answers the "
+            "only question the row is usually asked: 'no' is live work "
+            "someone is waiting on, 'ask' is past its own deadline with "
+            "its session still alive, 'yes' is an orphan whose session is "
+            "gone. 'ram' carries what the box has, what live claims hold "
+            "and what is sitting in orphans — measured off the processes "
+            "where they could be seen rather than only what was declared. "
+            "Post your own with xenia_claim.\n"
             "\n"
             "Rows come back under 'rows'. The tasks view also returns "
             "'instructions', the text of each instruction its rows sat under, "
@@ -166,7 +179,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "view": {"type": "string", "enum": list(VIEWS),
-                         "description": "Which of the six above."},
+                         "description": "Which of the eight above."},
                 "since": _SINCE, "repo": _REPO, "limit": _LIMIT,
                 "agent": _views("tasks repeats tools disk", _AGENT),
                 "tool": _views("repeats tools disk", _TOOL),
@@ -256,6 +269,16 @@ TOOLS: list[dict[str, Any]] = [
                                    "'repeated_bytes' for what the redoing cost "
                                    "a context, which is where the cost of this "
                                    "view lands — redone work is rarely slow)."},
+                "state": _views("claims", {
+                    "type": "string", "enum": list(agora.STATES),
+                    "description": "Only claims in one state: 'held' "
+                                   "(live work), 'overrun' (past the "
+                                   "window its holder gave it, its "
+                                   "session still alive), 'abandoned' "
+                                   "(its session is gone — this is what "
+                                   "is free to reclaim), or 'released' "
+                                   "(finished with; kept as history and "
+                                   "not returned otherwise)."}),
                 "min_count": {
                     "type": "integer",
                     "description": "[failures repeats tools disk] Drop rows "
@@ -431,6 +454,104 @@ TOOLS: list[dict[str, Any]] = [
                                           "corrupt it."},
             },
             "required": ["url", "secret"],
+        },
+    },
+    {
+        "name": "xenia_claim",
+        "description": (
+            "Post something expensive in the agora, so the other agents "
+            "sharing this machine can see it. This is the write side of "
+            "xenia_report(view='claims').\n"
+            "\n"
+            "Claim anything that will hold a lot of memory for a while — a "
+            "headless browser or a browser per test job, a long suite, a "
+            "build, a bake, a model, a dev server. Post BEFORE you start it, "
+            "not after: the number is worth most to a peer who is still "
+            "deciding whether to start something of its own.\n"
+            "\n"
+            "  op='post'     what it is ('resource'), what it is for "
+            "('purpose'), what it will cost ('ram_mb'), and how long it "
+            "should be running ('holds_for'). Returns the claim, with its "
+            "'id'.\n"
+            "  op='update'   attach 'pids' once the processes exist — that is "
+            "what turns the claim from a number you asserted into one xenia "
+            "measures, and what tells a peer exactly what to kill. Also how "
+            "to extend 'holds_for' on work that is taking longer.\n"
+            "  op='release'  when the work is done. Always do this; it is "
+            "what keeps the agora worth reading.\n"
+            "\n"
+            "You are identified by this xenia server, which runs one per "
+            "agent session — so a claim you forget to release is not lost, it "
+            "becomes 'abandoned' the moment your session ends and another "
+            "agent is then free to reclaim the memory. While your session "
+            "lives, nobody else can release your claim out from under you.\n"
+            "\n"
+            "Before killing a process you did not start, read the agora: kill "
+            "what is 'abandoned', ask about 'overrun', and leave 'held' work "
+            "alone — behind it is a peer waiting on a result."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "enum": ["post", "update", "release"],
+                       "description": "post a new claim, update one, or "
+                                      "release it when the work is done."},
+                "id": {"type": "integer",
+                       "description": "Which claim, for update and release. "
+                                      "It came back from 'post'."},
+                "resource": {"type": "string",
+                             "description": "What is running, named the way "
+                                            "someone hunting it in `ps` would "
+                                            "recognise it: 'chrome-headless-"
+                                            "shell x4 (paradise test suite)', "
+                                            "not 'browser'."},
+                "purpose": {"type": "string",
+                            "description": "What it is FOR, in your own words "
+                                           "— the sentence that lets another "
+                                           "agent judge whether interrupting "
+                                           "it costs anything."},
+                "ram_mb": {"type": "integer",
+                           "description": "Peak resident memory you expect, "
+                                          "in MB. An estimate is worth far "
+                                          "more than nothing; xenia measures "
+                                          "the real figure once 'pids' are "
+                                          "attached and reports both."},
+                "pids": {"type": "array", "items": {"type": "integer"},
+                         "description": "The process ids the claim covers. "
+                                        "Attach them as soon as they exist. "
+                                        "Each is recorded with the clock it "
+                                        "started on, so a recycled pid is "
+                                        "never mistaken for it later."},
+                "pattern": {"type": "string",
+                            "description": "How to find the processes when "
+                                           "the pids move or multiply — the "
+                                           "`pgrep -f` pattern you would use "
+                                           "yourself."},
+                "holds_for": {"type": "string",
+                              "description": "How long this should still be "
+                                             "running before anyone wonders "
+                                             "about it: '10m', '90m', '2h'. "
+                                             "Past it the claim reads as "
+                                             "'overrun' — still not killable "
+                                             "while your session lives, but "
+                                             "no longer quietly believed. "
+                                             "Extend it with op='update' "
+                                             "rather than letting it lapse."},
+                "kill_note": {"type": "string",
+                              "description": "What happens to someone else if "
+                                             "this is killed, and whether it "
+                                             "can simply be re-run. This is "
+                                             "the field a peer reads when it "
+                                             "needs the memory and has to "
+                                             "decide."},
+                "repo": {"type": "string",
+                         "description": "Which checkout the work belongs to."},
+                "note": {"type": "string",
+                         "description": "On release: how it went, or why it "
+                                        "is being cleared. Worth a sentence "
+                                        "when you are clearing up after "
+                                        "somebody else's abandoned claim."},
+            },
+            "required": ["op"],
         },
     },
 ]
@@ -698,6 +819,22 @@ def _report(conn, args: dict[str, Any]) -> Any:
         return {"view": view, "ordered_by": "name",
                 "rows": readonly.credentials(conn)}
 
+    if view == "claims":
+        state = _one_of("state", args.get("state"), agora.STATES)
+        every = agora.order(agora.assess(readonly.claims(
+            conn, since=since, repo=repo, released=state == "released",
+            limit=limit)))
+        # The totals are over the whole agora, not the slice asked for. A
+        # reader filtering to 'abandoned' is asking what it can reclaim, and
+        # a 'claimed_mb' of 0 computed off that filter would tell it the
+        # machine is free when the answer is the opposite.
+        ram = agora.summary(every)
+        rows = [r for r in every if r["state"] == state] if state else every
+        return {"view": view,
+                "ordered_by": "what is free to reclaim first, then the "
+                              "largest",
+                "ram": ram, "rows": rows}
+
     group_by = _one_of(
         "group_by", args.get("group_by"), readonly.DISK_GROUPS) or "path"
     order = _one_of("order", args.get("order"),
@@ -739,9 +876,61 @@ def _fetch(args: dict[str, Any]) -> Any:
         return {"refused": str(exc)}
 
 
+def _writable(db_path=None) -> sqlite3.Connection:
+    """A read-write connection, for the one thing this server writes.
+
+    The agora is not the record: it is what agents tell each other they
+    are running, authored by them rather than derived from their events, and
+    nothing an agent did is editable through it. The read path stays `mode=ro`
+    for everything else.
+
+    A process older than the database must not write to it any more than it
+    may report from it, so the stale-reader check runs here too — before the
+    read-write open, because opening one is what would migrate the file.
+    """
+    target = Path(db_path) if db_path else config.db_path()
+    if target.exists():
+        probe = readonly.connect(target)
+        try:
+            readonly.require_current(probe)
+        finally:
+            probe.close()
+    return db.connect(target)
+
+
+def _claim(args: dict[str, Any], db_path=None) -> Any:
+    op = _one_of("op", args.get("op"), ("post", "update", "release"))
+    if op is None:
+        raise KeyError("op is required, one of: post, update, release")
+    if op != "post" and not args.get("id"):
+        raise KeyError(f"op '{op}' needs the 'id' that op='post' returned")
+
+    conn = _writable(db_path)
+    try:
+        if op == "post":
+            out = agora.post(
+                conn, resource=args.get("resource"),
+                purpose=args.get("purpose"), ram_mb=args.get("ram_mb"),
+                pids=args.get("pids"), pattern=args.get("pattern"),
+                holds_for=args.get("holds_for"),
+                kill_note=args.get("kill_note"), repo=args.get("repo"))
+        elif op == "update":
+            out = agora.update(conn, int(args["id"]),
+                               **{k: args[k] for k in agora.UPDATABLE
+                                  if k in args})
+        else:
+            out = agora.release(conn, int(args["id"]), note=args.get("note"))
+    finally:
+        conn.close()
+    return out if "refused" in out else {"claim": out}
+
+
 def _dispatch(name: str, args: dict[str, Any], db_path=None) -> Any:
     if name == "xenia_fetch":
         return _fetch(args)
+
+    if name == "xenia_claim":
+        return _claim(args, db_path)
 
     conn = readonly.connect(db_path)
     try:
@@ -796,7 +985,7 @@ class Server:
                         "Read-only record of how coding agents have been "
                         "getting on with their work on this machine.\n"
                         "\n"
-                        "xenia_report answers it, in seven views: 'tasks' (what "
+                        "xenia_report answers it, in eight views: 'tasks' (what "
                         "agents were trying to do, and whether it worked — "
                         "start here), 'instructions' (what the user asked for), "
                         "'failures' (kinds of work that keep failing), "
@@ -804,8 +993,21 @@ class Server:
                         "(counts, failure rates, latency and reply bytes — ask "
                         "for these rather than totalling rows yourself) and "
                         "'disk' (what was written, and how much of it changed "
-                        "nothing) and 'credentials' (what the user has given "
-                        "xenia to use on your behalf).\n"
+                        "nothing), 'credentials' (what the user has given "
+                        "xenia to use on your behalf) and 'claims' (the "
+                        "agora).\n"
+                        "\n"
+                        "The agora is how the agents sharing this "
+                        "machine stay out of each other's way. Read "
+                        "xenia_report(view='claims') before you start "
+                        "anything that will hold a lot of memory — a headless "
+                        "browser, a long suite, a build, a model — and before "
+                        "you kill any process you did not start yourself: "
+                        "every row says what it is, what it is for, what it "
+                        "costs, and whether it is safe to kill ('yes' only "
+                        "for orphans whose session is gone). Announce your "
+                        "own heavy work with xenia_claim, attach its pids "
+                        "once they exist, and release it when you are done.\n"
                         "\n"
                         "xenia_fetch makes an HTTP call with one of those "
                         "credentials without being handed it: write "

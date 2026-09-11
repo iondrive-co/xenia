@@ -73,6 +73,7 @@ def test_every_tool_is_listed_with_a_schema(server):
     tools = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
     assert {t["name"] for t in tools} == {
         "xenia_report", "xenia_calls", "xenia_trace", "xenia_fetch",
+        "xenia_claim",
     }
     for tool in tools:
         assert tool["description"]

@@ -27,7 +27,7 @@ which is why every part of it fails soft.
 
 | Module | What is in it |
 | --- | --- |
-| `schema.sql` | the ledger, the projections derived from it, and the reporting views |
+| `schema.sql` | the ledger, the projections derived from it, the reporting views, and the one table nothing derives — `claim`, which agents author |
 | `db.py` | connection, and the migrations that reach an old file |
 | `chain.py` | the hash chain and its verification — `Break`, `VerifyResult` |
 
@@ -45,18 +45,38 @@ one outbound request.
 | `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
 | `secrets.py` | first-use setup for the store, and adding, renaming, removing and approving credentials — `add`, `rename`, `remove`, shared by the command and the page |
 
+## Coordinate
+
+| Module | What is in it |
+| --- | --- |
+| `agora.py` | the agora — what agents have told each other they are running, what it costs, and whether it is safe to kill. Posting, updating and releasing a claim, the process and memory probing behind `assess`, and the totals in `summary` |
+
+The claim table is the one thing an agent writes. It is not part of the
+record: a claim is authored by the agent rather than derived from its events,
+it is released when the work is done rather than kept forever, and nothing
+about what an agent *did* can be reached through it. The holder of a claim is
+the `xenia-mcp` process that posted it — one per agent session — so liveness
+needs no heartbeat, and a claim outliving its session says so by itself.
+
+Two rules hold the write path up. A claim is released by its own holder, or by
+anyone once it is no longer live work, so the agora cannot be used to clear a
+peer's claim out from under it. And liveness that cannot be measured is
+reported as live: `_ps` returns `None` rather than an empty result when the
+process table cannot be read, and every claim then reads as held.
+
 ## Read
 
 Two front ends over one read path. Neither returns file content, and neither
 can write to the record — what an agent did is not editable from the page that
-reports it. The one exception is the credentials themselves, which are the
-user's rather than the record's: the page can add, rename and remove one, and
-does it through `secrets.py` like every other front end.
+reports it. Two things are the exception, and both are somebody else's rather
+than the record's: the credentials, which are the user's, added, renamed and
+removed through `secrets.py`; and the agora, which is the agents', written
+through `agora.py`. Both go through their own module whichever front end asks.
 
 | Module | What is in it |
 | --- | --- |
-| `readonly.py` | every query there is, and the credential boundary — `StaleReader` |
-| `mcp.py` | the MCP protocol and the four tool definitions — `Server`. `xenia_fetch` is forwarded to the broker's socket: this server makes no request, opens no store and holds no value |
+| `readonly.py` | every query there is, and the credential boundary — `StaleReader`. `claims` reads the agora as stored; what is live about it is `agora.assess` |
+| `mcp.py` | the MCP protocol and the five tool definitions — `Server`. `xenia_fetch` is forwarded to the broker's socket: this server makes no request, opens no store and holds no value. `xenia_claim` is the one call that opens a read-write connection, through `_writable`, which re-runs the stale-reader check first because opening one is what would migrate the file |
 | `report.py` | the local page and its JSON API — `Report`. Every view is served from a read-only connection; the three paths in `WRITES` are the only ones that answer a POST at all |
 | `readers.py` | the register of long-lived readers, and retiring them on a migration |
 

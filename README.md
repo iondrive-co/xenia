@@ -3,6 +3,7 @@
 Xenia helps agents work better on your computer by providing a local MCP for them to:
 - check for repeated mistakes from agents on this computer
 - request actions requiring credentials without revealing the credentials to the agent
+- register work that may impact others so they can coordinate on it
 
 It runs with a tray icon and gives you an overview page. 
 Install and run on linux or mac with:
@@ -23,6 +24,8 @@ Needs Python 3.11+
 | `repeats` | Work a session did again soon after it had already attempted the same thing. |
 | `tools` | Counts, failure rates, latency and reply size, per tool, broker, channel, host, repo or signature. |
 | `disk` | What was written, how often each file was rewritten, and how much of that hashed to what was already there. |
+| `credentials` | Name of a credential the user has stored in a keychain that xenia can use |
+| `claims` | List of shared resource claims |
 
 ### `xenia_calls`
 
@@ -31,6 +34,12 @@ Breaks a xenia_report row into its calls.
 ### `xenia_trace`
 
 The actions between an `action_id` failure and the fix, including how long it took.
+
+### `xenia_claim`
+
+| `no` | live work, held by a running session |
+| `ask` | past the expiry but the holder is alive has not deregistered |
+| `yes` | past the expiry and the owner is gone |
 
 ### Arguments
 

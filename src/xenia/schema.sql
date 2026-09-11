@@ -254,6 +254,39 @@ CREATE TABLE IF NOT EXISTS secret_use (
 CREATE INDEX IF NOT EXISTS secret_use_idx      ON secret_use (at);
 CREATE INDEX IF NOT EXISTS secret_use_name_idx ON secret_use (name, at);
 
+-- The agora. Not part of the record: a claim is what one agent told the
+-- others it is running, authored by the agent rather than derived from its
+-- events, and it is deleted-by-release rather than kept forever. It lives here
+-- so every front end reads one store, and so "who left this running" survives
+-- the session that left it.
+CREATE TABLE IF NOT EXISTS claim (
+    id            INTEGER PRIMARY KEY,
+    posted_at     TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL,
+    released_at   TEXT,
+    release_note  TEXT,
+    -- The pid of the xenia-mcp server that posted it. One of those runs per
+    -- agent session, so its liveness IS the session's, with no heartbeat to
+    -- maintain. `holder_start` is the clock the OS started it on: a pid alone
+    -- is reused, and a recycled one would report a dead session as alive.
+    holder_pid    INTEGER NOT NULL,
+    holder_start  TEXT,
+    agent         TEXT,
+    repo          TEXT,
+    resource      TEXT    NOT NULL,
+    purpose       TEXT    NOT NULL,
+    ram_mb        INTEGER,
+    -- {"<pid>": "<lstart>"} — the processes the claim covers, each with the
+    -- clock it started on, for the same reason as the holder.
+    pids          TEXT,
+    pattern       TEXT,
+    expires_at    TEXT,
+    kill_note     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS claim_open_idx  ON claim (released_at, posted_at);
+CREATE INDEX IF NOT EXISTS claim_holder_idx ON claim (holder_pid);
+
 DROP VIEW IF EXISTS v_remote_calls;
 CREATE VIEW v_remote_calls AS
 SELECT a.id            AS action_id,
