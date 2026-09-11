@@ -242,3 +242,85 @@ def test_a_policy_can_be_described_in_words():
 
     assert any("create" in line and "count<=10" in line for line in described)
     assert any("read" in line for line in described)
+
+
+# -- exact shape ------------------------------------------------------------
+#
+# A cap bounds a field that is present. It says nothing about a field nobody
+# thought of, and an API that acts on an extra key — a fee recipient, a
+# routing hint — is the case where an allowlist of VALUES is not an allowlist.
+
+NESTED = {"actions": {"submit": {
+    "methods": ["POST"], "paths": ["/submit"],
+    "only": {"": ["job"], "job": ["kind", "items"],
+             "job.items.0": ["id", "size"]},
+    "length": {"job.items": 1},
+    "equals": {"job.kind": "run"},
+    "max": {"job.items.0.size": "10"},
+}}}
+
+
+def submit(body):
+    return policy.check(NESTED, "POST", "https://api.test/submit", JSON,
+                        json.dumps(body))
+
+
+GOOD = {"job": {"kind": "run", "items": [{"id": 1, "size": 3}]}}
+
+
+def test_an_exactly_specified_object_passes():
+    assert submit(GOOD) == "submit"
+
+
+def test_an_unlisted_field_is_refused_even_though_no_rule_names_it():
+    body = {"job": {"kind": "run", "items": [{"id": 1, "size": 3}],
+                    "payTo": "0xsomeone"}}
+
+    with pytest.raises(policy.Denied, match="exactly the configured fields"):
+        submit(body)
+
+
+def test_an_unlisted_field_inside_an_array_item_is_refused():
+    body = {"job": {"kind": "run",
+                    "items": [{"id": 1, "size": 3, "tag": "extra"}]}}
+
+    with pytest.raises(policy.Denied, match="exactly the configured fields"):
+        submit(body)
+
+
+def test_a_missing_listed_field_is_refused_too():
+    """`only` is exact both ways: it is a shape, not a ceiling."""
+    with pytest.raises(policy.Denied, match="exactly the configured fields"):
+        submit({"job": {"kind": "run"}})
+
+
+def test_an_array_of_the_wrong_length_is_refused():
+    body = {"job": {"kind": "run",
+                    "items": [{"id": 1, "size": 3}, {"id": 2, "size": 3}]}}
+
+    with pytest.raises(policy.Denied, match="array of 1 items"):
+        submit(body)
+
+
+def test_a_field_that_should_be_an_array_and_is_not_is_refused():
+    """Which rule catches it does not matter; that nothing signs it does."""
+    with pytest.raises(policy.Denied, match="job.items"):
+        submit({"job": {"kind": "run", "items": {"id": 1, "size": 3}}})
+
+
+def test_a_cap_reaches_through_an_array_index():
+    body = {"job": {"kind": "run", "items": [{"id": 1, "size": 99}]}}
+
+    with pytest.raises(policy.Denied, match="over the cap"):
+        submit(body)
+
+
+def test_an_index_past_the_end_of_an_array_is_absent_not_an_error():
+    assert policy._at({"items": []}, "items.0.size") is None
+
+
+def test_a_non_finite_number_is_not_a_number():
+    """`Decimal('Infinity')` compares under every cap there is."""
+    with pytest.raises(policy.Denied, match="not a number"):
+        submit({"job": {"kind": "run",
+                        "items": [{"id": 1, "size": "Infinity"}]}})

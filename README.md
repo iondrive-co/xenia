@@ -26,11 +26,11 @@ Needs Python 3.11+
 
 ### `xenia_calls`
 
-Breaks a xenia_report row into the individual calls behind it.
+Breaks a xenia_report row into its calls.
 
 ### `xenia_trace`
 
-The actions between an `action_id` failure and the fix including how long it took.
+The actions between an `action_id` failure and the fix, including how long it took.
 
 ### Arguments
 

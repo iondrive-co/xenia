@@ -612,16 +612,38 @@ def _secret(conn, broker, argv: list[str]) -> int:
 
     if action == "sign":
         if len(rest) < 2:
-            print("xenia: xenia secret sign NAME PROFILE key=value…",
-                  file=sys.stderr)
+            print("xenia: xenia secret sign NAME PROFILE key=value… "
+                  "(or < profile.json)", file=sys.stderr)
             return 2
         name, profile = rest[0], rest[1]
         settings: dict[str, Any] = {}
-        for item in rest[2:]:
-            if "=" not in item:
-                continue
-            key, value = item.split("=", 1)
-            settings[key] = value
+        # `key=value` carries a flat profile; a nested one (a typed-signing
+        # domain, its schema, its message bindings) has no flat spelling, and
+        # a value stringified here reaches the scheme as a string and is
+        # refused there. So the same stdin form as `secret body`.
+        if len(rest) > 2:
+            for item in rest[2:]:
+                if "=" not in item:
+                    continue
+                key, value = item.split("=", 1)
+                settings[key] = value
+        else:
+            raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+            if not raw.strip():
+                print("xenia: give the profile as `key=value` arguments, or as "
+                      "JSON on stdin — `xenia secret sign NAME PROFILE "
+                      "< profile.json`", file=sys.stderr)
+                return 2
+            try:
+                settings = json.loads(raw)
+            except ValueError as exc:
+                print(f"xenia: the profile on stdin is not JSON: {exc}",
+                      file=sys.stderr)
+                return 2
+            if not isinstance(settings, dict):
+                print("xenia: a signing profile must be a JSON object",
+                      file=sys.stderr)
+                return 2
         try:
             held = broker.set_profile(conn, name, profile, settings)
         except ValueError as exc:
@@ -809,10 +831,14 @@ def _usage() -> int:
                                   the answer sets the scope
   xenia secret sign NAME PROFILE scheme=hmac template='{ts}{method}{path}{body}'
                         digest=sha256 encoding=base64
+  xenia secret sign NAME PROFILE < profile.json
                                   how this credential signs. The scheme AND the
                                   string it signs are config, not something a
                                   caller may choose — a caller who picks what
-                                  gets signed has a signing oracle
+                                  gets signed has a signing oracle. Give it as
+                                  JSON when the profile nests: a typed-signing
+                                  domain, schema and message bindings have no
+                                  `key=value` spelling
   xenia secret body NAME [--show] < policy.json
                                   the actions this credential may take, over
                                   the parsed request. Required for a

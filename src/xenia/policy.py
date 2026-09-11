@@ -91,9 +91,13 @@ def _at(row: dict, path: str) -> Any:
     """One field, by name or by dotted path. Missing is None."""
     value: Any = row
     for step in path.split("."):
-        if not isinstance(value, dict) or step not in value:
+        if isinstance(value, list) and step.isdecimal():
+            index = int(step)
+            value = value[index] if index < len(value) else None
+        elif isinstance(value, dict) and step in value:
+            value = value[step]
+        else:
             return None
-        value = value[step]
     return value
 
 
@@ -122,7 +126,10 @@ def _truth(value: Any) -> bool | None:
 
 def _decimal(value: Any) -> Decimal:
     try:
-        return Decimal(str(value))
+        number = Decimal(str(value))
+        if not number.is_finite():
+            raise ValueError("non-finite number")
+        return number
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise Denied(f"{value!r} is not a number, and a cap applies to it"
                      ) from exc
@@ -176,6 +183,16 @@ def check(policy: dict, method: str, url: str, headers: dict,
 def _permits(action: dict, rows: list[dict]) -> str | None:
     """None when every row passes, else why the first failing one did not."""
     for row in rows:
+        for field, names in (action.get("only") or {}).items():
+            value = row if field == "" else _at(row, field)
+            if not isinstance(value, dict) or set(value) != set(names):
+                return f"{field or 'body'} must contain exactly the configured fields"
+
+        for field, count in (action.get("length") or {}).items():
+            value = _at(row, field)
+            if not isinstance(value, list) or len(value) != count:
+                return f"{field} must be an array of {count} items"
+
         for field in action.get("required", []):
             if _at(row, field) is None:
                 return f"{field} is required and absent"
