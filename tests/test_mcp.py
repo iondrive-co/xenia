@@ -403,6 +403,28 @@ def test_the_credentials_view_reports_policy_without_any_value(server, conn):
     assert "value" not in row
 
 
+def test_a_credential_name_comes_back_as_the_user_typed_it(server, conn):
+    """The name is the handle. xenia_fetch takes it, and the page posts it.
+
+    So a name is kept whatever it happens to contain, while everything the
+    user wrote beside it is still redacted: a blanked name leaves the caller
+    nothing to ask for and the page nothing to rename or remove.
+    """
+    from xenia import broker
+
+    name = f"gitlab {FAKE_GITLAB_PAT}"
+    broker.register(conn, name, backend="memory",
+                    hosts=["gitlab.example.com"],
+                    note=f"rotate this with {FAKE_GITLAB_PAT}")
+    conn.commit()
+
+    answer = json.loads(call(server, "xenia_report",
+                             {"view": "credentials"})["content"][0]["text"])
+    row = answer["rows"][0]
+    assert row["name"] == name
+    assert FAKE_GITLAB_PAT not in row["note"]
+
+
 def test_the_credentials_view_takes_no_filters(server):
     reply = server.handle({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
