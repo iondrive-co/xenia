@@ -7,7 +7,7 @@
 | `bin/xenia` | the command — sets up, starts the service (restarting one already running, so it picks up the code on disk), opens the report, exits. Also the credential commands: `secret`, `secrets`, `grant`, `grants`, `revoke` |
 | `bin/xenia-service` | the long-running process: tray, report and the credential broker |
 | `bin/xenia-hook` | hook entry point — fails soft, always exits 0 |
-| `bin/xenia-mcp` | the read-only MCP server, over stdio |
+| `bin/xenia-mcp` | the MCP server, over stdio — the record read-only, the agora and `xenia_fetch` writing through their own modules |
 
 ## Capture
 
@@ -16,7 +16,7 @@ which is why every part of it fails soft.
 
 | Module | What is in it |
 | --- | --- |
-| `hook.py` | the hook entry point |
+| `hook.py` | the hook entry point, and the one thing it ever says back: the agora nudge, on PreToolUse |
 | `ingest.py` | hook payload → ledger → projections |
 | `classify.py` | remote-call and filesystem-change detection — `RemoteFact`, `FsFact`, `Result` |
 | `plan.py` | the agent's own plan, read out of its tool calls — `Plan`, `PlanItem` |
@@ -49,7 +49,7 @@ one outbound request.
 
 | Module | What is in it |
 | --- | --- |
-| `agora.py` | the agora — what agents have told each other they are running, what it costs, and whether it is safe to kill. Posting, updating and releasing a claim, the process and memory probing behind `assess`, and the totals in `summary` |
+| `agora.py` | the agora — what agents have told each other they are running, what it costs, and whether it is safe to kill. Posting, updating and releasing a claim, the process and memory probing behind `assess`, the totals in `summary`, and `nudge` — what the hook tells an agent starting something heavy for the first time in a session |
 
 The claim table is the one thing an agent writes. It is not part of the
 record: a claim is authored by the agent rather than derived from its events,

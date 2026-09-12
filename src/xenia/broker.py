@@ -561,14 +561,28 @@ def next_nonce(conn, name: str, now: float) -> int:
     The broker sees every call for a credential, so it is the only thing that
     can keep one: two callers with their own would race. Seeded from the clock
     so a restored backup cannot re-issue a number already used.
+
+    ONE STATEMENT, AND COMMITTED BEFORE THE CALLER REACHES THE NETWORK. Both
+    halves are load-bearing:
+
+      the RACE   doing the max() inside the UPDATE leaves no gap between the
+                 read and the write, so two callers cannot read the same
+                 `last_nonce`.
+      the LOCK   sqlite opens a write transaction on the first DML and holds it
+                 until commit, and `fetch` calls this BEFORE it sends. Left
+                 open, the transaction would last the whole request, and every
+                 other xenia write would block behind a download.
+
+    A nonce is consumed even when the request that asked for it then fails.
+    That is what a nonce is for, not a leak: numbers may be skipped, never
+    reissued.
     """
     floor = int(now * 1000)
-    row = conn.execute("SELECT last_nonce FROM secret WHERE name = ?",
-                       (name,)).fetchone()
-    issued = max(floor, (row["last_nonce"] or 0) + 1) if row else floor
-    conn.execute("UPDATE secret SET last_nonce = ? WHERE name = ?",
-                 (issued, name))
-    return issued
+    row = conn.execute(
+        "UPDATE secret SET last_nonce = max(?, coalesce(last_nonce, 0) + 1) "
+        "WHERE name = ? RETURNING last_nonce", (floor, name)).fetchone()
+    conn.commit()
+    return row["last_nonce"] if row else floor
 
 
 def _json_body(body: Any) -> tuple[str, bool]:

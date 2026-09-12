@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from typing import Any
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,18 +28,45 @@ def main(argv: list[str] | None = None) -> int:
     if argv and not payload.get("hook_event_name"):
         payload["hook_event_name"] = argv[0]
 
+    said = None
     try:
         from . import db, ingest
 
         conn = db.connect()
         try:
+            # Before the recording, so the agora is asked about a session
+            # that does not yet contain the call being asked about.
+            said = _nudge(conn, payload)
             ingest.record(conn, payload)
         finally:
             conn.close()
     except Exception as exc:
         _fallback("store", f"{type(exc).__name__}: {exc}", raw)
 
+    if said:
+        # The one thing this hook ever says back. PreToolUse shows the model
+        # nothing but this: stdout is otherwise dropped, and stderr only
+        # reaches it by blocking the call, which a notice has no business
+        # doing.
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "additionalContext": said}}))
+
     return 0
+
+
+def _nudge(conn, payload: dict[str, Any]) -> str | None:
+    """The agora's opinion, and it must never cost the recording.
+
+    A hook that raises loses the call it was there to record, so an agora
+    that cannot answer says nothing and the event is stored regardless.
+    """
+    try:
+        from . import agora
+
+        return agora.nudge(conn, payload)
+    except Exception as exc:
+        _fallback("nudge", f"{type(exc).__name__}: {exc}")
+        return None
 
 
 def _fallback(stage: str, detail: str, raw: str = "") -> None:
