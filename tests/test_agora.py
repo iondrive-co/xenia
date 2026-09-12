@@ -4,7 +4,9 @@ import subprocess
 
 import pytest
 
-from xenia import agora, mcp, readonly
+from conftest import CORE
+
+from xenia import agora, config, ingest, mcp, readonly
 
 
 def a_dead_pid() -> int:
@@ -327,3 +329,84 @@ def test_the_claims_view_is_empty_rather_than_broken_on_an_old_database(
 
     reply = call(server, "xenia_report", {"view": "claims"})
     assert reply["structuredContent"]["rows"] == []
+
+
+# -------------------------------------------------------------------- nudge
+#
+# Nobody posted a claim in the sixteen hours after the agora shipped, while
+# 830 tasks ran across five checkouts. Two sessions did READ it — both got an
+# empty agora back. The write side was never the part anyone disagreed with;
+# it was that nothing mentions it while the decision is still open.
+
+
+def a_call(command: str, session: str = "s1") -> dict:
+    return {"hook_event_name": "PreToolUse", "session_id": session,
+            "cwd": CORE, "tool_name": "Bash", "tool_input": {"command": command}}
+
+
+@pytest.mark.parametrize("command, expected", [
+    ("python3 -m pytest -q", "python3 -m pytest"),
+    ("cd ui && npm run build", "npm run build"),
+    ("CI=1 npx playwright test --reporter=list", "playwright"),
+    ("time make -j8 all", "make -j8"),
+    ("docker compose up -d", "docker compose up"),
+    ("uv run pytest tests/test_agora.py", "pytest"),
+    ("ollama serve &", "ollama serve"),
+    # The other half, and the half that matters more: reading about a suite
+    # is not running one. A nudge that fires on these is one an agent learns
+    # to skip before it ever reaches the call it was written for.
+    ("grep -rn pytest src/", None),
+    ("cat playwright.config.ts", None),
+    ("git log --grep=build -5", None),
+    ("echo 'npm test'", None),
+    ("ls -la", None),
+])
+def test_what_counts_as_starting_something_heavy(command, expected):
+    assert agora.looks_heavy("Bash", {"command": command}) == expected
+
+
+def test_only_a_shell_call_is_looked_at():
+    assert agora.looks_heavy("Read", {"file_path": "/x/pytest.ini"}) is None
+    assert agora.looks_heavy("Bash", {}) is None
+    assert agora.looks_heavy("Bash", "npm run build") is None
+
+
+def test_the_first_heavy_call_of_a_session_is_told_about_the_agora(conn):
+    said = agora.nudge(conn, a_call("python3 -m pytest -q"))
+
+    assert said is not None
+    assert "python3 -m pytest" in said
+    assert "xenia_claim" in said
+    assert "nothing is claimed" in said
+
+
+def test_and_then_never_again_that_session(conn):
+    first = a_call("python3 -m pytest -q")
+    assert agora.nudge(conn, first) is not None
+    ingest.record(conn, first)
+
+    second = a_call("npx playwright test")
+    assert agora.nudge(conn, second) is None
+
+    # A different session has not been told anything yet.
+    assert agora.nudge(conn, a_call("npx playwright test", session="s2")) is not None
+
+
+def test_an_ordinary_command_is_left_alone(conn):
+    assert agora.nudge(conn, a_call("ls -la")) is None
+    assert agora.nudge(conn, {**a_call("python3 -m pytest"),
+                              "hook_event_name": "PostToolUse"}) is None
+
+
+def test_the_nudge_says_what_the_agora_is_holding_right_now(conn):
+    claim(conn, ram_mb=6000, holds_for="90m")
+
+    said = agora.nudge(conn, a_call("python3 -m pytest -q"))
+
+    assert "1 claim holding 5.9 GB" in said
+
+
+def test_the_nudge_can_be_silenced(conn, monkeypatch):
+    monkeypatch.setattr(config, "AGORA_NUDGE", False)
+
+    assert agora.nudge(conn, a_call("python3 -m pytest -q")) is None

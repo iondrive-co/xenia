@@ -57,7 +57,21 @@ def test_a_retired_reader_is_reported_when_the_next_one_connects(server, tmp_pat
 def test_the_instructions_survive_a_database_that_cannot_be_read(tmp_path):
     reply = mcp.Server(tmp_path / "nothing-here.db").handle(
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
-    assert reply["result"]["instructions"].startswith("Read-only record")
+    assert reply["result"]["instructions"].startswith("The record of how")
+
+
+def test_the_instructions_do_not_call_the_whole_server_read_only(server):
+    """They did, and xenia_claim is in the same tool list.
+
+    An agent that reads the first line and stops has been told there is
+    nothing here to post to, which is most of why nobody posted.
+    """
+    reply = server.handle(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    instructions = reply["result"]["instructions"]
+
+    assert "The record is read-only" in instructions
+    assert "The agora is yours to write" in instructions
 
 
 def test_notifications_are_never_answered(server):

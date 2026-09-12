@@ -37,6 +37,7 @@ The actions between an `action_id` failure and the fix, including how long it to
 
 ### `xenia_claim`
 
+For posting, updating or releasing a claim on a resource.
 | `no` | live work, held by a running session |
 | `ask` | past the expiry but the holder is alive has not deregistered |
 | `yes` | past the expiry and the owner is gone |

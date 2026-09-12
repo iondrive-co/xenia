@@ -982,8 +982,15 @@ class Server:
                     "capabilities": {"tools": {}},
                     "serverInfo": SERVER_INFO,
                     "instructions": (
-                        "Read-only record of how coding agents have been "
-                        "getting on with their work on this machine.\n"
+                        "The record of how coding agents have been getting "
+                        "on with their work on this machine, and the agora "
+                        "they keep so that they can share it.\n"
+                        "\n"
+                        "The record is read-only: xenia_report, xenia_calls "
+                        "and xenia_trace only ever read it. The agora is "
+                        "yours to write — xenia_claim posts a claim, attaches "
+                        "pids to it and releases it — and xenia_fetch makes a "
+                        "call with a credential you are never handed.\n"
                         "\n"
                         "xenia_report answers it, in eight views: 'tasks' (what "
                         "agents were trying to do, and whether it worked — "

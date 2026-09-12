@@ -1686,3 +1686,92 @@ def test_an_error_body_is_never_streamed_away(wired, monkeypatch, tmp_path):
     assert answer["status"] == 403
     assert "AccessDenied" in answer["body"]
     assert answer["binary"] is False
+
+
+# -- the nonce, and the write lock it used to hold --------------------------
+#
+# Earned 2026-09-11 pulling 9 GB from an S3 archive: `next_nonce` read then
+# updated without committing, and `fetch` calls it BEFORE it sends. So one
+# transfer held a write transaction for its whole duration.
+
+def test_concurrent_nonces_are_unique_and_increasing(tmp_path, monkeypatch):
+    """Two callers must never be issued the same number, whatever the timing."""
+    monkeypatch.setenv("XENIA_FAKE_NOW", "2026-07-27T09:00:00.000+00:00")
+    path = tmp_path / "audit.db"
+    setup = db.connect(path)
+    broker.register(setup, "gitlab-pat", backend="memory", hosts=[HOST],
+                    methods=["GET"])
+    setup.close()
+
+    issued, errors = [], []
+    lock = threading.Lock()
+    start = threading.Barrier(8)
+
+    def one():
+        c = db.connect(path)
+        try:
+            start.wait(timeout=10)
+            n = broker.next_nonce(c, "gitlab-pat", time.time())
+            with lock:
+                issued.append(n)
+        except Exception as exc:          # a lock timeout is a failure here
+            with lock:
+                errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            c.close()
+
+    threads = [threading.Thread(target=one) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert errors == [], errors
+    assert len(issued) == 8
+    assert len(set(issued)) == 8, f"a nonce was issued twice: {sorted(issued)}"
+
+
+def test_a_slow_request_does_not_hold_the_database(wired, monkeypatch, tmp_path):
+    """The whole point: a transfer in flight must not freeze every other write.
+
+    The opener blocks the way a 30 MB download does. While it is blocked, a
+    SEPARATE connection must still be able to commit — before this fix it sat
+    on the write lock until the transfer finished and then raised
+    'database is locked'.
+    """
+    monkeypatch.setattr(config, "BUSY_TIMEOUT_MS", 1500)
+    allow(wired)
+    path = Path(str(wired.execute("PRAGMA database_list").fetchone()["file"]))
+    sending = threading.Event()
+    release = threading.Event()
+
+    class Slow(Opener):
+        def open(self, request, timeout=None):
+            sending.set()
+            release.wait(timeout=10)
+            return super().open(request, timeout=timeout)
+
+    outcome = {}
+
+    def other_writer():
+        assert sending.wait(timeout=10), "the request never went out"
+        c = db.connect(path)
+        try:
+            c.execute("UPDATE secret SET note = 'written during a transfer' "
+                      "WHERE name = ?", ("gitlab-pat",))
+            c.commit()
+            outcome["ok"] = True
+        except Exception as exc:
+            outcome["ok"] = False
+            outcome["why"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            c.close()
+            release.set()
+
+    t = threading.Thread(target=other_writer)
+    t.start()
+    answer = call(wired, opener=Slow())
+    t.join(timeout=20)
+
+    assert outcome.get("ok"), f"another writer was blocked: {outcome.get('why')}"
+    assert answer["status"] == 200

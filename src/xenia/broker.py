@@ -561,14 +561,36 @@ def next_nonce(conn, name: str, now: float) -> int:
     The broker sees every call for a credential, so it is the only thing that
     can keep one: two callers with their own would race. Seeded from the clock
     so a restored backup cannot re-issue a number already used.
+
+    ONE STATEMENT, AND COMMITTED BEFORE THE CALLER REACHES THE NETWORK. Both
+    halves are load-bearing and the read-then-update this replaces had neither:
+
+      the RACE   two callers read the same `last_nonce` and both wrote it back.
+                 The second blocked on the first's write lock, but it had
+                 already read, so it issued a number that was no longer free.
+                 Doing the max() inside the UPDATE closes the window, because
+                 there is no longer a gap between the read and the write.
+      the LOCK   sqlite opens a write transaction on the first DML and holds it
+                 until commit, and `fetch` calls this BEFORE it sends. So the
+                 transaction stayed open for the whole request: milliseconds on
+                 a small reply, tens of seconds on a 30 MB download. Measured
+                 2026-09-11, pulling an S3 archive: at six concurrent downloads
+                 four died with "database is locked" against a 5,000 ms
+                 busy_timeout, and while any transfer was in flight EVERY other
+                 xenia write blocked — `xenia secret sign` from a separate
+                 process failed the same way. The broker advertises
+                 MAX_CLIENTS=16 and could not serve two.
+
+    A nonce is consumed even when the request that asked for it then fails.
+    That is what a nonce is for, not a leak: numbers may be skipped, never
+    reissued.
     """
     floor = int(now * 1000)
-    row = conn.execute("SELECT last_nonce FROM secret WHERE name = ?",
-                       (name,)).fetchone()
-    issued = max(floor, (row["last_nonce"] or 0) + 1) if row else floor
-    conn.execute("UPDATE secret SET last_nonce = ? WHERE name = ?",
-                 (issued, name))
-    return issued
+    row = conn.execute(
+        "UPDATE secret SET last_nonce = max(?, coalesce(last_nonce, 0) + 1) "
+        "WHERE name = ? RETURNING last_nonce", (floor, name)).fetchone()
+    conn.commit()
+    return row["last_nonce"] if row else floor
 
 
 def _json_body(body: Any) -> tuple[str, bool]:

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta
@@ -580,3 +581,143 @@ def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if unstated:
         out["unstated"] = unstated
     return out
+
+
+# -------------------------------------------------------------------- nudge
+
+
+#: Command starts worth telling the rest of the machine about: a suite, a
+#: build, a browser, a dev server, a model.
+_HEAVY_VERBS = r"""
+      pytest | tox | nox
+    | jest | vitest | mocha | karma | rspec | phpunit | ctest
+    | playwright | puppeteer | selenium | cypress | chromedriver
+    | chrome-headless-shell | google-chrome | chromium | chrome | firefox
+    | gradlew | gradle | mvn | bazel | ninja | sbt
+    | cargo \s+ (?: build | test | bench | clippy )
+    | go \s+ (?: build | test )
+    | docker (?: \s+ compose )? \s+ (?: build | up | run )
+    | (?: npm | pnpm | yarn | bun ) \s+ (?: run \s+ )?
+      (?: build | test | dev | start | watch | e2e )
+    | (?: vite | webpack | rollup | esbuild | next | nuxt ) \s+ (?: build | dev )
+    | make \s+ (?: -j \S* | \S* (?: build | test | all ) )
+    | cmake \s+ --build
+    | ollama \s+ (?: run | serve ) | vllm | llama-server | torchrun
+    | uvicorn | gunicorn | daphne
+    | python3? \s+ -m \s+ (?: pytest | unittest | uvicorn | gunicorn | vllm\S* )
+"""
+
+#: Matched at a command start — the top of the line or the far side of a
+#: separator, past anything that only wraps what follows (`time`, `env FOO=1`,
+#: `uv run`) — and never anywhere in the line. `grep -rn pytest src/` is a
+#: question about a suite and not a suite, and a nudge that fires on reading
+#: is one an agent learns to skip long before it reaches the call it is about.
+_HEAVY = re.compile(
+    r"(?: \A | [\n;&|()] ) \s*"
+    r"(?: (?: [A-Za-z_]\w* = \S*"
+    r"        | time | nohup | exec | sudo | env | xvfb-run | npx | bunx"
+    r"        | uv | uvx | poetry | pipenv | run ) \s+ )*"
+    r"(?P<verb>" + _HEAVY_VERBS + r") \b",
+    re.X | re.I)
+
+
+def looks_heavy(tool: Any, tool_input: Any) -> str | None:
+    """What this call is about to start that will hold memory, or nothing.
+
+    Names what matched, so the nudge can say which command it means. A regex
+    is never going to be right about `./run-everything.sh`, and does not have
+    to be: a nudge missed is one claim not posted, a nudge misfired is an
+    agent that stops reading them.
+    """
+    if tool != "Bash":
+        return None
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str) or not command.strip():
+        return None
+    found = _HEAVY.search(command)
+    return " ".join(found.group("verb").split()) if found else None
+
+
+def nudge(conn: sqlite3.Connection, payload: dict[str, Any]) -> str | None:
+    """What to say to an agent about to start something the others can't see.
+
+    Once a session, on the first such command, and never again. The agora is
+    a convention rather than a mechanism, and nothing else on this machine
+    mentions it at the moment it matters: the MCP server says so at startup,
+    thousands of tokens before anyone types `npm run build`. A line repeated
+    on every `pytest` after that is one an agent filters out, so it is spent
+    where it buys the most and then not again.
+
+    Whether it has been spent is asked of the record rather than kept as a
+    flag, because the hook is one process per event and a flag would have to
+    outlive it — and the record already knows what this session has run.
+    """
+    if not config.AGORA_NUDGE:
+        return None
+    if payload.get("hook_event_name") != "PreToolUse":
+        return None
+    what = looks_heavy(payload.get("tool_name"), payload.get("tool_input"))
+    if not what:
+        return None
+    if _heavy_before(conn, payload.get("session_id")):
+        return None
+    return _advice(conn, what)
+
+
+def _heavy_before(conn: sqlite3.Connection, session_uid: Any) -> bool:
+    """Has this session already started something like it?
+
+    The call being nudged about is not in the record yet — the hook asks
+    before it records — so anything found here really is earlier. A payload
+    with no session to be first in is left alone rather than nudged on every
+    command it ever runs.
+    """
+    if not session_uid:
+        return True
+    row = conn.execute("SELECT id FROM session WHERE session_uid = ?",
+                       (str(session_uid),)).fetchone()
+    if row is None:
+        return False
+    earlier = conn.execute(
+        "SELECT detail FROM action WHERE session_id = ? AND tool = 'Bash' "
+        "ORDER BY seq DESC LIMIT ?",
+        (row["id"], config.AGORA_NUDGE_SCAN)).fetchall()
+    return any(looks_heavy("Bash", {"command": r["detail"]}) for r in earlier)
+
+
+def _gb(mb: Any) -> str:
+    if not mb:
+        return "0 GB"
+    return f"{mb} MB" if mb < 1024 else f"{mb / 1024:.1f} GB"
+
+
+def _advice(conn: sqlite3.Connection, what: str) -> str:
+    # Only the call that actually speaks pays for this import, and the hook
+    # runs on every tool call there is.
+    from . import readonly
+
+    rows = assess(readonly.claims(conn))
+    ram = summary(rows)
+    live = [r for r in rows if r.get("state") in ("held", "overrun")]
+    free = (f"{_gb(ram.get('available_mb'))} of {_gb(ram.get('total_mb'))} free"
+            if ram.get("available_mb") else "")
+
+    if live:
+        state = (f"{len(live)} claim{'' if len(live) == 1 else 's'} "
+                 f"holding {_gb(ram.get('claimed_mb'))}")
+    else:
+        state = "nothing is claimed"
+    loose = sum(1 for r in rows if r.get("may_kill") == "yes")
+    if loose:
+        state += (f", plus {loose} abandoned worth {_gb(ram.get('reclaimable_mb'))} "
+                  "to whoever reclaims it")
+
+    return (
+        f"xenia: `{what}` will hold memory for a while, and the other agents "
+        f"on this machine cannot see it. Right now {state}"
+        + (f"; {free}" if free else "") + ". Announce yours with "
+        "xenia_claim(op='post', resource=…, purpose=…, ram_mb=…, holds_for=…), "
+        "attach its pids with op='update' once they exist, and op='release' "
+        "when it is done. Read xenia_report(view='claims') before you kill "
+        "anything you did not start yourself. Said once a session."
+    )

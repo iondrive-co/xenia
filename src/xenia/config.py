@@ -123,6 +123,19 @@ TASK_IDLE_MINUTES = float(os.environ.get("XENIA_TASK_IDLE_MINUTES", "20"))
 # reads as 'ask', never 'yes'.
 AGORA_HOLD_MINUTES = float(os.environ.get("XENIA_AGORA_HOLD_MINUTES", "120"))
 
+# Whether the hook says one line back to an agent about to start something
+# expensive — what the agora holds right now, and how to post to it. The agora
+# is a convention, and a convention nobody is told about at the moment it
+# applies is not one: the MCP server mentions it at startup, thousands of
+# tokens before anyone types `npm run build`, and nothing else on the machine
+# mentions it at all. Set XENIA_AGORA_NUDGE=0 to silence it.
+AGORA_NUDGE = os.environ.get("XENIA_AGORA_NUDGE", "1") not in ("0", "no", "false")
+
+# How far back down a session the nudge looks for heavy work it has already
+# seen. Far enough to cover a long session, bounded because it is read on the
+# way into a tool call that has not started yet.
+AGORA_NUDGE_SCAN = int(os.environ.get("XENIA_AGORA_NUDGE_SCAN", "400"))
+
 # The most processes one claim may name. A claim is a handle on work, not an
 # inventory of a process tree; past this, name the parent and give a pattern.
 AGORA_MAX_PIDS = int(os.environ.get("XENIA_AGORA_MAX_PIDS", "32"))

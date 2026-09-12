@@ -146,3 +146,49 @@ def test_concurrent_hooks_do_not_fork_the_chain(tmp_path, monkeypatch):
     conn = db.connect(tmp_path / "a.db")
     assert conn.execute("SELECT COUNT(*) AS n FROM event").fetchone()["n"] == 12
     assert chain.verify(conn).ok
+
+
+def test_the_binary_tells_an_agent_about_the_agora_once(tmp_path):
+    """The only thing this hook says back, and PreToolUse is where it fits.
+
+    stdout is dropped for a PreToolUse hook and stderr only reaches the model
+    by blocking the call, which a notice has no business doing —
+    hookSpecificOutput.additionalContext is the one channel that reaches it
+    before the command runs.
+    """
+    env = {"PATH": "/usr/bin:/bin", "XENIA_DB": str(tmp_path / "a.db"),
+           "XENIA_FALLBACK_LOG": str(tmp_path / "e.log"), "HOME": str(tmp_path)}
+    payload = json.dumps({"hook_event_name": "PreToolUse", "session_id": "s1",
+                          "cwd": CORE, "tool_name": "Bash",
+                          "tool_input": {"command": "python3 -m pytest -q"}})
+
+    def run() -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(HOOK_BIN), "PreToolUse"],
+                              input=payload, text=True, capture_output=True,
+                              env=env)
+
+    first = run()
+    assert first.returncode == 0
+    spoken = json.loads(first.stdout)["hookSpecificOutput"]
+    assert spoken["hookEventName"] == "PreToolUse"
+    assert "xenia_claim" in spoken["additionalContext"]
+
+    again = run()
+    assert again.returncode == 0
+    assert again.stdout == ""
+
+
+def test_an_agora_that_cannot_answer_never_costs_the_recording(hook_env, monkeypatch):
+    """The hook's one promise. Nothing it says back is worth a lost call."""
+    def explode(*_args, **_kw):
+        raise RuntimeError("no agora today")
+
+    monkeypatch.setattr("xenia.agora.nudge", explode)
+    payload = {"hook_event_name": "PreToolUse", "session_id": "s1",
+               "cwd": CORE, "tool_name": "Bash",
+               "tool_input": {"command": "python3 -m pytest -q"}}
+
+    assert feed(json.dumps(payload), monkeypatch) == 0
+
+    conn = db.connect(hook_env / "audit.db")
+    assert conn.execute("SELECT COUNT(*) AS n FROM action").fetchone()["n"] == 1
