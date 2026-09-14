@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -968,6 +969,34 @@ def _list(conn, broker) -> int:
     return 0
 
 
+def until_moment(text: str) -> datetime:
+    """When a standing approval ends, from a date, a timestamp or a duration.
+
+    A bare date means the END of that day in UTC, because "until the 8th" is
+    what a person says when they mean through the 8th, and a standing
+    approval that stopped at midnight on the morning of the date it was
+    given for would fail on exactly the day it was needed.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("--until needs a date (2026-12-08), a timestamp or a duration (85d)")
+    try:
+        return datetime.now(timezone.utc) + timedelta(seconds=duration(raw))
+    except ValueError:
+        pass
+    try:
+        if len(raw) == 10:
+            day = date.fromisoformat(raw)
+            return datetime(day.year, day.month, day.day, 23, 59, 59,
+                            tzinfo=timezone.utc)
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(
+            f"not a date or duration: {raw} (try 2026-12-08, "
+            f"2026-12-08T12:00Z, or 85d)") from None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
 def _grant(conn, broker, argv: list[str]) -> int:
     if not argv:
         print("xenia: grant which credential?", file=sys.stderr)
@@ -983,20 +1012,49 @@ def _grant(conn, broker, argv: list[str]) -> int:
             print("xenia: --host is required", file=sys.stderr)
             return 2
 
-    mutating = "--write" in argv
+    mutating = ("--write" in argv) or (host == broker.SIGN_SCOPE)
     window = _flag_value(argv, "--for")
+    until = _flag_value(argv, "--until")
+    reason = _flag_value(argv, "--reason") or ""
+    profiles = [p.strip() for p in (_flag_value(argv, "--profiles") or "").split(",")
+                if p.strip()]
+
+    if window and until:
+        print("xenia: --for and --until say different things; give one",
+              file=sys.stderr)
+        return 2
+    if not until and (profiles or reason):
+        print("xenia: --profiles and --reason belong to a standing approval; "
+              "add --until DATE", file=sys.stderr)
+        return 2
+
     try:
-        seconds = duration(window) if window else None
-        row = broker.grant(conn, name, host, mutating=mutating,
-                           seconds=seconds, source="cli")
+        if until:
+            row = broker.standing(conn, name, host, until=until_moment(until),
+                                  profiles=profiles or None, reason=reason,
+                                  mutating=mutating)
+        else:
+            seconds = duration(window) if window else None
+            row = broker.grant(conn, name, host, mutating=mutating,
+                               seconds=seconds, source="cli")
     except ValueError as exc:
         print(f"xenia: {exc}", file=sys.stderr)
         return 2
 
-    print(f"Approved '{name}' for {host}"
+    lead = ("Standing approval for" if broker.is_standing(row) else "Approved")
+    print(f"{lead} '{name}' for {host}"
           f"{' including writes' if mutating else ' (reads only)'}.")
-    print(f"  until   {row['expires_at'][:19]}  (slides forward on use)")
-    print(f"  ceiling {row['ceiling_at'][:19]}  (does not move)")
+    if broker.is_standing(row):
+        covers = broker.grant_profiles(row)
+        print(f"  until    {row['expires_at'][:19]}Z  and not a moment past it")
+        print(f"  covers   {', '.join(covers) if covers else 'every profile'}")
+        print(f"  because  {row['reason']}")
+        print(f"  No prompt will be raised for this while it lasts. End it "
+              f"with `xenia revoke {shlex.quote(name)}`, or from the report's "
+              f"Credentials tab.")
+    else:
+        print(f"  until   {row['expires_at'][:19]}  (slides forward on use)")
+        print(f"  ceiling {row['ceiling_at'][:19]}  (does not move)")
     return 0
 
 
@@ -1005,11 +1063,19 @@ def _grants(conn, broker, everything: bool) -> int:
     if not rows:
         print("No live grants." if not everything else "No grants recorded.")
         return 0
-    print(f"{'NAME':22} {'HOST':28} {'WRITES':7} {'UNTIL':20} USES")
+    wide = max(len("NAME"), *(len(row["name"]) for row in rows))
+    print(f"{'NAME':{wide}} {'HOST':22} {'WRITES':7} {'KIND':9} {'UNTIL':21} USES")
     for row in rows:
-        print(f"{row['name']:22} {row['host'][:28]:28} "
+        standing = broker.is_standing(row)
+        print(f"{row['name']:{wide}} {row['host'][:22]:22} "
               f"{'yes' if row['mutating'] else 'no':7} "
-              f"{row['expires_at'][:19]:20} {row['uses']}")
+              f"{'standing' if standing else 'session':9} "
+              f"{row['expires_at'][:19]:21} {row['uses']}")
+        if standing:
+            covers = broker.grant_profiles(row)
+            print(f"{'':{wide}} unattended, no prompt · covers "
+                  f"{', '.join(covers) if covers else 'EVERY profile'} · "
+                  f"{row['reason'] or 'no reason recorded'}")
     return 0
 
 
@@ -1067,7 +1133,25 @@ def _usage() -> int:
                                   the first use raises a prompt and answering
                                   it does the same thing. Reads get 4h, writes
                                   30m, and no approval outlives a 4h ceiling
-  xenia grants [--all]            what is approved right now
+
+  xenia grant NAME --host H --write --until 2026-12-08
+                        --profiles 'i079-*' --reason 'why'
+                                  a STANDING approval, for work that runs when
+                                  nobody is at the keyboard. A prompt is not a
+                                  control at 03:00 — it times out and the call
+                                  is refused — so this one has an end date
+                                  instead of a ceiling. It pays for the length
+                                  by being narrow: --reason is required and
+                                  goes on the record, and for signing
+                                  (--host '(sign)') --profiles is required and
+                                  limits it to those profiles, so an approval
+                                  for one job is not a signing oracle for the
+                                  rest. A bare date means the end of that day,
+                                  UTC. Revocable at any moment.
+                                  The report's Credentials tab does this with
+                                  a mouse: Approve… on the credential's row.
+  xenia grants [--all]            what is approved right now, session and
+                                  standing, with what each standing one covers
   xenia revoke NAME [--host H]    end it early
 """)
     return 0

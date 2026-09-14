@@ -40,7 +40,7 @@ one outbound request.
 | Module | What is in it |
 | --- | --- |
 | `vault.py` | the OS stores — Secret Service over `dbus.py`, Keychain over `security` — behind `get`/`set`/`delete` |
-| `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing — `Refusal`, `Scrubber`, `Server`, `OPS`, `CODES` |
+| `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing — `Refusal`, `Scrubber`, `Server`, `OPS`, `CODES`. `Server.start()` REFUSES rather than replacing a socket something is still answering on (`socket_is_live`, `BrokerAlreadyListening`), and `stop()` unlinks only the inode it bound: a second instance that took the path and then left used to strand the first on an anonymous inode, and every credentialed call on the machine failed `broker-unreachable` while `ss -lx` still showed a listener |
 | `signing.py` | how a credential authenticates a request without appearing in it — `Context`, `SCHEMES`, `SchemeError` |
 | `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
 | `secrets.py` | first-use setup for the store, and adding, renaming, removing and approving credentials — `add`, `rename`, `remove`, shared by the command and the page |

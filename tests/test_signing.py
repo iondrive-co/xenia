@@ -203,3 +203,100 @@ def test_profile_bound_eip712_signing_commits_to_the_checked_message():
     recovered = Account.recover_message(
         structured, signature=bytes.fromhex(got[2:]))
     assert recovered == Account.from_key(key).address
+
+
+# -- key encoding and the timestamp that has to match ----------------------
+#
+# A venue that issues a base64 key signs with the DECODED bytes. Signing the
+# text of one produces a valid-looking signature over the wrong key, which the
+# far side rejects with nothing to say why.
+
+def _ctx(secret, **config):
+    return signing.Context(
+        secret=secret, method="GET", url="https://api.test/v3/accounts/me",
+        headers={}, body="", config=config, nonce=1, now=1_757_000_000.0)
+
+
+def test_a_base64_key_is_decoded_before_it_is_used():
+    import base64 as b64, hashlib, hmac as hmac_mod
+
+    raw = b"\x00\x01\x02binary key bytes\xff"
+    stored = b64.b64encode(raw).decode()
+    ctx = _ctx(stored, scheme="hmac", template="{method}{path}",
+               digest="sha512", encoding="base64", key_encoding="base64")
+
+    got = signing.hmac_scheme(ctx)
+
+    want = b64.b64encode(hmac_mod.new(
+        raw, b"GET/v3/accounts/me", hashlib.sha512).digest()).decode()
+    assert got == want
+    assert got != signing.hmac_scheme(_ctx(
+        stored, scheme="hmac", template="{method}{path}", digest="sha512",
+        encoding="base64")), "the default must still sign the text"
+
+
+def test_a_key_that_says_base64_and_is_not_is_refused_by_name():
+    ctx = _ctx("not base64 at all!!", scheme="hmac", template="{method}",
+               key_encoding="base64")
+
+    with pytest.raises(signing.SchemeError, match="does not decode"):
+        signing.hmac_scheme(ctx)
+
+
+def test_an_unknown_key_encoding_is_refused():
+    with pytest.raises(signing.SchemeError, match="no such key encoding"):
+        signing.hmac_scheme(_ctx("x", scheme="hmac", template="{method}",
+                                 key_encoding="rot13"))
+
+
+def test_the_timestamp_header_carries_the_instant_that_was_signed():
+    """The far side re-derives the message from the header, so the value sent
+    has to be the value signed — not one the caller guessed a moment before."""
+    ctx = _ctx("secret", scheme="hmac", template="{method}{path}{ts_ms}",
+               timestamp_header="BM-AUTH-TIMESTAMP")
+
+    signing.hmac_scheme(ctx)
+
+    assert ctx.headers["BM-AUTH-TIMESTAMP"] == "1757000000000"
+
+
+def test_no_timestamp_header_is_added_unless_the_profile_asks():
+    ctx = _ctx("secret", scheme="hmac", template="{method}")
+    signing.hmac_scheme(ctx)
+    assert ctx.headers == {}
+
+
+def test_the_timestamp_variable_may_be_seconds_instead():
+    ctx = _ctx("secret", scheme="hmac", template="{method}{ts}",
+               timestamp_header="X-TS", timestamp_variable="ts")
+    signing.hmac_scheme(ctx)
+    assert ctx.headers["X-TS"] == "1757000000"
+
+
+def test_the_public_half_of_a_key_pair_is_placed_for_the_caller():
+    """Most REST venues send an identifier beside the signature. It is public —
+    it travels in the clear on every request — so it belongs in the profile,
+    not pasted into every call by whoever is making one."""
+    ctx = _ctx("secret", scheme="hmac", template="{method}{path}",
+               api_key_header="BM-AUTH-APIKEY",
+               key_id="765be18b-0000-0000-0000-000000000000")
+
+    signature = signing.hmac_scheme(ctx)
+
+    assert ctx.headers["BM-AUTH-APIKEY"] == "765be18b-0000-0000-0000-000000000000"
+    assert len(signature) > 0
+
+
+def test_an_api_key_header_with_no_key_is_refused_rather_than_sent_empty():
+    """An empty identifier is a 401 the caller has to guess the cause of."""
+    ctx = _ctx("secret", scheme="hmac", template="{method}",
+               api_key_header="BM-AUTH-APIKEY")
+
+    with pytest.raises(signing.SchemeError, match="no 'key_id'"):
+        signing.hmac_scheme(ctx)
+
+
+def test_no_api_key_header_is_added_unless_the_profile_asks():
+    ctx = _ctx("secret", scheme="hmac", template="{method}", key_id="unused")
+    signing.hmac_scheme(ctx)
+    assert ctx.headers == {}

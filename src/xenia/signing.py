@@ -127,18 +127,76 @@ def _encode(raw: bytes, encoding: str) -> str:
 def hmac_scheme(ctx: Context) -> str:
     """HMAC of a templated string, in hex or base64.
 
-    Config: `template` (required), `digest` (sha256), `encoding` (base64).
+    Config: `template` (required), `digest` (sha256), `encoding` (base64),
+    `key_encoding` (utf8), `timestamp_header` (none).
+
+    `key_encoding` is how the STORED credential turns into HMAC key bytes.
+
+    `timestamp_header` names a header that must carry the same instant the
+    signature covers. A scheme whose message includes `{ts}` or `{ts_ms}` and
+    whose far side re-derives it from a header has to send the value it
+    signed, not one the caller guessed a moment earlier; SigV4 does the same
+    with `x-amz-date`.
     """
     template = ctx.config.get("template")
     if not template:
         raise SchemeError(
             "this credential's signing profile has no 'template' — the string "
             "to sign is config, not something the caller may choose")
-    message = render(template, ctx.variables())
-    raw = hmac.new(ctx.secret.encode(),
+    variables = ctx.variables()
+    message = render(template, variables)
+    raw = hmac.new(_key_bytes(ctx.secret, ctx.config.get("key_encoding", "utf8")),
                    message.encode(),
                    _digest(ctx.config.get("digest", "sha256"))).digest()
+
+    # THE PUBLIC HALF OF A KEY PAIR. Most REST venues send an identifier
+    # beside the signature — BTC Markets' BM-AUTH-APIKEY, Coinbase's CB-ACCESS-KEY
+    # — and it is an IDENTIFIER, not a secret: it travels in the clear on every
+    # request and is useless without the private half. SigV4 already has this as
+    # `key_id`; without it here the caller had to paste the public key into
+    # every call, so a stored credential was not on its own enough to make one.
+    api_header = ctx.config.get("api_key_header")
+    if api_header:
+        key_id = ctx.extras.get("key_id") or ctx.config.get("key_id")
+        if not key_id:
+            raise SchemeError(
+                "this profile names an 'api_key_header' but no 'key_id' to put "
+                "in it (or 'key_id_from' naming another credential)")
+        ctx.headers[api_header] = str(key_id)
+
+    header = ctx.config.get("timestamp_header")
+    if header:
+        name = str(ctx.config.get("timestamp_variable", "ts_ms"))
+        if name not in variables:
+            raise SchemeError(
+                f"timestamp_variable {name!r} is not one of: "
+                f"{', '.join(sorted(variables))}")
+        ctx.headers[header] = variables[name]
+
     return _encode(raw, ctx.config.get("encoding", "base64"))
+
+
+def _key_bytes(secret: str, encoding: str) -> bytes:
+    """The stored credential as HMAC key material."""
+    if encoding in ("utf8", "utf-8", "text", "raw"):
+        return secret.encode()
+    if encoding == "base64":
+        try:
+            return base64.b64decode(secret, validate=True)
+        except Exception as exc:
+            raise SchemeError(
+                "this profile says the credential is base64, and it does not "
+                "decode — check which half of the venue's key pair is stored",
+                code="off-policy") from exc
+    if encoding == "hex":
+        try:
+            return bytes.fromhex(secret)
+        except ValueError as exc:
+            raise SchemeError(
+                "this profile says the credential is hex, and it does not "
+                "decode", code="off-policy") from exc
+    raise SchemeError(
+        f"no such key encoding: {encoding} (utf8, base64, hex)")
 
 
 # --------------------------------------------------------------------------

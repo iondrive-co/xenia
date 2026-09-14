@@ -6,7 +6,7 @@ import socket
 import sys
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -445,6 +445,65 @@ def test_the_socket_is_private_to_its_owner(tmp_path):
         assert mode == 0o600
     finally:
         server.stop()
+
+
+def test_a_second_broker_refuses_to_take_a_live_socket(tmp_path):
+    """The stale-socket wedge, measured on ptah 2026-09-14.
+
+    A second instance used to unlink the first's socket, bind a NEW inode at
+    the same path and — when it then went away — leave a file every client got
+    ECONNREFUSED from, while the first listened on an inode with no name. The
+    box looked healthy (`ss -lx` still showed a LISTEN row at the path) and
+    every credentialed call failed `broker-unreachable`.
+    """
+    first = broker.Server(path=str(tmp_path / "b.sock"))
+    first.start()
+    try:
+        second = broker.Server(path=first.path)
+        with pytest.raises(broker.BrokerAlreadyListening):
+            second.start()
+        # The running broker is untouched: that is the point of refusing.
+        assert broker.request({"op": "ping"}, path=first.path)["ok"] is True
+    finally:
+        first.stop()
+
+
+def test_a_broker_replaces_a_socket_nothing_is_answering_on(tmp_path):
+    """The other half: a file left by a crash must not block a restart."""
+    import os
+
+    path = str(tmp_path / "b.sock")
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(path)          # bound, never listened, then closed: a stale file
+    dead.close()
+    assert os.path.exists(path)
+    assert broker.socket_is_live(path) is False
+
+    server = broker.Server(path=path)
+    server.start()
+    try:
+        assert broker.request({"op": "ping"}, path=server.path)["ok"] is True
+    finally:
+        server.stop()
+    assert not os.path.exists(path)
+
+
+def test_stopping_does_not_unlink_a_socket_it_no_longer_owns(tmp_path):
+    """stop() is the same hazard as start(): it removed whatever was at the
+    path, not the socket it bound."""
+    import os
+
+    path = str(tmp_path / "b.sock")
+    mine = broker.Server(path=path)
+    mine.start()
+    os.unlink(path)
+    other = broker.Server(path=path)
+    other.start()                      # a legitimate restart after the unlink
+    try:
+        mine.stop()                    # must NOT take the new one's socket
+        assert broker.request({"op": "ping"}, path=path)["ok"] is True
+    finally:
+        other.stop()
 
 
 def test_a_fetch_over_the_socket_reaches_the_broker(tmp_path, monkeypatch):
@@ -1775,3 +1834,218 @@ def test_a_slow_request_does_not_hold_the_database(wired, monkeypatch, tmp_path)
 
     assert outcome.get("ok"), f"another writer was blocked: {outcome.get('why')}"
     assert answer["status"] == 200
+
+
+# -- standing approvals: the unattended case -------------------------------
+#
+# A prompt is not a control when nobody is at the keyboard. These cover the
+# approval that replaces it: longer than an interactive one, and narrower,
+# because the length is what has to be paid for.
+
+def test_a_standing_approval_outlives_the_interactive_ceiling(wired):
+    row = broker.standing(wired, "gitlab-pat", HOST,
+                          until=broker.utcnow() + timedelta(days=85),
+                          reason="the timer fires at 03:00 and nobody is up")
+
+    ceiling = datetime.fromisoformat(row["ceiling_at"]) - broker.utcnow()
+    assert ceiling > timedelta(days=84), "a 4h ceiling would refuse every bar"
+    assert row["source"] == "standing"
+    assert row["reason"].startswith("the timer fires")
+
+
+def test_a_standing_approval_without_a_reason_is_refused(wired):
+    with pytest.raises(ValueError, match="needs a reason"):
+        broker.standing(wired, "gitlab-pat", HOST,
+                        until=broker.utcnow() + timedelta(days=3), reason="  ")
+
+
+def test_a_standing_approval_for_signing_must_name_its_profiles(wired):
+    """Otherwise the long approval is a signing oracle for every profile."""
+    with pytest.raises(ValueError, match="name the profiles"):
+        broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                        until=broker.utcnow() + timedelta(days=30),
+                        reason="unattended trading")
+
+
+def test_a_standing_approval_is_bounded_however_far_out_it_asks(wired):
+    with pytest.raises(ValueError, match="may not run past"):
+        broker.standing(wired, "gitlab-pat", HOST,
+                        until=broker.utcnow() + timedelta(days=4000),
+                        reason="forever is not a duration")
+
+
+def test_a_standing_approval_expires_rather_than_sliding(wired):
+    """`_extend` slides an ordinary window forward on use. An end date is an
+    end date: using it must not push it out."""
+    row = broker.standing(wired, "gitlab-pat", HOST,
+                          until=broker.utcnow() + timedelta(days=10),
+                          reason="nightly")
+    was = row["expires_at"]
+
+    broker._extend(wired, row, True)
+    wired.commit()
+
+    now = wired.execute("SELECT * FROM secret_grant WHERE id = ?",
+                        (row["id"],)).fetchone()
+    assert now["expires_at"] <= was
+
+
+def test_a_scoped_standing_approval_signs_only_what_it_names(wired):
+    broker.set_profile(wired, "gitlab-pat", "i079-open-BTC",
+                       {"scheme": "hmac", "template": "{body}"})
+    broker.set_profile(wired, "gitlab-pat", "payouts",
+                       {"scheme": "hmac", "template": "{body}"})
+    broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                    until=broker.utcnow() + timedelta(days=85),
+                    profiles=["i079-*"], reason="I-079 trades on a 4h timer")
+
+    named = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "i079-open-BTC",
+                "payload": {"a": 1}}, store=Store(), notify=False)
+    other = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "payouts",
+                "payload": {"a": 1}}, store=Store(), notify=False)
+
+    assert named.get("signature"), named
+    assert other.get("code") == "unapproved", other
+    assert "payouts" in other["refused"]
+
+
+def test_an_unanswered_prompt_says_a_standing_approval_is_the_fix(wired):
+    """The refusal an unattended caller actually gets has to name the cure.
+
+    Telling a 03:00 timer to 'ask the user to run' something is advice for a
+    case that recurs at the same hour tomorrow.
+    """
+    said = broker._why_not({"how": "timed-out", "seconds": 25},
+                           "gitlab-pat", broker.SIGN_SCOPE, True,
+                           "i079-open-BTC")
+
+    assert "STANDING" in said
+    assert "i079-open-BTC" in said
+
+
+def test_an_interactive_approval_still_covers_every_profile(wired):
+    """The narrowing is what a standing approval buys its length with; it must
+    not quietly become a new requirement on answering a prompt."""
+    broker.set_profile(wired, "gitlab-pat", "anything",
+                       {"scheme": "hmac", "template": "{body}"})
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
+                 source="prompt")
+
+    answer = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "anything",
+                "payload": {"a": 1}}, store=Store(), notify=False)
+
+    assert answer.get("signature"), answer
+
+
+def test_a_standing_approval_is_revoked_like_any_other(wired):
+    broker.standing(wired, "gitlab-pat", HOST,
+                    until=broker.utcnow() + timedelta(days=85),
+                    reason="nightly")
+
+    assert broker.revoke(wired, "gitlab-pat", HOST) == 1
+    assert broker.live_grant(wired, "gitlab-pat", HOST, False) is None
+
+
+def test_an_interactive_approval_does_not_revoke_a_standing_approval(wired):
+    """Answering a prompt for one call must not blow away a standing
+    approval given for unattended work on a timer."""
+    broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                    until=broker.utcnow() + timedelta(days=85),
+                    profiles=["i079-*"], reason="unattended trading")
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
+                 source="prompt")
+
+    standing_row = broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                                     True, "i079-open-BTC")
+    assert standing_row is not None
+    assert standing_row["source"] == "standing"
+
+
+def test_multiple_standing_approvals_with_different_profiles_coexist(wired):
+    broker.set_profile(wired, "gitlab-pat", "i079-open-BTC",
+                       {"scheme": "hmac", "template": "{body}"})
+    broker.set_profile(wired, "gitlab-pat", "payouts",
+                       {"scheme": "hmac", "template": "{body}"})
+
+    broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                    until=broker.utcnow() + timedelta(days=85),
+                    profiles=["i079-*"], reason="I-079")
+    broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                    until=broker.utcnow() + timedelta(days=85),
+                    profiles=["payouts"], reason="payouts")
+
+    named1 = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "i079-open-BTC",
+                "payload": {"a": 1}}, store=Store(), notify=False)
+    named2 = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "payouts",
+                "payload": {"a": 1}}, store=Store(), notify=False)
+
+    assert named1.get("signature")
+    assert named2.get("signature")
+
+
+def test_reissuing_a_standing_approval_for_the_same_scope_replaces_it(wired):
+    g1 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                         until=broker.utcnow() + timedelta(days=10),
+                         profiles=["i079-*"], reason="old reason")
+    g2 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                         until=broker.utcnow() + timedelta(days=85),
+                         profiles=["i079-*"], reason="new reason")
+
+    old = wired.execute("SELECT revoked_at FROM secret_grant WHERE id = ?",
+                        (g1["id"],)).fetchone()
+    assert old["revoked_at"] is not None
+    cur = broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "i079-open")
+    assert cur["id"] == g2["id"]
+
+
+def test_revoking_by_grant_id_leaves_other_grants_live(wired):
+    g1 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                         until=broker.utcnow() + timedelta(days=85),
+                         profiles=["i079-*"], reason="I-079")
+    g2 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                         until=broker.utcnow() + timedelta(days=85),
+                         profiles=["payouts"], reason="payouts")
+
+    assert broker.revoke(wired, "gitlab-pat", grant_id=g1["id"]) == 1
+    assert broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "i079-open") is None
+    assert broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "payouts") is not None
+
+
+def test_stopping_an_unstarted_broker_does_not_unlink_active_socket(tmp_path):
+    """If a Server was never started or failed to start, calling stop() must
+    not touch the file at path."""
+    import os, socket
+    path = str(tmp_path / "active.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)
+    try:
+        unstarted = broker.Server(path=path)
+        unstarted.stop()
+        assert os.path.exists(path), "unstarted server unlinked active socket"
+    finally:
+        sock.close()
+        os.unlink(path)
+
+
+def test_sign_only_returns_headers_generated_by_profile(wired):
+    broker.set_profile(wired, "gitlab-pat", "bm",
+                       {"scheme": "hmac", "template": "{method}{ts_ms}",
+                        "timestamp_header": "BM-AUTH-TIMESTAMP",
+                        "api_key_header": "BM-AUTH-APIKEY",
+                        "key_id": "test-key-id"})
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
+                 source="prompt")
+
+    res = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "bm", "payload": {}},
+        store=Store(), notify=False)
+
+    assert res.get("signature")
+    assert "headers" in res
+    assert res["headers"]["BM-AUTH-APIKEY"] == "test-key-id"
+    assert "BM-AUTH-TIMESTAMP" in res["headers"]

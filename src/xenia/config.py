@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 GENERAL_REPO = "general"
 
@@ -149,6 +149,19 @@ BUSY_TIMEOUT_MS = int(os.environ.get("XENIA_BUSY_TIMEOUT_MS", "5000"))
 GRANT_READ_SECONDS = int(os.environ.get("XENIA_GRANT_READ_SECONDS", 4 * 3600))
 GRANT_WRITE_SECONDS = int(os.environ.get("XENIA_GRANT_WRITE_SECONDS", 30 * 60))
 GRANT_CEILING_SECONDS = int(os.environ.get("XENIA_GRANT_CEILING_SECONDS", 4 * 3600))
+
+# THE UNATTENDED CASE. The ceiling above assumes someone is at the keyboard:
+# a prompt goes up, it is answered or it is not, and an approval that crept
+# past four hours would be one nobody remembers giving. Work that runs on a
+# timer breaks that assumption in both directions — there is nobody to ask, so
+# an unanswered prompt is a silent refusal rather than a delay, and the work
+# recurs for weeks rather than minutes. A STANDING approval is that case named:
+# it has an end date instead of a ceiling, a written reason, and — for signing
+# — the set of profiles it covers, so it is longer than an interactive grant
+# and narrower at the same time. This is the outer bound on one; past it, give
+# a shorter one again and mean it.
+GRANT_STANDING_MAX_SECONDS = int(
+    os.environ.get("XENIA_GRANT_STANDING_MAX_SECONDS", 180 * 86400))
 
 # What one brokered response may cost. The read cap is what xenia pulls off
 # the wire; the returned body is cut well below it so the reply still fits

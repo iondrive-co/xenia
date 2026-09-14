@@ -258,6 +258,7 @@ class App:
             MenuItem("Credentials", items=[
                 MenuItem("Add…", self.add_credential),
                 MenuItem("List", self.list_credentials),
+                MenuItem("Approvals…", self.approvals),
                 MenuItem("Delete…", self.delete_credential),
             ]),
             MenuItem("Quit xenia", self.quit),
@@ -277,6 +278,16 @@ class App:
         The same list, with what each credential has been used for beside it,
         somewhere it can be read after the click that opened it — and the tab
         is where one is added or removed now, so the list is the way in.
+        """
+        webbrowser.open(self.report.tab("credentials"))
+
+    def approvals(self) -> None:
+        """What is approved right now, and where a standing one is given.
+
+        Work that runs on a timer cannot be approved by a prompt — there is
+        nobody to answer it — so the approval has to be given in advance, by
+        someone looking at the list of what is already approved. That list is
+        the Credentials tab, and Approve… on a row is the form.
         """
         webbrowser.open(self.report.tab("credentials"))
 
@@ -325,7 +336,7 @@ class App:
         self.report.start()
         try:
             self.broker.start()
-        except OSError as exc:
+        except (OSError, broker_mod.BrokerError) as exc:
             # No socket is a smaller failure than no service: the record and
             # the report are the job, and brokered calls simply refuse with a
             # reason until this is fixed.

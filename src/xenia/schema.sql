@@ -213,7 +213,21 @@ CREATE TABLE IF NOT EXISTS secret_grant (
     ceiling_at   TEXT    NOT NULL,
     last_used_at TEXT,
     uses         INTEGER NOT NULL DEFAULT 0,
+    -- 'cli', 'prompt', or 'standing'. A STANDING approval is the one kind
+    -- that outlives the ceiling an interactive one gets: it exists because
+    -- the work runs when nobody is at the keyboard, so there is no prompt to
+    -- answer and a refusal is silent. It is not a longer ordinary grant — it
+    -- carries an end date and a written reason, and for signing it names the
+    -- profiles it covers, so the length is paid for in narrowness.
     source       TEXT    NOT NULL,
+    -- JSON list of signing-profile patterns this grant covers ('i079-*').
+    -- NULL means every profile, which is what an interactive approval gives
+    -- and what a standing one should not.
+    profiles     TEXT,
+    -- Why a standing approval exists, in the grantor's words. Required for
+    -- one, because an approval nobody can account for later is the thing a
+    -- ceiling was protecting against.
+    reason       TEXT,
     revoked_at   TEXT
 );
 

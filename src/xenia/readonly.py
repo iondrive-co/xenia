@@ -1282,6 +1282,21 @@ def _now() -> str:
     return ingest.utcnow()
 
 
+def _json_list(raw) -> list[str] | None:
+    """A JSON list column as a list, or None when it holds nothing.
+
+    None and [] mean different things on a grant's `profiles`: nothing
+    recorded means every profile, an empty list would mean none.
+    """
+    if not raw:
+        return None
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return [str(x) for x in loaded] if isinstance(loaded, list) else None
+
+
 def _scope_stale(verified_at: str | None) -> bool:
     """Whether a scope check is old enough to have stopped being evidence.
     Never verified counts as stale."""
@@ -1335,7 +1350,8 @@ def credentials(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
     live = {}
     for row in _rows(conn.execute("""
-        SELECT name, host, mutating, expires_at, ceiling_at, uses
+        SELECT id, name, host, mutating, expires_at, ceiling_at, uses,
+               source, profiles, reason
         FROM secret_grant
         WHERE revoked_at IS NULL AND expires_at > :now AND ceiling_at > :now
         ORDER BY name, host
@@ -1364,10 +1380,14 @@ def credentials(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 pass
         approvals = live.get(row["name"], [])
         row["approved_for"] = [
-            {"host": grant["host"],
+            {"id": grant["id"],
+             "host": grant["host"],
              "writes": bool(grant["mutating"]),
              "until": grant["expires_at"],
-             "ceiling": grant["ceiling_at"]}
+             "ceiling": grant["ceiling_at"],
+             "standing": (grant.get("source") or "") == "standing",
+             "profiles": _json_list(grant.get("profiles")),
+             "reason": grant.get("reason")}
             for grant in approvals]
         row["usable_now"] = bool(approvals)
     return rows

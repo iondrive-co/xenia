@@ -28,7 +28,20 @@ def test_the_tray_menu_is_the_three_things_it_can_do(fake_home):
     assert [item.label for item in menu] == [
         "Show Report", "Credentials", "Quit xenia"]
     assert [item.label for item in menu[1].items] == [
-        "Add…", "List", "Delete…"]
+        "Add…", "List", "Approvals…", "Delete…"]
+
+
+def test_approvals_opens_the_page_where_a_standing_one_is_given(fake_home,
+                                                                monkeypatch):
+    """Unattended work cannot be approved by a prompt — nobody is there to
+    answer it — so the approval is given in advance, on the page that lists
+    what is already approved."""
+    opened = []
+    monkeypatch.setattr(app.webbrowser, "open", opened.append)
+
+    app.App().menu()[1].items[2].action()
+
+    assert opened and opened[0].endswith("#credentials")
 
 
 def test_a_submenu_is_numbered_flat_because_a_click_is_only_an_id(fake_home):
@@ -39,8 +52,8 @@ def test_a_submenu_is_numbered_flat_because_a_click_is_only_an_id(fake_home):
 
     assert [(i, item.label, parent) for i, item, parent in numbered] == [
         (1, "Show Report", 0), (2, "Credentials", 0),
-        (3, "Add…", 2), (4, "List", 2), (5, "Delete…", 2),
-        (6, "Quit xenia", 0)]
+        (3, "Add…", 2), (4, "List", 2), (5, "Approvals…", 2),
+        (6, "Delete…", 2), (7, "Quit xenia", 0)]
 
 
 def test_clicking_a_submenu_header_does_nothing(fake_home, monkeypatch):
@@ -314,7 +327,7 @@ def test_adding_a_credential_is_still_a_terminal(fake_home, monkeypatch):
     monkeypatch.setattr(secrets_cli, "open_in_terminal",
                         lambda command: launched.append(command) or True)
 
-    add, _listing, _delete = app.App().menu()[1].items
+    add, _listing, _approvals, _delete = app.App().menu()[1].items
     add.action()
 
     assert opened == [], "a typed value does not go through the browser"
@@ -352,7 +365,7 @@ def test_deleting_asks_in_a_terminal_because_it_cannot_be_undone(fake_home,
     monkeypatch.setattr(secrets_cli, "open_in_terminal",
                         lambda command: launched.append(command) or True)
 
-    app.App().menu()[1].items[2].action()
+    app.App().menu()[1].items[3].action()
 
     assert launched and launched[0][-3:] == ["secret", "rm", "--wait"]
 
@@ -378,5 +391,5 @@ def test_a_backend_that_cannot_nest_gets_the_tree_flattened(fake_home):
     labels = [item.label for item in Tray("xenia", app.App().menu()).flattened()]
 
     assert labels == ["Show Report", "Credentials: Add…",
-                      "Credentials: List", "Credentials: Delete…",
-                      "Quit xenia"]
+                      "Credentials: List", "Credentials: Approvals…",
+                      "Credentials: Delete…", "Quit xenia"]

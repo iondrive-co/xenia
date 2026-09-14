@@ -8,10 +8,11 @@ from urllib.parse import parse_qs, urlparse
 
 from . import readonly
 
-#: The only things a POST here may change, all three of them one credential.
-#: The record itself is never one of them: what an agent did is not editable
-#: from the page that reports it.
-WRITES = ("/api/secrets/add", "/api/secrets/remove", "/api/secrets/rename")
+#: The only things a POST here may change, all of them one credential or one
+#: approval of one. The record itself is never one of them: what an agent did
+#: is not editable from the page that reports it.
+WRITES = ("/api/secrets/add", "/api/secrets/remove", "/api/secrets/rename",
+          "/api/grants/approve", "/api/grants/revoke")
 
 #: A credential is a line, not a file. Anything larger is a mistake or an
 #: attempt to fill memory, and is refused before it is read.
@@ -240,6 +241,46 @@ class Report:
 
         conn = db.connect(self.db_path)
         try:
+            if path == "/api/grants/revoke":
+                raw_id = payload.get("id")
+                try:
+                    grant_id = int(raw_id) if raw_id is not None else None
+                except (TypeError, ValueError):
+                    grant_id = None
+                count = broker.revoke(conn, name,
+                                      str(payload.get("host") or "") or None,
+                                      grant_id=grant_id)
+                if not count:
+                    return {"error": f"nothing live to revoke for '{name}'"}
+                return {"ok": True, "revoked": count}
+
+            if path == "/api/grants/approve":
+                # A STANDING APPROVAL, GIVEN WITH A MOUSE. The page is where a
+                # person already looks to see what is approved, and an
+                # approval for unattended work is given deliberately, in
+                # advance, by someone reading exactly this list — not typed
+                # into a terminal at the moment a timer happens to fire.
+                from . import secrets as secrets_cli
+                host = str(payload.get("host") or "").strip()
+                if not host:
+                    return {"error": "an approval needs a host, or (sign)"}
+                raw = payload.get("profiles") or ""
+                profiles = [p.strip() for p in
+                            (raw if isinstance(raw, str) else ",".join(raw)).split(",")
+                            if p.strip()]
+                try:
+                    row = broker.standing(
+                        conn, name, host,
+                        until=secrets_cli.until_moment(str(payload.get("until") or "")),
+                        profiles=profiles or None,
+                        reason=str(payload.get("reason") or ""),
+                        mutating=bool(payload.get("writes")))
+                except ValueError as exc:
+                    return {"error": str(exc)}
+                return {"ok": True, "until": row["expires_at"],
+                        "host": host, "writes": bool(row["mutating"]),
+                        "profiles": broker.grant_profiles(row)}
+
             if path == "/api/secrets/rename":
                 try:
                     outcome = secrets_cli.rename(
@@ -364,6 +405,7 @@ _PAGE = r"""<!doctype html>
   .entry{align-items:center}
   .entry input{min-width:180px}
   .entry input#s-value{min-width:260px;flex:1}
+  .entry input#g-reason{min-width:220px;flex:1}
   .entry b{font-weight:600;margin-right:4px}
   .msg{padding:9px 18px;font-size:13px;border-bottom:1px solid var(--line);
     background:color-mix(in srgb,var(--ok) 8%,transparent)}
@@ -432,6 +474,21 @@ _PAGE = r"""<!doctype html>
   <input id="s-note" autocomplete="off" placeholder="Note (optional)">
   <button class="act" id="s-save">Store</button>
   <button class="act" id="s-cancel">Cancel</button>
+</div>
+<div class="bar entry" id="grantForm" hidden>
+  <b id="g-title">Standing approval</b>
+  <input id="g-host" autocomplete="off" spellcheck="false"
+    placeholder="Where — a host, or (sign) for signing">
+  <input id="g-until" autocomplete="off" spellcheck="false"
+    placeholder="Until — 2026-12-08">
+  <input id="g-profiles" autocomplete="off" spellcheck="false"
+    placeholder="Signing profiles — i079-*">
+  <input id="g-reason" autocomplete="off" placeholder="Why this runs unattended">
+  <label style="color:var(--muted);font-size:12px">
+    <input type="checkbox" id="g-writes" style="min-width:auto"> may write/sign
+  </label>
+  <button class="act" id="g-save">Approve</button>
+  <button class="act" id="g-cancel">Cancel</button>
 </div>
 <div class="msg" id="msg" hidden></div>
 <div class="wrap"><table>
@@ -618,9 +675,17 @@ async function loadSecrets(){
   const rows = await rowsFrom('/api/secrets', new URLSearchParams({t:T}));
 
   el('rows').innerHTML = rows.map(s=>{
-    const grants = (s.approved_for||[]).map(g=>
-      `<span class="pill ${g.writes?'elevated':'achieved'}">${esc(g.host)}`
-      + `${g.writes?' + writes':''} until ${esc(timeOf(g.until))}</span>`).join(' ');
+    const grants = (s.approved_for||[]).map(g=>{
+      const covers = g.standing
+        ? ` · ${g.profiles ? esc(g.profiles.join(', ')) : 'EVERY profile'}` : '';
+      const why = g.standing && g.reason
+        ? `<br><span class="normal" style="font-size:11px">${esc(g.reason)}</span>` : '';
+      return `<span class="pill ${g.writes?'elevated':'achieved'}"`
+      + ` title="${esc(g.standing ? 'standing: runs unattended until this date, no prompt' : 'session approval, slides forward on use under a 4h ceiling')}">`
+      + `${g.standing?'standing · ':''}${esc(g.host)}`
+      + `${g.writes?' + writes':''} until ${esc(timeOf(g.until))}${covers}</span>`
+      + ` <button class="act rv" data-n="${esc(s.name)}" data-h="${esc(g.host)}" data-id="${esc(g.id)}">Revoke</button>${why}`;
+    }).join(' ');
     const worry = s.echoed
       ? ` <span class="pill critical" title="the far side sent the credential back — rotate it">echoed ${s.echoed}×</span>` : '';
     const refused = s.refused
@@ -641,7 +706,10 @@ async function loadSecrets(){
       <td>${grants || '<span class="normal">not approved</span>'}</td>
       <td class="mono">${s.uses||0}${refused}</td>
       <td class="mono">${esc(timeOf(s.last_used_at)||'never')}</td>
-      <td><button class="act mv" data-n="${esc(s.name)}">Rename</button>
+      <td><button class="act ap" data-n="${esc(s.name)}"
+            data-h="${esc((s.hosts||[]).length===1?s.hosts[0]:'')}"
+            data-signs="${(s.schemes||[]).length?'1':''}">Approve…</button>
+        <button class="act mv" data-n="${esc(s.name)}">Rename</button>
         <button class="act rm" data-n="${esc(s.name)}">Remove</button></td></tr>`;
   }).join('');
 
@@ -651,6 +719,12 @@ async function loadSecrets(){
   });
   el('rows').querySelectorAll('button.mv').forEach(b=>{
     b.onclick = ()=>renameSecret(b.dataset.n);
+  });
+  el('rows').querySelectorAll('button.ap').forEach(b=>{
+    b.onclick = ()=>showGrantForm(b.dataset.n, b.dataset.h, !!b.dataset.signs);
+  });
+  el('rows').querySelectorAll('button.rv').forEach(b=>{
+    b.onclick = ()=>revokeGrant(b.dataset.n, b.dataset.h, b.dataset.id ? parseInt(b.dataset.id, 10) : null);
   });
 
   el('empty').hidden = rows.length > 0;
@@ -700,6 +774,48 @@ async function saveSecret(){
   note(`Stored '${name}' in the ${out.store}. Nothing can use it yet: you are`
     + ` asked the first time something reaches for it, and that answer decides`
     + ` where it may be sent.`);
+  loadSecrets();
+}
+
+let grantFor = null;
+
+function showGrantForm(name, host, signs){
+  grantFor = name;
+  el('grantForm').hidden = false;
+  el('g-title').textContent = `Standing approval — ${name}`;
+  el('g-host').value = signs ? '(sign)' : (host || '');
+  el('g-until').value = '';
+  el('g-profiles').value = '';
+  el('g-reason').value = '';
+  el('g-writes').checked = !!signs;
+  note('A standing approval is for work that runs when you are not here: it'
+    + ' lasts until the date you give instead of the usual four hours, and no'
+    + ' prompt is raised while it holds. Say why, and for signing say which'
+    + ' profiles — a long approval has to be a narrow one.');
+  el('g-until').focus();
+}
+
+async function saveGrant(){
+  if(!grantFor) return;
+  const out = await post('/api/grants/approve', {
+    name: grantFor, host: el('g-host').value.trim(),
+    until: el('g-until').value.trim(), profiles: el('g-profiles').value,
+    reason: el('g-reason').value.trim(), writes: el('g-writes').checked});
+  if(out.error){ note(out.error, true); return; }
+  const covers = out.profiles ? out.profiles.join(', ') : 'every profile';
+  note(`'${grantFor}' is approved for ${out.host} until`
+    + ` ${timeOf(out.until)} without a prompt, covering ${covers}.`
+    + ` Revoke ends it the moment you click it.`);
+  el('grantForm').hidden = true; grantFor = null;
+  loadSecrets();
+}
+
+async function revokeGrant(name, host, id){
+  if(!confirm(`Revoke the approval on '${name}' for ${host}?\n\nAnything`
+    + ` using it stops at the next call, and is asked again.`)) return;
+  const out = await post('/api/grants/revoke', {name, host, id});
+  if(out.error){ note(out.error, true); return; }
+  note(`Revoked ${out.revoked} approval(s) on '${name}' for ${host}.`);
   loadSecrets();
 }
 
@@ -778,7 +894,8 @@ function setTab(name){
     ? 'No credentials yet. "Add a credential" puts one in the OS keyring;'
       + ' xenia keeps its name and where it may be sent, never the value.'
     : 'Nothing here for these filters.';
-  if(name!=='credentials'){ showForm(false); note(''); }
+  if(name!=='credentials'){ showForm(false); note('');
+    el('grantForm').hidden = true; grantFor = null; }
   drawChip(); head(); refresh();
 }
 
@@ -809,6 +926,10 @@ el('s-save').onclick = saveSecret;
 el('s-cancel').onclick = ()=>{ clearForm(); showForm(false); note(''); };
 for(const id of ['s-name','s-value','s-hosts','s-note'])
   el(id).onkeydown = e=>{ if(e.key==='Enter') saveSecret(); };
+el('g-save').onclick = saveGrant;
+el('g-cancel').onclick = ()=>{ el('grantForm').hidden = true; grantFor = null; note(''); };
+for(const id of ['g-host','g-until','g-profiles','g-reason'])
+  el(id).onkeydown = e=>{ if(e.key==='Enter') saveGrant(); };
 let deb; el('q').oninput = ()=>{ clearTimeout(deb); deb=setTimeout(refresh,220); };
 el('live').onchange = ()=>{ clearInterval(timer);
   if(el('live').checked) timer = setInterval(refresh, 5000); };

@@ -672,3 +672,41 @@ def test_a_profile_that_is_not_json_is_refused_rather_than_stored(cli):
     assert cli("secret", "sign", "wallet", "l1", stdin="not json") == 2
     assert cli("secret", "sign", "wallet", "l1", stdin="[1, 2]") == 2
     assert profile_on(cli) == {}
+
+
+# -- until, the standing approval's clock ----------------------------------
+
+def test_a_bare_date_means_the_end_of_that_day():
+    """"Until the 8th" means through the 8th. An approval that stopped at
+    00:00 on the morning of the date it was given for would fail on exactly
+    the day it was needed."""
+    moment = secrets.until_moment("2026-12-08")
+
+    assert moment.isoformat() == "2026-12-08T23:59:59+00:00"
+
+
+def test_until_also_takes_a_duration_and_a_timestamp():
+    from datetime import datetime, timezone
+
+    assert secrets.until_moment("2026-12-08T12:00Z") == datetime(
+        2026, 12, 8, 12, 0, tzinfo=timezone.utc)
+    assert secrets.until_moment("85d") > datetime.now(timezone.utc)
+
+
+def test_until_refuses_something_that_is_neither():
+    with pytest.raises(ValueError, match="not a date or duration"):
+        secrets.until_moment("next tuesday")
+
+
+def test_granting_for_signing_infers_mutating_even_without_write_flag(cli):
+    """Signing is inherently mutating; omitting --write must not create a
+    grant with mutating=0 that is never matched."""
+    assert cli("secret", "add", "wallet", "--host", "api.example.com", stdin=VALUE) == 0
+    assert cli("secret", "sign", "wallet", "l1", "scheme=hmac", "template={body}") == 0
+
+    status = cli("grant", "wallet", "--host", "(sign)", "--until", "2026-12-08",
+                 "--profiles", "l1", "--reason", "trading")
+
+    assert status == 0
+    row = cli.db().execute("SELECT mutating FROM secret_grant WHERE name = 'wallet'").fetchone()
+    assert row["mutating"] == 1

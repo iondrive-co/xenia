@@ -26,8 +26,25 @@ def connect(path: Path | str | None = None, *, read_only: bool = False) -> sqlit
 
 
 def migrate(conn: sqlite3.Connection) -> None:
+    # ADDED COLUMNS ARE CHECKED EVEN AT THE CURRENT VERSION (2026-09-14). The
+    # version stamp says which migration ran, not which code ran it: a bump
+    # lands in `config.py` and the column lands in `_ADDED_COLUMNS`, and any
+    # process that opens the database between those two writes migrates,
+    # stamps the new version, and strands the column FOREVER — every later
+    # run returns early on the matching version and never looks again. That
+    # happened here on the 21 -> 22 bump: `secret_grant.profiles` and
+    # `.reason` were missing from a database stamped 22, so every query
+    # naming them raised `no such column` and the report's credentials list
+    # answered an error, which the page draws as an empty list. Nothing had
+    # been deleted; the read was broken, not the record.
+    #
+    # So this runs first and always. It is one PRAGMA per table, not per
+    # column, and it only ALTERs what is actually absent.
+    _add_columns(conn)
+
     current = schema_version(conn)
     if current == config.SCHEMA_VERSION:
+        conn.commit()
         return
 
     _add_columns(conn)
@@ -260,6 +277,8 @@ _ADDED_COLUMNS = (
     ("action", "result_bytes", "INTEGER"),
     ("action", "blocked_by", "TEXT"),
     ("secret_grant", "window_s", "INTEGER"),
+    ("secret_grant", "profiles", "TEXT"),
+    ("secret_grant", "reason", "TEXT"),
     ("secret", "schemes", "TEXT"),
     ("secret", "last_nonce", "INTEGER"),
     ("secret", "body_policy", "TEXT"),
@@ -281,10 +300,23 @@ _DROPPED_COLUMNS = (("action", "risk"),)
 
 
 def _add_columns(conn: sqlite3.Connection) -> None:
+    """Add every column a later version introduced that is not there yet.
+
+    Grouped by table so this costs one `PRAGMA table_info` per table rather
+    than one per column: it runs on every writable connect now, not only when
+    the version moves.
+    """
+    wanted: dict[str, list[tuple[str, str]]] = {}
     for table, column, kind in _ADDED_COLUMNS:
+        wanted.setdefault(table, []).append((column, kind))
+
+    for table, columns in wanted.items():
         existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if existing and column not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+        if not existing:                      # the table is not there yet
+            continue
+        for column, kind in columns:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 def _drop_removed(conn: sqlite3.Connection) -> None:

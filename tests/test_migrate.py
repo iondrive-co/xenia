@@ -241,3 +241,52 @@ def test_the_read_side_survives_a_database_it_cannot_migrate(legacy):
         assert stats["tasks"] == 0
     finally:
         ro.close()
+
+
+def test_a_column_missing_from_a_current_database_is_still_added(tmp_path):
+    """The version stamp says which migration ran, not which code ran it.
+
+    A bump lands in `config.py` and the new column lands in `_ADDED_COLUMNS`.
+    Any process that opens the database between those two writes migrates,
+    stamps the new version, and — when the early return was the first thing
+    `migrate` did — stranded the column forever: every later run saw a
+    matching version and never looked. It happened on 21 -> 22, and the
+    symptom was a report tab that drew an empty credentials list because the
+    query behind it raised `no such column`.
+    """
+    from xenia import config, db
+
+    path = tmp_path / "audit.db"
+    conn = db.connect(path)
+    assert db.schema_version(conn) == config.SCHEMA_VERSION
+    conn.execute("ALTER TABLE secret_grant DROP COLUMN profiles")
+    conn.commit()
+    assert "profiles" not in _columns(conn, "secret_grant")
+    conn.close()
+
+    again = db.connect(path)
+
+    assert "profiles" in _columns(again, "secret_grant")
+    again.close()
+
+
+def test_repairing_a_column_does_not_touch_what_is_stored(tmp_path):
+    from xenia import broker, db
+
+    path = tmp_path / "audit.db"
+    conn = db.connect(path)
+    broker.register(conn, "pat", backend="memory", hosts=["api.test"],
+                    methods=["GET"])
+    conn.execute("ALTER TABLE secret_grant DROP COLUMN reason")
+    conn.commit()
+    conn.close()
+
+    again = db.connect(path)
+
+    assert [row["name"] for row in again.execute("SELECT name FROM secret")] == ["pat"]
+    assert "reason" in _columns(again, "secret_grant")
+    again.close()
+
+
+def _columns(conn, table):
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}

@@ -398,3 +398,111 @@ def test_a_body_that_is_not_a_credential_is_refused_before_it_is_read(served):
     with pytest.raises(urllib.error.HTTPError) as raised:
         urllib.request.urlopen(request)
     assert raised.value.code == 400
+
+
+# -- standing approvals, given with a mouse ---------------------------------
+#
+# The page is where a person already looks to see what is approved, and an
+# approval for work that runs at 03:00 has to be given in advance by someone
+# reading exactly that list — not typed into a terminal when a timer fires.
+
+def test_the_page_can_give_a_standing_approval(served, store):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED,
+                                      "hosts": "api.test"})
+
+    out = post(served, "/api/grants/approve", {
+        "name": "pat", "host": "api.test", "until": "2026-12-08",
+        "writes": True, "reason": "a timer runs this every four hours"})
+
+    assert out.get("ok"), out
+    assert out["until"].startswith("2026-12-08")
+    rows = api(served, "/api/secrets")["rows"]
+    grant = [g for r in rows for g in r["approved_for"]][0]
+    assert grant["standing"] and grant["writes"]
+    assert grant["reason"] == "a timer runs this every four hours"
+
+
+def test_the_page_refuses_a_standing_signing_approval_with_no_profiles(served,
+                                                                       store):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+
+    out = post(served, "/api/grants/approve", {
+        "name": "pat", "host": "(sign)", "until": "2026-12-08",
+        "writes": True, "reason": "unattended"})
+
+    assert "name the profiles" in out.get("error", "")
+
+
+def test_the_page_reports_what_a_standing_approval_covers(served, store):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+    post(served, "/api/grants/approve", {
+        "name": "pat", "host": "(sign)", "until": "2026-12-08", "writes": True,
+        "profiles": "i079-open-*, i079-close-*", "reason": "the 4h timer"})
+
+    rows = api(served, "/api/secrets")["rows"]
+    grant = [g for r in rows for g in r["approved_for"]][0]
+
+    assert grant["profiles"] == ["i079-close-*", "i079-open-*"]
+
+
+def test_the_page_revokes_an_approval(served, store):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED,
+                                      "hosts": "api.test"})
+    post(served, "/api/grants/approve", {
+        "name": "pat", "host": "api.test", "until": "2026-12-08",
+        "writes": True, "reason": "a timer"})
+
+    out = post(served, "/api/grants/revoke", {"name": "pat",
+                                              "host": "api.test"})
+
+    assert out.get("revoked") == 1
+    rows = api(served, "/api/secrets")["rows"]
+    assert all(not r["approved_for"] for r in rows)
+
+
+def test_revoking_nothing_says_so_rather_than_claiming_success(served, store):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+
+    out = post(served, "/api/grants/revoke", {"name": "pat"})
+
+    assert "nothing live to revoke" in out.get("error", "")
+
+
+def test_a_grant_write_still_needs_the_token_and_the_page(served, store):
+    """The approval endpoints are writes, so they sit behind the same two
+    checks the credential ones do."""
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
+
+    with pytest.raises(urllib.error.HTTPError) as bare:
+        post(served, "/api/grants/approve", {"name": "pat"}, token=False)
+    with pytest.raises(urllib.error.HTTPError) as foreign:
+        post(served, "/api/grants/approve", {"name": "pat"},
+             headers={"Origin": "http://evil.test"})
+
+    assert bare.value.code == 403 and foreign.value.code == 403
+
+
+def test_the_page_revokes_an_approval_by_id(served, store):
+    post(served, "/api/secrets/add", {"name": "pat", "value": TYPED,
+                                      "hosts": "api.test"})
+    post(served, "/api/grants/approve", {
+        "name": "pat", "host": "api.test", "until": "2026-12-08",
+        "writes": True, "reason": "a timer"})
+    post(served, "/api/grants/approve", {
+        "name": "pat", "host": "(sign)", "until": "2026-12-08",
+        "writes": True, "profiles": "i079-*", "reason": "signing timer"})
+
+    rows = api(served, "/api/secrets")["rows"]
+    grants = rows[0]["approved_for"]
+    assert len(grants) == 2
+    grant_to_revoke = [g for g in grants if g["host"] == "api.test"][0]
+
+    out = post(served, "/api/grants/revoke", {"name": "pat",
+                                              "host": "api.test",
+                                              "id": grant_to_revoke["id"]})
+
+    assert out.get("revoked") == 1
+    rows = api(served, "/api/secrets")["rows"]
+    remaining = rows[0]["approved_for"]
+    assert len(remaining) == 1
+    assert remaining[0]["host"] == "(sign)"

@@ -311,33 +311,165 @@ def default_window(mutating: bool) -> float:
 
 
 def grant(conn, name: str, host: str, *, mutating: bool = False,
-          seconds: float | None = None, source: str = "cli") -> dict:
+          seconds: float | None = None, source: str = "cli",
+          ceiling_seconds: float | None = None,
+          profiles: list[str] | None = None, reason: str | None = None) -> dict:
+    """Approve one credential against one host, until one of two clocks stops.
+
+    `ceiling_seconds` is the clock that does not slide. It defaults to the
+    interactive ceiling, and a STANDING approval — `source='standing'` — is
+    the one caller that passes its own, because the work it covers runs when
+    nobody is there to answer a prompt. See `standing()`, which is the only
+    way to make one and enforces what one costs.
+    """
     if entry(conn, name) is None:
         raise ValueError(f"no credential called '{name}'")
 
     now = utcnow()
     window = seconds if seconds is not None else default_window(mutating)
-    ceiling = now + timedelta(seconds=config.GRANT_CEILING_SECONDS)
+    ceiling = now + timedelta(
+        seconds=(config.GRANT_CEILING_SECONDS if ceiling_seconds is None
+                 else ceiling_seconds))
     expires = min(now + timedelta(seconds=window), ceiling)
 
-    conn.execute(
-        "UPDATE secret_grant SET revoked_at = ? "
-        "WHERE name = ? AND host = ? AND mutating = ? AND revoked_at IS NULL",
-        (stamp(now), name, host, int(mutating)))
+    profiles_json = json.dumps(sorted(profiles)) if profiles else None
+    if source == "standing":
+        # A standing approval only supersedes an existing grant covering the
+        # exact same profile scope (or another unscoped grant on the same host).
+        # It must not revoke standing approvals for other profiles on the same
+        # credential.
+        if profiles_json is not None:
+            conn.execute(
+                "UPDATE secret_grant SET revoked_at = ? "
+                "WHERE name = ? AND host = ? AND mutating = ? AND revoked_at IS NULL "
+                "  AND profiles = ?",
+                (stamp(now), name, host, int(mutating), profiles_json))
+        else:
+            conn.execute(
+                "UPDATE secret_grant SET revoked_at = ? "
+                "WHERE name = ? AND host = ? AND mutating = ? AND revoked_at IS NULL "
+                "  AND profiles IS NULL",
+                (stamp(now), name, host, int(mutating)))
+    else:
+        # An interactive / session grant (from a desktop prompt or CLI --for)
+        # only supersedes prior session grants. It MUST NOT revoke standing
+        # approvals: an unattended job running on a timer must not lose its
+        # standing approval just because someone answered a prompt on the desktop.
+        conn.execute(
+            "UPDATE secret_grant SET revoked_at = ? "
+            "WHERE name = ? AND host = ? AND mutating = ? AND revoked_at IS NULL "
+            "  AND (source IS NULL OR source != 'standing')",
+            (stamp(now), name, host, int(mutating)))
+
     cursor = conn.execute(
         "INSERT INTO secret_grant (name, host, mutating, granted_at, "
-        "                          window_s, expires_at, ceiling_at, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "                          window_s, expires_at, ceiling_at, source, "
+        "                          profiles, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, host, int(mutating), stamp(now), window, stamp(expires),
-         stamp(ceiling), source))
+         stamp(ceiling), source, profiles_json, (reason or None)))
     conn.commit()
     return dict(conn.execute("SELECT * FROM secret_grant WHERE id = ?",
                              (cursor.lastrowid,)).fetchone())
 
 
-def revoke(conn, name: str, host: str | None = None) -> int:
+def standing(conn, name: str, host: str, *, until: datetime,
+             profiles: list[str] | None = None, reason: str = "",
+             mutating: bool = True, source: str = "standing") -> dict:
+    """An approval for work that runs while nobody is at the keyboard.
+
+    THE PROBLEM IT SOLVES. An ordinary grant assumes a person: the first use
+    raises a prompt, and an unanswered one is a delay. On a timer there is
+    nobody to ask, so the prompt times out and the call is REFUSED — silently,
+    at 03:00, with no second chance. Handing that case a longer ordinary grant
+    would be the wrong fix, because the four-hour ceiling is what stops "for
+    thirty minutes" from meaning "until you stop".
+
+    WHAT IT COSTS INSTEAD. A standing approval buys its length with
+    narrowness and with accountability:
+
+      * an END DATE, not a sliding window — it expires on the day it was
+        given for, and `_extend` cannot move it;
+      * a REASON, in the grantor's words, on the row and in the report;
+      * for signing, the PROFILES it covers. An interactive `(sign)` approval
+        covers every profile on the credential; this one covers the ones
+        named, so a standing approval for one job's profiles is not a
+        signing oracle for the others.
+
+    It is still revocable at any moment, and it is bounded by
+    `GRANT_STANDING_MAX_SECONDS` however far out `until` is.
+    """
+    now = utcnow()
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError(
+            "a standing approval needs a reason: it outlives the ceiling that "
+            "would otherwise end it, so the record has to say what for")
+    seconds = (until - now).total_seconds()
+    if seconds <= 0:
+        raise ValueError(f"{stamp(until)[:19]} is not in the future")
+    if seconds > config.GRANT_STANDING_MAX_SECONDS:
+        days = config.GRANT_STANDING_MAX_SECONDS / 86400
+        raise ValueError(
+            f"a standing approval may not run past {days:g} days "
+            f"(asked for {seconds / 86400:.0f}); give a shorter one and renew it")
+    if host == SIGN_SCOPE and not profiles:
+        raise ValueError(
+            "a standing approval for signing has to name the profiles it "
+            "covers — without them it approves every profile on the "
+            "credential for the whole period, which is the thing the ceiling "
+            "was stopping")
+    return grant(conn, name, host, mutating=mutating, seconds=seconds,
+                 source=source, ceiling_seconds=seconds, profiles=profiles,
+                 reason=reason)
+
+
+def is_standing(row) -> bool:
+    try:
+        return (row["source"] or "") == "standing"
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def grant_profiles(row) -> list[str] | None:
+    """The profile patterns a grant covers, or None for every profile."""
+    try:
+        raw = row["profiles"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not raw:
+        return None
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return [str(x) for x in loaded] if isinstance(loaded, list) else None
+
+
+def grant_covers(row, profile: str | None) -> bool:
+    """Whether this approval reaches the signing profile being asked for.
+
+    A grant that names no profiles covers all of them — that is what
+    answering a prompt gives, and what it has always given. A grant that
+    names some covers exactly those, matched as shell globs so one line can
+    say `i079-*` rather than three hundred and eighteen.
+    """
+    patterns = grant_profiles(row)
+    if patterns is None:
+        return True
+    if profile is None:
+        return False
+    return any(fnmatch.fnmatchcase(profile, pattern) for pattern in patterns)
+
+
+def revoke(conn, name: str, host: str | None = None, *,
+           grant_id: int | None = None) -> int:
     now = stamp(utcnow())
-    if host:
+    if grant_id is not None:
+        cursor = conn.execute(
+            "UPDATE secret_grant SET revoked_at = ? WHERE id = ? AND "
+            "name = ? AND revoked_at IS NULL", (now, grant_id, name))
+    elif host:
         cursor = conn.execute(
             "UPDATE secret_grant SET revoked_at = ? WHERE name = ? AND "
             "host = ? AND revoked_at IS NULL", (now, name, host))
@@ -349,20 +481,30 @@ def revoke(conn, name: str, host: str | None = None) -> int:
     return cursor.rowcount
 
 
-def live_grant(conn, name: str, host: str, mutating: bool):
+def live_grant(conn, name: str, host: str, mutating: bool,
+               profile: str | None = None):
     """The approval that covers this call, if there is one.
 
     A grant that covers writing covers reading too — nobody approving a POST
     means to withhold the GET. The reverse is not true, which is the point of
     keeping the two apart.
+
+    `profile` narrows a SIGNING call to the approvals that reach it. More than
+    one can be live at once — a standing approval scoped to one job's
+    profiles, and an interactive one from a prompt answered five minutes ago —
+    so the rows are walked rather than the first one taken.
     """
     now = stamp(utcnow())
-    return conn.execute(
+    rows = conn.execute(
         "SELECT * FROM secret_grant "
         "WHERE name = ? AND host = ? AND mutating >= ? AND revoked_at IS NULL "
         "  AND expires_at > ? AND ceiling_at > ? "
-        "ORDER BY mutating, expires_at DESC LIMIT 1",
-        (name, host, int(mutating), now, now)).fetchone()
+        "ORDER BY mutating, expires_at DESC",
+        (name, host, int(mutating), now, now)).fetchall()
+    for row in rows:
+        if grant_covers(row, profile):
+            return row
+    return None
 
 
 def grants(conn, *, live_only: bool = True) -> list[dict]:
@@ -1351,7 +1493,10 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
 
         # A SIGNATURE IS A USE. There is no host to bind it to, so the grant is
         # the whole control here and it is required exactly as for a request.
-        approval = live_grant(conn, name, SIGN_SCOPE, True)
+        # The PROFILE is part of the question: a standing approval names the
+        # profiles it covers, so one job's unattended approval is not a
+        # signing oracle for every other profile on the same credential.
+        approval = live_grant(conn, name, SIGN_SCOPE, True, profile_name)
         if approval is None:
             # ASK THE SAME WAY A REQUEST DOES. Until 2026-09-11 this path only
             # posted a notification carrying the command, so a SIGNATURE — the
@@ -1367,10 +1512,11 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
                                      ended=ended)
             if not allowed:
                 raise Refusal(
-                    f"'{name}' is not approved for signing right now."
+                    f"'{name}' is not approved for signing "
+                    f"'{profile_name}' right now."
                     + _why_not(ended if allowed is not None
                                else {"how": "unasked"},
-                               name, SIGN_SCOPE, True),
+                               name, SIGN_SCOPE, True, profile_name),
                     code="unapproved")
             approval = grant(conn, name, SIGN_SCOPE, mutating=True,
                              source="prompt")
@@ -1410,7 +1556,8 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
             grant_id=approval["id"], status=None, size=len(text),
             duration_ms=int((time.monotonic() - started) * 1000), echoed=False)
     return {"signature": signature, "secret": name, "profile": profile_name,
-            "nonce": context.nonce, "signed_bytes": len(text)}
+            "nonce": context.nonce, "signed_bytes": len(text),
+            "headers": dict(context.headers)}
 
 
 def _record(conn, **row) -> None:
@@ -1627,7 +1774,8 @@ PROMPT_ENDED_SOMEHOW = (" The prompt on the user's desktop was declined or "
                         "went unanswered.")
 
 
-def _why_not(ended: dict, name: str, host: str, mutating: bool) -> str:
+def _why_not(ended: dict, name: str, host: str, mutating: bool,
+             profile: str | None = None) -> str:
     """The second half of an unapproved refusal: what happened, then what to do."""
     how = ended.get("how")
     if how is None:
@@ -1640,6 +1788,22 @@ def _why_not(ended: dict, name: str, host: str, mutating: bool) -> str:
 
     if how in ("denied", "dismissed"):
         return said
+
+    # NOBODY WAS THERE. A prompt that timed out is the signature of work on a
+    # timer, and telling that caller to "ask the user to run" something is
+    # advice for a case that will recur at the same hour tomorrow. Name the
+    # standing approval instead, and say where it is given with a mouse.
+    if how in ("timed-out", "expired"):
+        said += (" Nobody answered, which is what unattended work looks like: "
+                 "a prompt is not a control when there is no one at the "
+                 "keyboard. If this runs on a schedule it wants a STANDING "
+                 "approval — an end date and a written reason instead of a "
+                 "four-hour ceiling"
+                 + (f", scoped to the profiles it needs ('{profile}')"
+                    if profile else "")
+                 + ". Open the xenia report, Credentials, Approve…, or see "
+                   "`xenia grant --help`.")
+
     # QUOTED, because this is an instruction someone pastes. A credential named
     # after a wallet has spaces in it and the signing scope is literally
     # "(sign)", so the unquoted form printed here was a command that fails in
@@ -1744,6 +1908,32 @@ def socket_path() -> str:
     return str(config.broker_socket())
 
 
+class BrokerAlreadyListening(BrokerError, OSError):
+    """Another xenia is already answering on this socket. Not ours to take."""
+
+
+def socket_is_live(path: str, timeout: float = 1.0) -> bool:
+    """Is something ANSWERING at `path`, as opposed to a file left behind?
+
+    The two are indistinguishable by `os.path.exists`, and telling them apart
+    is the whole difference between a restart and a machine where every
+    credentialed call fails. A unix socket whose listener is gone still leaves
+    the file; connecting to it raises ECONNREFUSED.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+    except OSError:
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return True
+
+
 #: The socket contract. A program outside this repo depends on it, so this is
 #: documentation of an interface xenia intends to keep, not a list of what the
 #: code happens to do today.
@@ -1785,6 +1975,7 @@ class Server:
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+        self._inode: int | None = None
         self._slots = threading.Semaphore(MAX_CLIENTS)
 
     def start(self) -> str:
@@ -1795,11 +1986,31 @@ class Server:
         except OSError:
             pass
         if os.path.exists(self.path):
+            # NEVER unlink a socket something is still answering on. Doing that
+            # is how a machine ends up with a live broker nobody can reach:
+            # the second instance unlinks the first's socket, binds a NEW inode
+            # at the same path and then exits, leaving a file that every client
+            # gets ECONNREFUSED from while the first instance listens happily
+            # on an inode with no name. `ss -lx` still shows a LISTEN row at the
+            # path, which is what makes it look like the service is fine.
+            # Measured 2026-09-14 on ptah: every `credentials.fetch` and every
+            # xenia_fetch on the box failed "broker-unreachable" for hours.
+            if socket_is_live(self.path):
+                raise BrokerAlreadyListening(
+                    f"another xenia is already listening on {self.path}; "
+                    "stop it before starting a second one. Nothing was "
+                    "changed, and the running broker still answers.")
             os.unlink(self.path)
 
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(self.path)
         os.chmod(self.path, 0o600)
+        # Which inode we bound, so stop() removes OUR socket and not whatever
+        # is at the path by then. The unlink is the same hazard as the bind.
+        try:
+            self._inode = os.stat(self.path).st_ino
+        except OSError:
+            self._inode = None
         self._sock.listen(8)
         self._running = True
         self._thread = threading.Thread(target=self._accept, daemon=True,
@@ -1815,9 +2026,11 @@ class Server:
             finally:
                 self._sock = None
         try:
-            os.unlink(self.path)
+            if self._inode is not None and os.stat(self.path).st_ino == self._inode:
+                os.unlink(self.path)
         except OSError:
             pass
+        self._inode = None
 
     def _accept(self) -> None:
         while self._running and self._sock is not None:
