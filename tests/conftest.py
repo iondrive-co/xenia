@@ -84,10 +84,13 @@ def site_config(tmp_path, monkeypatch):
 def fake_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
     monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.delenv("XENIA_DB", raising=False)
