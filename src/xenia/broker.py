@@ -419,6 +419,17 @@ def standing(conn, name: str, host: str, *, until: datetime,
             "covers — without them it approves every profile on the "
             "credential for the whole period, which is the thing the ceiling "
             "was stopping")
+    if host == SIGN_SCOPE and profiles:
+        installed = installed_profiles(conn, name)
+        if installed and not any(fnmatch.fnmatchcase(p, pat)
+                                 for p in installed for pat in profiles):
+            shown = ", ".join(installed[:4]) + (
+                f" … ({len(installed)} in all)" if len(installed) > 4 else "")
+            raise ValueError(
+                f"none of the profiles named ({', '.join(profiles)}) is "
+                f"installed on '{name}' — it has {shown}. An approval that "
+                f"covers nothing is a mistake, not a narrow one; "
+                f"'{suggest_profiles(installed)}' would cover the installed set")
     return grant(conn, name, host, mutating=mutating, seconds=seconds,
                  source=source, ceiling_seconds=seconds, profiles=profiles,
                  reason=reason)
@@ -460,6 +471,73 @@ def grant_covers(row, profile: str | None) -> bool:
     if profile is None:
         return False
     return any(fnmatch.fnmatchcase(profile, pattern) for pattern in patterns)
+
+
+def installed_profiles(conn, name: str) -> list[str]:
+    """The signing profiles installed on a credential, by name, sorted."""
+    row = entry(conn, name)
+    if row is None or not row["schemes"]:
+        return []
+    try:
+        held = json.loads(row["schemes"])
+    except (TypeError, ValueError):
+        return []
+    if isinstance(held, dict):
+        return sorted(str(k) for k in held)
+    return sorted(str(x) for x in held) if isinstance(held, list) else []
+
+
+def suggest_profiles(profiles: list[str]) -> str:
+    """One pattern covering the largest family of installed profiles.
+
+    A family shares the text before the first '-': `worker-open-…` and
+    `worker-close-…` beside `sync-job` and `sync-batch` suggest `worker-*`;
+    a lone profile suggests its own name; nothing installed suggests nothing.
+    """
+    if not profiles:
+        return ""
+    if len(profiles) == 1:
+        return profiles[0]
+    families: dict[str, list[str]] = {}
+    for p in profiles:
+        families.setdefault(p.split("-", 1)[0] if "-" in p else p, []).append(p)
+    prefix, members = max(families.items(), key=lambda kv: (len(kv[1]), kv[0]))
+    return members[0] if len(members) == 1 else f"{prefix}-*"
+
+
+def suggest_standing(conn, name: str, host: str) -> dict:
+    """What the Approve form should open WITH, not what it should ask for.
+
+    The answer is already known twice over: the profiles installed on the
+    credential, and any standing approval given for it before — which is the
+    ordinary case after a hard stop revokes one.
+
+    Prefers the most recent standing approval for this credential and host,
+    revoked or not (a revoked approval is usually the one being re-given).
+    Falls back to the installed profiles when there is none, or when the last
+    one reached none of them — a mistake is not offered a second time.
+    """
+    installed = installed_profiles(conn, name)
+    last = conn.execute(
+        "SELECT * FROM secret_grant WHERE name = ? AND host = ? "
+        "AND source = 'standing' ORDER BY granted_at DESC, id DESC LIMIT 1",
+        (name, host)).fetchone()
+    if last is not None:
+        covers = grant_profiles(last) or []
+        reaches = not installed or not covers or any(
+            fnmatch.fnmatchcase(p, pat) for p in installed for pat in covers)
+        return {"until": (last["expires_at"] or "")[:10],
+                "profiles": ", ".join(covers) if reaches else suggest_profiles(installed),
+                "reason": last["reason"] or "",
+                "writes": bool(last["mutating"]),
+                "from": "last" if reaches else "installed",
+                "installed": len(installed)}
+    return {"until": "",
+            "profiles": suggest_profiles(installed) if host == SIGN_SCOPE else "",
+            "reason": "",
+            "writes": host == SIGN_SCOPE,
+            "from": "installed" if (installed and host == SIGN_SCOPE) else "none",
+            "installed": len(installed)}
 
 
 def revoke(conn, name: str, host: str | None = None, *,
@@ -1272,6 +1350,9 @@ def fetch(conn, request: dict, *, store=None, opener=None,
     except Refusal as refusal:
         return refuse(refusal)
     except vault.VaultError as exc:
+        text = str(exc)
+        if "locked" in text.lower():
+            return refuse(Refusal("the keyring is locked", code="unavailable"))
         return refuse(Refusal(
             f"the credential store would not answer: {exc}", code="unavailable"))
 
@@ -1535,6 +1616,9 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
     except Refusal as refusal:
         return refuse(refusal)
     except vault.VaultError as exc:
+        text = str(exc)
+        if "locked" in text.lower():
+            return refuse(Refusal("the keyring is locked", code="unavailable"))
         return refuse(Refusal(f"the credential store would not answer: {exc}",
                               code="unavailable"))
 

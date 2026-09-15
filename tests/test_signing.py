@@ -253,11 +253,11 @@ def test_the_timestamp_header_carries_the_instant_that_was_signed():
     """The far side re-derives the message from the header, so the value sent
     has to be the value signed — not one the caller guessed a moment before."""
     ctx = _ctx("secret", scheme="hmac", template="{method}{path}{ts_ms}",
-               timestamp_header="X-TS")
+               timestamp_header="X-AUTH-TIMESTAMP")
 
     signing.hmac_scheme(ctx)
 
-    assert ctx.headers["X-TS"] == "1757000000000"
+    assert ctx.headers["X-AUTH-TIMESTAMP"] == "1757000000000"
 
 
 def test_no_timestamp_header_is_added_unless_the_profile_asks():

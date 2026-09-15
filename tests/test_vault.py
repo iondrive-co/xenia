@@ -130,6 +130,18 @@ def test_a_dismissed_prompt_is_an_error_and_not_a_missing_value():
         store(bus).get("pat")
 
 
+def test_an_unanswered_prompt_is_reported_as_keyring_locked(monkeypatch):
+    monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.05)
+    bus = FakeBus(locked=True, prompts=True)
+    bus.items["pat"] = b"value"
+    bus.call = lambda dest, path, iface, member, sig="", body=(), timeout=None: (
+        [] if member == "Prompt" else FakeBus.call(bus, dest, path, iface, member, sig, body, timeout)
+    )
+
+    with pytest.raises(vault.VaultError, match="the keyring is locked"):
+        store(bus).get("pat")
+
+
 def test_the_connection_is_closed_even_when_the_call_fails():
     bus = FakeBus()
 

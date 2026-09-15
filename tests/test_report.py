@@ -506,3 +506,23 @@ def test_the_page_revokes_an_approval_by_id(served, store):
     remaining = rows[0]["approved_for"]
     assert len(remaining) == 1
     assert remaining[0]["host"] == "(sign)"
+
+
+def test_the_approve_form_can_ask_what_to_prefill(served, conn):
+    """The page asks the broker what it already knows about the credential."""
+    import urllib.parse
+    from xenia import broker
+
+    broker.register(conn, "service-auth", backend="memory", hosts=[], methods=["GET"])
+    for p in ("worker-open", "worker-close", "sync-job"):
+        broker.set_profile(conn, "service-auth", p, {"scheme": "hmac", "template": "{body}"})
+    conn.commit()
+
+    q = urllib.parse.urlencode({"name": "service-auth", "host": broker.SIGN_SCOPE})
+    got = api(served, f"/api/grants/suggest?{q}")
+    assert got["profiles"] == "worker-*"
+    assert got["from"] == "installed"
+    assert got["writes"] is True
+
+    unknown = api(served, "/api/grants/suggest?name=nobody&host=x")
+    assert unknown["profiles"] == "" and unknown["from"] == "none"
