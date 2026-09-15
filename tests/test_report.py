@@ -437,12 +437,12 @@ def test_the_page_reports_what_a_standing_approval_covers(served, store):
     post(served, "/api/secrets/add", {"name": "pat", "value": TYPED})
     post(served, "/api/grants/approve", {
         "name": "pat", "host": "(sign)", "until": "2026-12-08", "writes": True,
-        "profiles": "i079-open-*, i079-close-*", "reason": "the 4h timer"})
+        "profiles": "worker-open-*, worker-close-*", "reason": "the 4h timer"})
 
     rows = api(served, "/api/secrets")["rows"]
     grant = [g for r in rows for g in r["approved_for"]][0]
 
-    assert grant["profiles"] == ["i079-close-*", "i079-open-*"]
+    assert grant["profiles"] == ["worker-close-*", "worker-open-*"]
 
 
 def test_the_page_revokes_an_approval(served, store):
@@ -490,7 +490,7 @@ def test_the_page_revokes_an_approval_by_id(served, store):
         "writes": True, "reason": "a timer"})
     post(served, "/api/grants/approve", {
         "name": "pat", "host": "(sign)", "until": "2026-12-08",
-        "writes": True, "profiles": "i079-*", "reason": "signing timer"})
+        "writes": True, "profiles": "worker-*", "reason": "signing timer"})
 
     rows = api(served, "/api/secrets")["rows"]
     grants = rows[0]["approved_for"]
@@ -506,3 +506,24 @@ def test_the_page_revokes_an_approval_by_id(served, store):
     remaining = rows[0]["approved_for"]
     assert len(remaining) == 1
     assert remaining[0]["host"] == "(sign)"
+
+
+def test_the_approve_form_can_ask_what_to_prefill(served, conn):
+    """2026-09-15: the form opened empty and an approval covering nothing was saved. The page
+    now asks the broker what it already knows about the credential."""
+    import urllib.parse
+    from xenia import broker
+
+    broker.register(conn, "service-auth", backend="memory", hosts=[], methods=["GET"])
+    for p in ("worker-open", "worker-close", "sync-job"):
+        broker.set_profile(conn, "service-auth", p, {"scheme": "hmac", "template": "{body}"})
+    conn.commit()
+
+    q = urllib.parse.urlencode({"name": "service-auth", "host": broker.SIGN_SCOPE})
+    got = api(served, f"/api/grants/suggest?{q}")
+    assert got["profiles"] == "worker-*"
+    assert got["from"] == "installed"
+    assert got["writes"] is True
+
+    unknown = api(served, "/api/grants/suggest?name=nobody&host=x")
+    assert unknown["profiles"] == "" and unknown["from"] == "none"

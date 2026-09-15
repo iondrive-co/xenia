@@ -1200,7 +1200,7 @@ def test_nothing_is_signed_for_a_request_that_is_refused(wired_policy, monkeypat
     """A signature over a body asserts that body is final.
 
     A check that ran after signing would already have produced a valid
-    signature for an order nobody approved — and once computed, that exists.
+    signature for a request nobody approved — and once computed, that exists.
     """
     signed = []
     real = broker.signing.sign
@@ -1219,13 +1219,13 @@ def test_the_gate_sees_the_request_after_substitution(conn):
     two different requests."""
     broker.register(conn, "api-key", backend="memory", hosts=[HOST],
                     methods=["POST"])
-    broker.set_body_policy(conn, "api-key", {"actions": {"order": {
-        "methods": ["POST"], "paths": ["/order"],
+    broker.set_body_policy(conn, "api-key", {"actions": {"dispatch": {
+        "methods": ["POST"], "paths": ["/dispatch"],
         "in": {"key": ["the-real-value"]}}}})
     broker.grant(conn, "api-key", HOST, mutating=True, source="test")
 
     answer = broker.fetch(conn, {
-        "secret": "api-key", "method": "POST", "url": f"https://{HOST}/order",
+        "secret": "api-key", "method": "POST", "url": f"https://{HOST}/dispatch",
         "headers": {"Content-Type": "application/json"},
         "body": {"key": broker.PLACEHOLDER},
     }, store=Store({"api-key": "the-real-value"}), opener=Opener(), notify=False)
@@ -1254,7 +1254,7 @@ def test_a_credential_with_no_body_policy_is_unaffected(wired):
     assert call(wired)["status"] == 200
 
 
-def test_a_form_encoded_order_is_checked_and_signed(conn):
+def test_a_form_encoded_request_is_checked_and_signed(conn):
     """Parameters in the query with the signature beside them: a layer that
     only read JSON would leave this shape unchecked."""
     broker.register(conn, "form-api", backend="memory", hosts=[HOST],
@@ -1864,7 +1864,7 @@ def test_a_standing_approval_for_signing_must_name_its_profiles(wired):
     with pytest.raises(ValueError, match="name the profiles"):
         broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                         until=broker.utcnow() + timedelta(days=30),
-                        reason="unattended trading")
+                        reason="unattended sync")
 
 
 def test_a_standing_approval_is_bounded_however_far_out_it_asks(wired):
@@ -1891,16 +1891,16 @@ def test_a_standing_approval_expires_rather_than_sliding(wired):
 
 
 def test_a_scoped_standing_approval_signs_only_what_it_names(wired):
-    broker.set_profile(wired, "gitlab-pat", "i079-open-BTC",
+    broker.set_profile(wired, "gitlab-pat", "worker-open",
                        {"scheme": "hmac", "template": "{body}"})
     broker.set_profile(wired, "gitlab-pat", "payouts",
                        {"scheme": "hmac", "template": "{body}"})
     broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                     until=broker.utcnow() + timedelta(days=85),
-                    profiles=["i079-*"], reason="I-079 trades on a 4h timer")
+                    profiles=["worker-*"], reason="worker timer")
 
     named = broker.sign_only(
-        wired, {"secret": "gitlab-pat", "profile": "i079-open-BTC",
+        wired, {"secret": "gitlab-pat", "profile": "worker-open",
                 "payload": {"a": 1}}, store=Store(), notify=False)
     other = broker.sign_only(
         wired, {"secret": "gitlab-pat", "profile": "payouts",
@@ -1919,10 +1919,10 @@ def test_an_unanswered_prompt_says_a_standing_approval_is_the_fix(wired):
     """
     said = broker._why_not({"how": "timed-out", "seconds": 25},
                            "gitlab-pat", broker.SIGN_SCOPE, True,
-                           "i079-open-BTC")
+                           "worker-open")
 
     assert "STANDING" in said
-    assert "i079-open-BTC" in said
+    assert "worker-open" in said
 
 
 def test_an_interactive_approval_still_covers_every_profile(wired):
@@ -1954,31 +1954,31 @@ def test_an_interactive_approval_does_not_revoke_a_standing_approval(wired):
     approval given for unattended work on a timer."""
     broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                     until=broker.utcnow() + timedelta(days=85),
-                    profiles=["i079-*"], reason="unattended trading")
+                    profiles=["worker-*"], reason="unattended sync")
     broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
                  source="prompt")
 
     standing_row = broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE,
-                                     True, "i079-open-BTC")
+                                     True, "worker-open")
     assert standing_row is not None
     assert standing_row["source"] == "standing"
 
 
 def test_multiple_standing_approvals_with_different_profiles_coexist(wired):
-    broker.set_profile(wired, "gitlab-pat", "i079-open-BTC",
+    broker.set_profile(wired, "gitlab-pat", "worker-open",
                        {"scheme": "hmac", "template": "{body}"})
     broker.set_profile(wired, "gitlab-pat", "payouts",
                        {"scheme": "hmac", "template": "{body}"})
 
     broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                     until=broker.utcnow() + timedelta(days=85),
-                    profiles=["i079-*"], reason="I-079")
+                    profiles=["worker-*"], reason="worker batch")
     broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                     until=broker.utcnow() + timedelta(days=85),
                     profiles=["payouts"], reason="payouts")
 
     named1 = broker.sign_only(
-        wired, {"secret": "gitlab-pat", "profile": "i079-open-BTC",
+        wired, {"secret": "gitlab-pat", "profile": "worker-open",
                 "payload": {"a": 1}}, store=Store(), notify=False)
     named2 = broker.sign_only(
         wired, {"secret": "gitlab-pat", "profile": "payouts",
@@ -1991,28 +1991,28 @@ def test_multiple_standing_approvals_with_different_profiles_coexist(wired):
 def test_reissuing_a_standing_approval_for_the_same_scope_replaces_it(wired):
     g1 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                          until=broker.utcnow() + timedelta(days=10),
-                         profiles=["i079-*"], reason="old reason")
+                         profiles=["worker-*"], reason="old reason")
     g2 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                          until=broker.utcnow() + timedelta(days=85),
-                         profiles=["i079-*"], reason="new reason")
+                         profiles=["worker-*"], reason="new reason")
 
     old = wired.execute("SELECT revoked_at FROM secret_grant WHERE id = ?",
                         (g1["id"],)).fetchone()
     assert old["revoked_at"] is not None
-    cur = broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "i079-open")
+    cur = broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "worker-open")
     assert cur["id"] == g2["id"]
 
 
 def test_revoking_by_grant_id_leaves_other_grants_live(wired):
     g1 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                          until=broker.utcnow() + timedelta(days=85),
-                         profiles=["i079-*"], reason="I-079")
+                         profiles=["worker-*"], reason="worker batch")
     g2 = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
                          until=broker.utcnow() + timedelta(days=85),
                          profiles=["payouts"], reason="payouts")
 
     assert broker.revoke(wired, "gitlab-pat", grant_id=g1["id"]) == 1
-    assert broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "i079-open") is None
+    assert broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "worker-open") is None
     assert broker.live_grant(wired, "gitlab-pat", broker.SIGN_SCOPE, True, "payouts") is not None
 
 
@@ -2033,19 +2033,118 @@ def test_stopping_an_unstarted_broker_does_not_unlink_active_socket(tmp_path):
 
 
 def test_sign_only_returns_headers_generated_by_profile(wired):
-    broker.set_profile(wired, "gitlab-pat", "bm",
+    broker.set_profile(wired, "gitlab-pat", "auth-service",
                        {"scheme": "hmac", "template": "{method}{ts_ms}",
-                        "timestamp_header": "BM-AUTH-TIMESTAMP",
-                        "api_key_header": "BM-AUTH-APIKEY",
+                        "timestamp_header": "X-AUTH-TIMESTAMP",
+                        "api_key_header": "X-AUTH-APIKEY",
                         "key_id": "test-key-id"})
     broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
                  source="prompt")
 
     res = broker.sign_only(
-        wired, {"secret": "gitlab-pat", "profile": "bm", "payload": {}},
+        wired, {"secret": "gitlab-pat", "profile": "auth-service", "payload": {}},
         store=Store(), notify=False)
 
     assert res.get("signature")
     assert "headers" in res
-    assert res["headers"]["BM-AUTH-APIKEY"] == "test-key-id"
-    assert "BM-AUTH-TIMESTAMP" in res["headers"]
+    assert res["headers"]["X-AUTH-APIKEY"] == "test-key-id"
+    assert "X-AUTH-TIMESTAMP" in res["headers"]
+
+
+# -- the Approve form knows the answer; a standing approval must reach a real profile ------
+#
+# 2026-09-15: the form opened empty, the operator saved `a` / `a`, and xenia accepted a
+# signing approval that covered none of the 318 profiles installed an hour before.
+
+def test_a_standing_signing_approval_must_reach_an_installed_profile(wired):
+    broker.set_profile(wired, "gitlab-pat", "worker-open", {"scheme": "hmac", "template": "{body}"})
+    broker.set_profile(wired, "gitlab-pat", "worker-close", {"scheme": "hmac", "template": "{body}"})
+    with pytest.raises(ValueError, match="covers nothing") as refused:
+        broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                        until=broker.utcnow() + timedelta(days=30),
+                        profiles=["a"], reason="a")
+    assert "worker-*" in str(refused.value), "the refusal names the pattern that would have worked"
+    row = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                          until=broker.utcnow() + timedelta(days=30),
+                          profiles=["worker-*"], reason="worker on a 4h timer")
+    assert broker.grant_profiles(row) == ["worker-*"]
+
+
+def test_a_standing_signing_approval_before_any_profile_is_installed_is_allowed(wired):
+    """The approval may legitimately come before the install; there is nothing to check against."""
+    row = broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE,
+                          until=broker.utcnow() + timedelta(days=30),
+                          profiles=["worker-*"], reason="installing next")
+    assert broker.grant_profiles(row) == ["worker-*"]
+
+
+def test_suggest_profiles_names_the_largest_family():
+    assert broker.suggest_profiles([]) == ""
+    assert broker.suggest_profiles(["default"]) == "default"
+    assert broker.suggest_profiles(
+        ["worker-close", "worker-open", "worker-process", "sync-job", "sync-batch"]) == "worker-*"
+    assert broker.suggest_profiles(["sync-job", "payouts"]) in ("sync-job", "payouts")
+
+
+def test_the_approve_form_is_prefilled_from_the_installed_profiles(wired):
+    for p in ("worker-open", "worker-close", "sync-job"):
+        broker.set_profile(wired, "gitlab-pat", p, {"scheme": "hmac", "template": "{body}"})
+    got = broker.suggest_standing(wired, "gitlab-pat", broker.SIGN_SCOPE)
+    assert (got["profiles"], got["from"], got["writes"], got["installed"]) == ("worker-*", "installed", True, 3)
+    assert got["until"] == "" and got["reason"] == ""
+
+
+def test_the_approve_form_is_prefilled_from_the_last_standing_approval(wired):
+    broker.set_profile(wired, "gitlab-pat", "worker-open", {"scheme": "hmac", "template": "{body}"})
+    until = broker.utcnow() + timedelta(days=40)
+    broker.standing(wired, "gitlab-pat", broker.SIGN_SCOPE, until=until,
+                    profiles=["worker-*"], reason="plan 28 live")
+    broker.revoke(wired, "gitlab-pat")                      # the hard-stop case: re-giving it
+    got = broker.suggest_standing(wired, "gitlab-pat", broker.SIGN_SCOPE)
+    assert got["from"] == "last"
+    assert got["profiles"] == "worker-*"
+    assert got["reason"] == "plan 28 live"
+    assert got["until"] == broker.stamp(until)[:10]
+    assert got["writes"] is True
+
+
+def test_a_last_approval_that_reached_nothing_is_not_offered_again(wired):
+    for p in ("worker-open", "worker-close"):
+        broker.set_profile(wired, "gitlab-pat", p, {"scheme": "hmac", "template": "{body}"})
+    # written straight through grant(): standing() refuses this shape now, but old rows exist
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True, seconds=3600,
+                 source="standing", ceiling_seconds=3600, profiles=["a"], reason="a")
+    got = broker.suggest_standing(wired, "gitlab-pat", broker.SIGN_SCOPE)
+    assert got["profiles"] == "worker-*"
+    assert got["from"] == "installed"
+
+
+def test_a_plain_host_gets_no_profile_suggestion(wired):
+    got = broker.suggest_standing(wired, "gitlab-pat", HOST)
+    assert got == {"until": "", "profiles": "", "reason": "", "writes": False,
+                   "from": "none", "installed": 0}
+
+
+def test_when_the_keyring_is_locked_fetch_says_so_plainly(wired):
+    class LockedStore:
+        def get(self, name):
+            raise vault.VaultError("the keyring is locked")
+
+    allow(wired)
+    answer = call(wired, store=LockedStore())
+    assert answer["code"] == "unavailable"
+    assert answer["refused"] == "the keyring is locked"
+
+
+def test_when_the_keyring_is_locked_sign_says_so_plainly(wired):
+    class LockedStore:
+        def get(self, name):
+            raise vault.VaultError("the keyring is locked")
+
+    broker.set_profile(wired, "gitlab-pat", "default", {"scheme": "hmac", "template": "{body}"})
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True, source="prompt")
+    answer = broker.sign_only(
+        wired, {"secret": "gitlab-pat", "profile": "default", "payload": {}},
+        store=LockedStore(), notify=False)
+    assert answer["code"] == "unavailable"
+    assert answer["refused"] == "the keyring is locked"

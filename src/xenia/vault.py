@@ -25,8 +25,10 @@ from . import config
 APP = "xenia"
 
 #: How long to wait on a provider that has put a dialog in front of the user.
-#: Long, because the thing on the other side is somebody typing a password.
-PROMPT_TIMEOUT = 120.0
+#: Kept inside an agent's read timeout (see broker.CLIENT_READ_TIMEOUT) so an
+#: unattended run or ignored unlock prompt refuses as "the keyring is locked"
+#: rather than timing out as "sent-outcome-unknown".
+PROMPT_TIMEOUT = float(os.environ.get("XENIA_PROMPT_TIMEOUT", 15.0))
 
 #: How long to wait on a provider that should answer immediately.
 CALL_TIMEOUT = 10.0
@@ -204,8 +206,7 @@ class SecretService:
             return unlocked[0]
         if still_locked:
             raise VaultError(
-                f"'{name}' is in a locked collection and the unlock was "
-                f"dismissed or timed out")
+                f"'{name}' is in a locked collection: the keyring is locked")
         return None
 
     def _unlock(self, conn, paths: list[str]) -> None:
@@ -235,11 +236,9 @@ class SecretService:
         conn.call(SERVICE, path, I_PROMPT, "Prompt", "s", [""],
                   timeout=CALL_TIMEOUT)
         if not done.wait(PROMPT_TIMEOUT):
-            raise VaultError(
-                f"the credential store asked for an unlock and nothing "
-                f"answered within {int(PROMPT_TIMEOUT)}s")
+            raise VaultError("the keyring is locked")
         if outcome["dismissed"]:
-            raise VaultError("the unlock prompt was dismissed")
+            raise VaultError("the unlock prompt was dismissed: the keyring is locked")
 
 
 def _session_bus():

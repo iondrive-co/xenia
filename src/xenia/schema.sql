@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS secret_grant (
     -- carries an end date and a written reason, and for signing it names the
     -- profiles it covers, so the length is paid for in narrowness.
     source       TEXT    NOT NULL,
-    -- JSON list of signing-profile patterns this grant covers ('i079-*').
+    -- JSON list of signing-profile patterns this grant covers ('worker-*').
     -- NULL means every profile, which is what an interactive approval gives
     -- and what a standing one should not.
     profiles     TEXT,

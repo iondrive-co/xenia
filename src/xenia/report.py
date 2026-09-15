@@ -204,6 +204,13 @@ class Report:
                     status=one("status"))}
             if path == "/api/secrets":
                 return {"rows": readonly.credentials(conn)}
+            if path == "/api/grants/suggest":
+                # What the Approve form opens filled with: the last standing
+                # approval for this credential and host, or the pattern that
+                # covers its installed profiles. See broker.suggest_standing.
+                from . import broker
+                return broker.suggest_standing(conn, one("name") or "",
+                                               one("host") or "")
             if path == "/api/disk":
                 return {"rows": readonly.disk_churn(
                     conn, since=one("since"), repo=one("repo"),
@@ -482,7 +489,7 @@ _PAGE = r"""<!doctype html>
   <input id="g-until" autocomplete="off" spellcheck="false"
     placeholder="Until — 2026-12-08">
   <input id="g-profiles" autocomplete="off" spellcheck="false"
-    placeholder="Signing profiles — i079-*">
+    placeholder="Signing profiles — worker-*">
   <input id="g-reason" autocomplete="off" placeholder="Why this runs unattended">
   <label style="color:var(--muted);font-size:12px">
     <input type="checkbox" id="g-writes" style="min-width:auto"> may write/sign
@@ -779,20 +786,42 @@ async function saveSecret(){
 
 let grantFor = null;
 
-function showGrantForm(name, host, signs){
+async function showGrantForm(name, host, signs){
   grantFor = name;
   el('grantForm').hidden = false;
   el('g-title').textContent = `Standing approval — ${name}`;
-  el('g-host').value = signs ? '(sign)' : (host || '');
+  const scope = signs ? '(sign)' : (host || '');
+  el('g-host').value = scope;
   el('g-until').value = '';
   el('g-profiles').value = '';
   el('g-reason').value = '';
   el('g-writes').checked = !!signs;
+  let from = 'none', got = null;
+  try{
+    const r = await fetch('/api/grants/suggest?' + new URLSearchParams(
+      {t:T, name, host:scope}));
+    got = await r.json();
+  }catch(err){ got = null; }
+  if(got && !got.error){
+    el('g-until').value = got.until || '';
+    el('g-profiles').value = got.profiles || '';
+    el('g-reason').value = got.reason || '';
+    if(got.writes != null) el('g-writes').checked = !!got.writes;
+    from = got.from || 'none';
+  }
+  const where = from === 'last'
+    ? ' The boxes are filled from the last standing approval given for this'
+      + ' credential — check the date, then save.'
+    : from === 'installed'
+      ? ` The profiles box is filled with the pattern covering the ${got.installed}`
+        + ' profile(s) installed on this credential; add the end date and why.'
+      : '';
   note('A standing approval is for work that runs when you are not here: it'
     + ' lasts until the date you give instead of the usual four hours, and no'
     + ' prompt is raised while it holds. Say why, and for signing say which'
-    + ' profiles — a long approval has to be a narrow one.');
-  el('g-until').focus();
+    + ' profiles — a long approval has to be a narrow one.' + where);
+  const first = ['g-until','g-profiles','g-reason'].find(id => !el(id).value.trim());
+  el(first || 'g-until').focus();
 }
 
 async function saveGrant(){

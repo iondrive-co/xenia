@@ -149,12 +149,8 @@ def hmac_scheme(ctx: Context) -> str:
                    message.encode(),
                    _digest(ctx.config.get("digest", "sha256"))).digest()
 
-    # THE PUBLIC HALF OF A KEY PAIR. Most REST venues send an identifier
-    # beside the signature — BTC Markets' BM-AUTH-APIKEY, Coinbase's CB-ACCESS-KEY
-    # — and it is an IDENTIFIER, not a secret: it travels in the clear on every
-    # request and is useless without the private half. SigV4 already has this as
-    # `key_id`; without it here the caller had to paste the public key into
-    # every call, so a stored credential was not on its own enough to make one.
+    # THE PUBLIC HALF OF A KEY PAIR. Most REST services send an identifier
+    # beside the signature
     api_header = ctx.config.get("api_key_header")
     if api_header:
         key_id = ctx.extras.get("key_id") or ctx.config.get("key_id")
@@ -186,7 +182,7 @@ def _key_bytes(secret: str, encoding: str) -> bytes:
         except Exception as exc:
             raise SchemeError(
                 "this profile says the credential is base64, and it does not "
-                "decode — check which half of the venue's key pair is stored",
+                "decode — check which half of the service's key pair is stored",
                 code="off-policy") from exc
     if encoding == "hex":
         try:
@@ -384,7 +380,7 @@ def _binding(spec: dict, payload: dict, ctx: Context, depth: int = 0) -> Any:
 
     Input paths, literals, nonce, MessagePack, fixed-width integers and Keccak
     cover typed messages that commit to structured actions. No evaluation,
-    imports, venue knowledge or network calls come from configuration.
+    imports, service knowledge or network calls come from configuration.
     """
     if depth > 8 or not isinstance(spec, dict) or len(spec) != 1:
         raise SchemeError("invalid typed-signing message binding")

@@ -1135,7 +1135,7 @@ def _usage() -> int:
                                   30m, and no approval outlives a 4h ceiling
 
   xenia grant NAME --host H --write --until 2026-12-08
-                        --profiles 'i079-*' --reason 'why'
+                        --profiles 'worker-*' --reason 'why'
                                   a STANDING approval, for work that runs when
                                   nobody is at the keyboard. A prompt is not a
                                   control at 03:00 — it times out and the call

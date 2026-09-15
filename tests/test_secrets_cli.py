@@ -629,7 +629,7 @@ NESTED_PROFILE = {
 }
 
 
-def profile_on(cli, name="wallet"):
+def profile_on(cli, name="service-key"):
     conn = cli.db()
     row = broker.entry(conn, name)
     held = broker.profiles_for(row, "SIGN")
@@ -643,21 +643,21 @@ def test_a_nested_signing_profile_is_stored_as_json_not_as_strings(cli):
     Stringifying them would store a profile the scheme then refuses at signing
     time — the failure arriving one operator step after the mistake.
     """
-    assert cli("secret", "add", "wallet", "--host", "api.example.com",
+    assert cli("secret", "add", "service-key", "--host", "api.example.com",
                stdin=VALUE) == 0
-    assert cli("secret", "sign", "wallet", "l1",
+    assert cli("secret", "sign", "service-key", "dispatch",
                stdin=json.dumps(NESTED_PROFILE)) == 0
 
-    held = profile_on(cli)["l1"]
+    held = profile_on(cli)["dispatch"]
     assert held["domain"] == NESTED_PROFILE["domain"]
     assert held["types"] == NESTED_PROFILE["types"]
     assert held["payload_policy"] == NESTED_PROFILE["payload_policy"]
 
 
 def test_the_flat_form_still_works(cli):
-    assert cli("secret", "add", "wallet", "--host", "api.example.com",
+    assert cli("secret", "add", "service-key", "--host", "api.example.com",
                stdin=VALUE) == 0
-    assert cli("secret", "sign", "wallet", "hm", "scheme=hmac",
+    assert cli("secret", "sign", "service-key", "hm", "scheme=hmac",
                "template={ts}{body}", "digest=sha256") == 0
 
     held = profile_on(cli)["hm"]
@@ -666,11 +666,11 @@ def test_the_flat_form_still_works(cli):
 
 
 def test_a_profile_that_is_not_json_is_refused_rather_than_stored(cli):
-    assert cli("secret", "add", "wallet", "--host", "api.example.com",
+    assert cli("secret", "add", "service-key", "--host", "api.example.com",
                stdin=VALUE) == 0
 
-    assert cli("secret", "sign", "wallet", "l1", stdin="not json") == 2
-    assert cli("secret", "sign", "wallet", "l1", stdin="[1, 2]") == 2
+    assert cli("secret", "sign", "service-key", "dispatch", stdin="not json") == 2
+    assert cli("secret", "sign", "service-key", "dispatch", stdin="[1, 2]") == 2
     assert profile_on(cli) == {}
 
 
@@ -701,12 +701,12 @@ def test_until_refuses_something_that_is_neither():
 def test_granting_for_signing_infers_mutating_even_without_write_flag(cli):
     """Signing is inherently mutating; omitting --write must not create a
     grant with mutating=0 that is never matched."""
-    assert cli("secret", "add", "wallet", "--host", "api.example.com", stdin=VALUE) == 0
-    assert cli("secret", "sign", "wallet", "l1", "scheme=hmac", "template={body}") == 0
+    assert cli("secret", "add", "service-key", "--host", "api.example.com", stdin=VALUE) == 0
+    assert cli("secret", "sign", "service-key", "dispatch", "scheme=hmac", "template={body}") == 0
 
-    status = cli("grant", "wallet", "--host", "(sign)", "--until", "2026-12-08",
-                 "--profiles", "l1", "--reason", "trading")
+    status = cli("grant", "service-key", "--host", "(sign)", "--until", "2026-12-08",
+                 "--profiles", "dispatch", "--reason", "batch processing")
 
     assert status == 0
-    row = cli.db().execute("SELECT mutating FROM secret_grant WHERE name = 'wallet'").fetchone()
+    row = cli.db().execute("SELECT mutating FROM secret_grant WHERE name = 'service-key'").fetchone()
     assert row["mutating"] == 1

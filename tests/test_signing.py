@@ -207,7 +207,7 @@ def test_profile_bound_eip712_signing_commits_to_the_checked_message():
 
 # -- key encoding and the timestamp that has to match ----------------------
 #
-# A venue that issues a base64 key signs with the DECODED bytes. Signing the
+# A service that issues a base64 key signs with the DECODED bytes. Signing the
 # text of one produces a valid-looking signature over the wrong key, which the
 # far side rejects with nothing to say why.
 
@@ -253,11 +253,11 @@ def test_the_timestamp_header_carries_the_instant_that_was_signed():
     """The far side re-derives the message from the header, so the value sent
     has to be the value signed — not one the caller guessed a moment before."""
     ctx = _ctx("secret", scheme="hmac", template="{method}{path}{ts_ms}",
-               timestamp_header="BM-AUTH-TIMESTAMP")
+               timestamp_header="X-AUTH-TIMESTAMP")
 
     signing.hmac_scheme(ctx)
 
-    assert ctx.headers["BM-AUTH-TIMESTAMP"] == "1757000000000"
+    assert ctx.headers["X-AUTH-TIMESTAMP"] == "1757000000000"
 
 
 def test_no_timestamp_header_is_added_unless_the_profile_asks():
@@ -274,23 +274,23 @@ def test_the_timestamp_variable_may_be_seconds_instead():
 
 
 def test_the_public_half_of_a_key_pair_is_placed_for_the_caller():
-    """Most REST venues send an identifier beside the signature. It is public —
+    """Most REST services send an identifier beside the signature. It is public —
     it travels in the clear on every request — so it belongs in the profile,
     not pasted into every call by whoever is making one."""
     ctx = _ctx("secret", scheme="hmac", template="{method}{path}",
-               api_key_header="BM-AUTH-APIKEY",
+               api_key_header="X-AUTH-APIKEY",
                key_id="765be18b-0000-0000-0000-000000000000")
 
     signature = signing.hmac_scheme(ctx)
 
-    assert ctx.headers["BM-AUTH-APIKEY"] == "765be18b-0000-0000-0000-000000000000"
+    assert ctx.headers["X-AUTH-APIKEY"] == "765be18b-0000-0000-0000-000000000000"
     assert len(signature) > 0
 
 
 def test_an_api_key_header_with_no_key_is_refused_rather_than_sent_empty():
     """An empty identifier is a 401 the caller has to guess the cause of."""
     ctx = _ctx("secret", scheme="hmac", template="{method}",
-               api_key_header="BM-AUTH-APIKEY")
+               api_key_header="X-AUTH-APIKEY")
 
     with pytest.raises(signing.SchemeError, match="no 'key_id'"):
         signing.hmac_scheme(ctx)
