@@ -74,8 +74,8 @@ class FakeBus:
         raise AssertionError(f"unexpected call: {interface}.{member}")
 
 
-def store(bus):
-    return vault.SecretService(connect=lambda: bus)
+def store(bus, gate=None):
+    return vault.SecretService(connect=lambda: bus, gate=gate or vault.UnlockGate())
 
 
 def test_round_trips_a_value_through_the_secret_service():
@@ -142,7 +142,102 @@ def test_an_unanswered_prompt_is_reported_as_keyring_locked(monkeypatch):
         store(bus).get("pat")
 
 
-def test_the_connection_is_closed_even_when_the_call_fails():
+class PromptBus(FakeBus):
+
+    def __init__(self, shared_items, shared_state):
+        self._state = shared_state
+        super().__init__(locked=True, prompts=True)
+        self.items = shared_items
+        self.dismissed = False
+
+    @property
+    def locked(self):
+        return self._state["locked"]
+
+    @locked.setter
+    def locked(self, value):
+        if value is False or "locked" not in self._state:
+            self._state["locked"] = value
+
+    def call(self, dest, path, interface, member, signature="", body=(), timeout=None):
+        if member == "Prompt":
+            self.calls.append((interface, member, body))
+            return []
+        if member == "Dismiss":
+            self.calls.append((interface, member, body))
+            self.dismissed = True
+            self._signals[(path, vault.I_PROMPT, "Completed")](type("M", (), {"body": [True, None]})())
+            return []
+        return FakeBus.call(self, dest, path, interface, member, signature, body, timeout)
+
+    def answer(self, path="/prompt/1"):
+        self.locked = False
+        self._signals[(path, vault.I_PROMPT, "Completed")](type("M", (), {"body": [False, None]})())
+
+
+def _buses():
+    items, state, made = {"pat": b"value"}, {}, []
+
+    def connect():
+        bus = PromptBus(items, state)
+        made.append(bus)
+        return bus
+    return connect, made
+
+
+def test_one_dialog_serves_every_caller_and_its_connection_outlives_them(monkeypatch):
+    monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.05)
+    gate, (connect, made) = vault.UnlockGate(), _buses()
+    box = vault.SecretService(connect=connect, gate=gate)
+    for _ in range(3):
+        with pytest.raises(vault.VaultError, match="waiting for the password"):
+            box.get("pat")
+    dialogs = [b for b in made if any(c[1] == "Prompt" for c in b.calls)]
+    assert len(dialogs) == 1
+    assert not dialogs[0].closed
+    dialogs[0].answer()
+    for _ in range(100):
+        if dialogs[0].closed:
+            break
+        __import__("time").sleep(0.01)
+    assert dialogs[0].closed and not dialogs[0].dismissed
+    assert box.get("pat") == "value"
+
+
+def test_a_dialog_left_open_is_dismissed_by_xenia_never_dropped(monkeypatch):
+    monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.05)
+    monkeypatch.setattr(vault, "DIALOG_LIFETIME", 0.1)
+    gate, (connect, made) = vault.UnlockGate(), _buses()
+    with pytest.raises(vault.VaultError):
+        vault.SecretService(connect=connect, gate=gate).get("pat")
+    dialog = [b for b in made if any(c[1] == "Prompt" for c in b.calls)][0]
+    for _ in range(100):
+        if dialog.closed:
+            break
+        __import__("time").sleep(0.01)
+    assert dialog.dismissed and dialog.closed
+    assert [c[1] for c in dialog.calls].index("Dismiss") > [c[1] for c in dialog.calls].index("Prompt")
+
+
+def test_a_dismissed_dialog_is_not_raised_again_during_the_cooldown(monkeypatch):
+    monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.5)
+    gate, (connect, made) = vault.UnlockGate(), _buses()
+    box = vault.SecretService(connect=connect, gate=gate)
+    import threading
+    t = threading.Timer(0.05, lambda: [b for b in made if any(c[1] == "Prompt" for c in b.calls)][0]
+                        ._signals[("/prompt/1", vault.I_PROMPT, "Completed")](type("M", (), {"body": [True, None]})()))
+    t.start()
+    with pytest.raises(vault.VaultError, match="dismissed"):
+        box.get("pat")
+    t.join()
+    before = sum(1 for b in made for c in b.calls if c[1] == "Prompt")
+    with pytest.raises(vault.VaultError, match="no new one"):
+        box.get("pat")
+    assert sum(1 for b in made for c in b.calls if c[1] == "Prompt") == before
+
+
+def test_the_connection_is_closed_even_when_the_call_fails(monkeypatch):
+    monkeypatch.setattr(vault, "LINGER", 0.05)
     bus = FakeBus()
 
     def explode(*_args, **_kwargs):
@@ -151,6 +246,15 @@ def test_the_connection_is_closed_even_when_the_call_fails():
     bus.call = explode
     with pytest.raises(Exception):
         store(bus).get("pat")
+    assert not bus.closed
+    __import__("time").sleep(0.2)
+    assert bus.closed
+
+
+def test_a_clean_operation_closes_its_connection_at_once():
+    bus = FakeBus()
+    bus.items["pat"] = b"value"
+    assert store(bus).get("pat") == "value"
     assert bus.closed
 
 

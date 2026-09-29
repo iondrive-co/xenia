@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Callable
 
 from . import config
@@ -33,6 +34,10 @@ PROMPT_TIMEOUT = float(os.environ.get("XENIA_PROMPT_TIMEOUT", 15.0))
 
 #: How long to wait on a provider that should answer immediately.
 CALL_TIMEOUT = 10.0
+
+DIALOG_LIFETIME = float(os.environ.get("XENIA_DIALOG_LIFETIME", 600.0))
+
+PROMPT_COOLDOWN = float(os.environ.get("XENIA_PROMPT_COOLDOWN", 120.0))
 
 
 class VaultError(RuntimeError):
@@ -58,6 +63,76 @@ I_PROMPT = "org.freedesktop.Secret.Prompt"
 NO_OBJECT = "/"
 
 
+class _Attempt:
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.unlocked = False
+
+
+class UnlockGate:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._current: _Attempt | None = None
+        self._quiet_until = 0.0
+
+    def unlock(self, connect: Callable[[], Any], paths: list[str]) -> None:
+        with self._lock:
+            attempt = self._current
+            if attempt is None:
+                if time.monotonic() < self._quiet_until:
+                    raise VaultError("the keyring is locked (its unlock dialog was dismissed a moment ago; "
+                                     "no new one for a while)")
+                attempt = self._current = _Attempt()
+                threading.Thread(target=self._run, args=(connect, list(paths), attempt),
+                                 name="xenia-unlock", daemon=True).start()
+        if not attempt.done.wait(PROMPT_TIMEOUT):
+            raise VaultError("the keyring is locked: an unlock dialog is waiting for the password")
+        if not attempt.unlocked:
+            raise VaultError("the unlock prompt was dismissed: the keyring is locked")
+
+    def _run(self, connect: Callable[[], Any], paths: list[str], attempt: _Attempt) -> None:
+        conn = None
+        try:
+            conn = connect()
+            _unlocked, prompt = conn.call(SERVICE, ROOT, I_SERVICE, "Unlock", "ao", [paths],
+                                          timeout=CALL_TIMEOUT)
+            attempt.unlocked = True if prompt == NO_OBJECT else _hold_prompt(conn, prompt, DIALOG_LIFETIME)
+        except Exception:
+            attempt.unlocked = False
+        finally:
+            with self._lock:
+                self._current = None
+                if not attempt.unlocked:
+                    self._quiet_until = time.monotonic() + PROMPT_COOLDOWN
+            attempt.done.set()
+            if conn is not None:
+                _close(conn)
+
+
+def _hold_prompt(conn, path: str, lifetime: float) -> bool:
+    done = threading.Event()
+    outcome: dict[str, Any] = {"dismissed": True}
+
+    def completed(message) -> None:
+        body = message.body or []
+        outcome["dismissed"] = bool(body[0]) if body else True
+        done.set()
+
+    conn.on_signal(path, I_PROMPT, "Completed", completed)
+    conn.call(SERVICE, path, I_PROMPT, "Prompt", "s", [""], timeout=CALL_TIMEOUT)
+    if not done.wait(lifetime):
+        try:
+            conn.call(SERVICE, path, I_PROMPT, "Dismiss", timeout=CALL_TIMEOUT)
+        except Exception:
+            pass
+        done.wait(CALL_TIMEOUT)
+        return False
+    return not outcome["dismissed"]
+
+
+GATE = UnlockGate()
+
+
 class SecretService:
     """The freedesktop Secret Service, over xenia's own D-Bus client.
 
@@ -67,8 +142,9 @@ class SecretService:
 
     kind = "secret-service"
 
-    def __init__(self, connect: Callable[[], Any] | None = None) -> None:
+    def __init__(self, connect: Callable[[], Any] | None = None, gate: UnlockGate | None = None) -> None:
         self._connect = connect or _session_bus
+        self._gate = gate or GATE
 
     # -- interface ---------------------------------------------------------
 
@@ -213,10 +289,7 @@ class SecretService:
     def _unlock(self, conn, paths: list[str]) -> None:
         if not paths:
             return
-        _unlocked, prompt = conn.call(SERVICE, ROOT, I_SERVICE, "Unlock",
-                                      "ao", [paths], timeout=CALL_TIMEOUT)
-        if prompt != NO_OBJECT:
-            self._prompt(conn, prompt)
+        self._gate.unlock(self._connect, paths)
 
     def _prompt(self, conn, path: str) -> None:
         """Run a provider's own dialog and wait for the person in front of it.
@@ -237,6 +310,11 @@ class SecretService:
         conn.call(SERVICE, path, I_PROMPT, "Prompt", "s", [""],
                   timeout=CALL_TIMEOUT)
         if not done.wait(PROMPT_TIMEOUT):
+            try:
+                conn.call(SERVICE, path, I_PROMPT, "Dismiss", timeout=CALL_TIMEOUT)
+            except Exception:
+                pass
+            done.wait(CALL_TIMEOUT)
             raise VaultError("the keyring is locked")
         if outcome["dismissed"]:
             raise VaultError("the unlock prompt was dismissed: the keyring is locked")
@@ -247,7 +325,19 @@ def _session_bus():
     return Connection().connect()
 
 
+LINGER = float(os.environ.get("XENIA_LINGER", 60.0))
+
+
 def _close(conn) -> None:
+    if sys.exc_info()[0] is not None and LINGER > 0:
+        timer = threading.Timer(LINGER, _close_now, args=(conn,))
+        timer.daemon = True
+        timer.start()
+        return
+    _close_now(conn)
+
+
+def _close_now(conn) -> None:
     try:
         conn.close()
     except Exception:
