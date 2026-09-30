@@ -13,9 +13,31 @@ MATCHED = ("PreToolUse", "PostToolUse")
 
 MARKER = "xenia-hook"
 
+# What xenia says back to an agent — the agora nudge and the one refusal —
+# is a separate hook with its own entry (guard.py), so either can be removed
+# from a settings file without touching the other. Both of its jobs look at
+# shell commands only, so it is not started for every Read and Edit.
+GUARD = "xenia-guard"
+GUARD_EVENT = "PreToolUse"
+GUARD_MATCHER = "Bash"
+
 
 def hook_command(hook_path: Path, event: str) -> str:
     return f"{hook_path} {event}"
+
+
+def guard_path(hook_path: Path) -> Path:
+    return hook_path.with_name(GUARD)
+
+
+def _has(entries: list[Any], marker: str) -> bool:
+    return any(
+        marker in str(hook.get("command", ""))
+        for entry in entries
+        if isinstance(entry, dict)
+        for hook in entry.get("hooks", [])
+        if isinstance(hook, dict)
+    )
 
 
 def _entry(hook_path: Path, event: str) -> dict[str, Any]:
@@ -36,17 +58,19 @@ def _merge(existing: dict[str, Any], hook_path: Path) -> tuple[dict[str, Any], l
         entries = hooks.setdefault(event, [])
         if not isinstance(entries, list):
             continue
-        already = any(
-            MARKER in str(hook.get("command", ""))
-            for entry in entries
-            if isinstance(entry, dict)
-            for hook in entry.get("hooks", [])
-            if isinstance(hook, dict)
-        )
-        if already:
+        if _has(entries, MARKER):
             continue
         entries.append(_entry(hook_path, event))
         added.append(event)
+
+    entries = hooks.setdefault(GUARD_EVENT, [])
+    if isinstance(entries, list) and not _has(entries, GUARD):
+        entries.append({
+            "matcher": GUARD_MATCHER,
+            "hooks": [{"type": "command",
+                       "command": hook_command(guard_path(hook_path), GUARD_EVENT)}],
+        })
+        added.append(GUARD)
 
     return merged, added
 
@@ -117,7 +141,7 @@ def status() -> list[dict[str, Any]]:
     for label, target in machine_targets():
         entry: dict[str, Any] = {
             "runtime": label, "path": str(target),
-            "exists": target.exists(), "events": [], "error": None,
+            "exists": target.exists(), "events": [], "guard": False, "error": None,
         }
         if target.exists():
             try:
@@ -130,11 +154,9 @@ def status() -> list[dict[str, Any]]:
             if isinstance(hooks, dict):
                 entry["events"] = sorted(
                     event for event, entries in hooks.items()
-                    if isinstance(entries, list) and any(
-                        MARKER in str(hook.get("command", ""))
-                        for item in entries if isinstance(item, dict)
-                        for hook in item.get("hooks", []) if isinstance(hook, dict)
-                    )
+                    if isinstance(entries, list) and _has(entries, MARKER)
                 )
+                pre = hooks.get(GUARD_EVENT)
+                entry["guard"] = isinstance(pre, list) and _has(pre, GUARD)
         out.append(entry)
     return out

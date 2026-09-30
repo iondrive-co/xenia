@@ -5,7 +5,7 @@
 
 ## There is no build
 
-`bin/xenia`, `bin/xenia-hook`, `bin/xenia-mcp` and `bin/xenia-service` each put
+`bin/xenia`, `bin/xenia-hook`, `bin/xenia-guard`, `bin/xenia-mcp` and `bin/xenia-service` each put
 `src/` on `sys.path` and import from it. Nothing is compiled, installed or
 copied, so an edit under `src/xenia/` is live the moment it is saved — for
 whatever starts after it.
@@ -15,6 +15,7 @@ What is already running is not. A process holds the code it started with:
 | | |
 | --- | --- |
 | `bin/xenia-hook` | one process per hook event — always current, never needs restarting |
+| `bin/xenia-guard` | the same, on PreToolUse for `Bash` — but it runs only in a session started after `xenia` setup (`install.apply`) wired it into that session's settings file |
 | `bin/xenia-service` | `systemctl --user restart xenia.service`, or on mac `launchctl kickstart -k gui/$(id -u)/dev.xenia.tray` |
 | `bin/xenia-mcp` | one per agent session — only its client can restart it, so ask |
 

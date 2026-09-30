@@ -387,6 +387,24 @@ def test_and_then_never_again_that_session(conn):
     assert agora.nudge(conn, a_call("npx playwright test", session="s2")) is not None
 
 
+def test_the_call_asked_about_may_already_be_recorded(conn):
+    # xenia-hook and xenia-guard run side by side, so the recording can land
+    # before the nudge is asked. That row is this call, not an earlier one.
+    first = {**a_call("python3 -m pytest -q"), "tool_use_id": "toolu_1"}
+    ingest.record(conn, first)
+    assert agora.nudge(conn, first) is not None
+
+    # Without a tool_use_id the key is the command itself; still this call.
+    other = a_call("npm run build", session="s3")
+    ingest.record(conn, other)
+    assert agora.nudge(conn, other) is not None
+
+    # And a finished one really is earlier.
+    ingest.record(conn, {**first, "hook_event_name": "PostToolUse",
+                         "tool_response": {"stdout": "ok"}})
+    assert agora.nudge(conn, {**a_call("npx playwright test"), "tool_use_id": "toolu_2"}) is None
+
+
 def test_an_ordinary_command_is_left_alone(conn):
     assert agora.nudge(conn, a_call("ls -la")) is None
     assert agora.nudge(conn, {**a_call("python3 -m pytest"),

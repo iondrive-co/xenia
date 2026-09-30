@@ -657,19 +657,22 @@ def nudge(conn: sqlite3.Connection, payload: dict[str, Any]) -> str | None:
     what = looks_heavy(payload.get("tool_name"), payload.get("tool_input"))
     if not what:
         return None
-    if _heavy_before(conn, payload.get("session_id")):
+    if _heavy_before(conn, payload):
         return None
     return _advice(conn, what)
 
 
-def _heavy_before(conn: sqlite3.Connection, session_uid: Any) -> bool:
+def _heavy_before(conn: sqlite3.Connection, payload: dict[str, Any]) -> bool:
     """Has this session already started something like it?
 
-    The call being nudged about is not in the record yet — the hook asks
-    before it records — so anything found here really is earlier. A payload
-    with no session to be first in is left alone rather than nudged on every
-    command it ever runs.
+    The call being nudged about may already be in the record: xenia-guard
+    asks from a hook that runs BESIDE xenia-hook, and either can write first.
+    So its own row — the newest one under its correlation key that has not
+    finished — is left out, and anything else found really is earlier. A
+    payload with no session to be first in is left alone rather than nudged on
+    every command it ever runs.
     """
+    session_uid = payload.get("session_id")
     if not session_uid:
         return True
     row = conn.execute("SELECT id FROM session WHERE session_uid = ?",
@@ -677,10 +680,18 @@ def _heavy_before(conn: sqlite3.Connection, session_uid: Any) -> bool:
     if row is None:
         return False
     earlier = conn.execute(
-        "SELECT detail FROM action WHERE session_id = ? AND tool = 'Bash' "
+        "SELECT detail, corr_key, status FROM action WHERE session_id = ? AND tool = 'Bash' "
         "ORDER BY seq DESC LIMIT ?",
         (row["id"], config.AGORA_NUDGE_SCAN)).fetchall()
-    return any(looks_heavy("Bash", {"command": r["detail"]}) for r in earlier)
+    from .ingest import corr_key
+
+    key = corr_key(payload)
+    rows = list(earlier)
+    for i, r in enumerate(rows):
+        if r["corr_key"] == key and r["status"] == "started":
+            del rows[i]
+            break
+    return any(looks_heavy("Bash", {"command": r["detail"]}) for r in rows)
 
 
 def _gb(mb: Any) -> str:

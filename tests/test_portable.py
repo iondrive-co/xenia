@@ -164,13 +164,14 @@ def test_the_two_platforms_do_not_share_a_path(fake_home, monkeypatch):
     assert app.autostart_file() != linux_path
 
 
-@pytest.mark.parametrize("name", ["xenia", "xenia-hook", "xenia-mcp"])
+@pytest.mark.parametrize("name", ["xenia", "xenia-hook", "xenia-guard", "xenia-mcp"])
 def test_every_entry_point_checks_the_python_version(name):
     body = (SRC.parents[1] / "bin" / name).read_text()
     assert "sys.version_info < (3, 11)" in body
 
 
-def test_the_hook_exits_zero_even_on_an_unusable_python():
-    body = (SRC.parents[1] / "bin" / "xenia-hook").read_text()
+@pytest.mark.parametrize("name", ["xenia-hook", "xenia-guard"])
+def test_the_hook_exits_zero_even_on_an_unusable_python(name):
+    body = (SRC.parents[1] / "bin" / name).read_text()
     version_guard = body.split("sys.version_info < (3, 11)")[1].split("\n\n")[0]
     assert "SystemExit(0)" in version_guard

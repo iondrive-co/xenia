@@ -8,6 +8,7 @@ import pytest
 from xenia import install
 
 HOOK = Path("/opt/xenia/bin/xenia-hook")
+GUARD = Path("/opt/xenia/bin/xenia-guard")
 
 
 @pytest.fixture
@@ -44,10 +45,33 @@ def test_a_fresh_machine_gets_all_six_events(targets):
     assert {r["runtime"] for r in results} == {"claude", "codex"}
 
     for result in results:
-        assert set(result["added"]) == set(install.EVENTS)
+        assert set(result["added"]) == set(install.EVENTS) | {install.GUARD}
         config = read(result["path"])
         for event in install.EVENTS:
-            assert commands(config, event) == [f"{HOOK} {event}"]
+            recorded = [c for c in commands(config, event) if "xenia-hook" in c]
+            assert recorded == [f"{HOOK} {event}"]
+
+
+def test_the_guard_is_its_own_entry_on_shell_calls_only(targets):
+    """What xenia says back is removable without touching the record."""
+    install.apply(targets, HOOK)
+    for _, path in targets:
+        pre = read(path)["hooks"]["PreToolUse"]
+        guard = [e for e in pre if any("xenia-guard" in h["command"] for h in e["hooks"])]
+        assert guard == [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": f"{GUARD} PreToolUse"}]}]
+        assert not any("xenia-hook" in h["command"] for h in guard[0]["hooks"])
+
+
+def test_a_machine_that_only_records_gets_the_guard_added(targets):
+    claude = Path(dict(targets)["claude"])
+    claude.parent.mkdir(parents=True)
+    # A settings file from before xenia-guard existed: xenia-hook on every event.
+    claude.write_text(json.dumps({"hooks": {e: [install._entry(HOOK, e)] for e in install.EVENTS}}))
+
+    result = next(r for r in install.apply(targets, HOOK) if r["runtime"] == "claude")
+    assert result["added"] == [install.GUARD]
+    assert f"{GUARD} PreToolUse" in commands(read(claude), "PreToolUse")
 
 
 def test_tool_events_are_wired_with_a_wildcard_matcher(targets):
@@ -55,7 +79,9 @@ def test_tool_events_are_wired_with_a_wildcard_matcher(targets):
     config = read(dict(targets)["claude"])
 
     for event in ("PreToolUse", "PostToolUse"):
-        assert all(e["matcher"] == "*" for e in config["hooks"][event])
+        recording = [e for e in config["hooks"][event]
+                     if any("xenia-hook" in h["command"] for h in e["hooks"])]
+        assert recording and all(e["matcher"] == "*" for e in recording)
     for event in ("SessionStart", "Stop"):
         assert all("matcher" not in e for e in config["hooks"][event])
 
@@ -140,6 +166,7 @@ def test_status_reports_a_wired_up_machine(targets):
     install.apply(targets, HOOK)
     for item in install.status():
         assert item["events"] == sorted(install.EVENTS)
+        assert item["guard"] is True
         assert item["error"] is None
 
 

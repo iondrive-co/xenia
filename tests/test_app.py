@@ -312,7 +312,7 @@ def test_a_path_without_the_bin_dir_is_reported(fake_home, monkeypatch, capsys):
 
 
 def test_the_entry_points_resolve_symlinks(fake_home):
-    for name in ("xenia", "xenia-hook", "xenia-mcp"):
+    for name in ("xenia", "xenia-hook", "xenia-guard", "xenia-mcp"):
         body = (app._entry_point().parent / name).read_text()
         assert "os.path.realpath(__file__)" in body
         assert "os.path.abspath(__file__)" not in body
