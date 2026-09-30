@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+from .classify import segments
 
 #: Where a claim can be in its life. 'held' is live work, 'overrun' is live
 #: work past the window its own holder gave it, 'abandoned' is a claim whose
@@ -611,7 +612,7 @@ _HEAVY_VERBS = r"""
 #: question about a suite and not a suite, and a nudge that fires on reading
 #: is one an agent learns to skip long before it reaches the call it is about.
 _HEAVY = re.compile(
-    r"(?: \A | [\n;&|()] ) \s*"
+    r"\A [\s(]*"
     r"(?: (?: [A-Za-z_]\w* = \S*"
     r"        | time | nohup | exec | sudo | env | xvfb-run | npx | bunx"
     r"        | uv | uvx | poetry | pipenv | run ) \s+ )*"
@@ -632,8 +633,11 @@ def looks_heavy(tool: Any, tool_input: Any) -> str | None:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str) or not command.strip():
         return None
-    found = _HEAVY.search(command)
-    return " ".join(found.group("verb").split()) if found else None
+    for segment in segments(command):
+        found = _HEAVY.match(segment)
+        if found:
+            return " ".join(found.group("verb").split())
+    return None
 
 
 def nudge(conn: sqlite3.Connection, payload: dict[str, Any]) -> str | None:

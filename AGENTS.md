@@ -1,7 +1,20 @@
 # xenia
 
-`python3 -m pytest -q` before calling anything done — a couple of minutes.
-[ARCHITECTURE.md](ARCHITECTURE.md) says what lives where.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) before starting, and run `python3 -m pytest -q` before finishing (takes a couple of minutes).
+
+## No comments
+
+Agents do not write comments or docstrings in this repo: not new ones, and
+not rewordings of old ones. Deleting comment text is fine. When a change needs
+explaining, explain it in your reply to the user, not in the code.
+
+## Test and demo data are invented
+
+Every value in `tests/` and `demo/` is made up:
+- hostnames under `example.com`, `.test` or `.invalid`
+- paths under `tmp_path` or `/srv/repos/<name>`, with repos named `shop` and
+  `infra`
+- commands, error text, pids, key ids, counts and dates
 
 ## There is no build
 
@@ -10,7 +23,7 @@
 copied, so an edit under `src/xenia/` is live the moment it is saved — for
 whatever starts after it.
 
-What is already running is not. A process holds the code it started with:
+A process holds the code it started with:
 
 | | |
 | --- | --- |

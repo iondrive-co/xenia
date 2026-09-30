@@ -354,6 +354,11 @@ def a_call(command: str, session: str = "s1") -> dict:
     ("cat playwright.config.ts", None),
     ("git log --grep=build -5", None),
     ("echo 'npm test'", None),
+    ("git grep -n -E 'foo|gradle|bar' -- .", None),
+    ('rg "build|pytest" src', None),
+    ("grep -E 'x;npm run build' notes.txt", None),
+    ("cd web; npm run build", "npm run build"),
+    ("(cd web && pytest -q)", "pytest"),
     ("ls -la", None),
 ])
 def test_what_counts_as_starting_something_heavy(command, expected):
