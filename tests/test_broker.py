@@ -73,6 +73,7 @@ def _dns(monkeypatch):
     # The prompt cool-off is process state, so one test's refusal would
     # otherwise silence the next test's question.
     broker._asked.clear()
+    broker._deferred.clear()
 
 
 @pytest.fixture
@@ -869,6 +870,59 @@ def test_a_failure_after_the_bytes_went_out_is_not_called_a_timeout(wired):
     assert wired.execute(
         "SELECT code FROM secret_use ORDER BY id DESC").fetchone()[0] == \
         "sent-outcome-unknown"
+
+
+def hold_the_database(conn, tmp_path):
+    other = db.connect(tmp_path / "audit.db")
+    other.execute("BEGIN IMMEDIATE")
+    conn.execute("PRAGMA busy_timeout = 0")
+    return other
+
+
+def test_a_lock_after_the_send_keeps_the_answer_and_records_the_call_later(
+        wired, tmp_path):
+    held = []
+
+    class LocksOnSend(Opener):
+        def open(self, request, timeout=None):
+            held.append(hold_the_database(wired, tmp_path))
+            return super().open(request, timeout)
+
+    allow(wired, mutating=True)
+    opener = LocksOnSend(Reply(status=201, body=b'{"job": "accepted"}'))
+    answer = call(wired, method="POST", opener=opener)
+
+    assert answer["status"] == 201
+    assert answer["body"] == '{"job": "accepted"}'
+    assert "code" not in answer
+    assert answer["warnings"] == ["call not recorded: database is locked"]
+    assert len(opener.sent) == 1
+    assert wired.execute("SELECT count(*) FROM secret_use").fetchone()[0] == 0
+
+    held[0].rollback()
+    held[0].close()
+    call(wired)
+
+    rows = wired.execute(
+        "SELECT method, status FROM secret_use ORDER BY id").fetchall()
+    assert [tuple(row) for row in rows] == [("POST", 201), ("GET", 200)]
+    assert wired.execute("SELECT max(uses) FROM secret_grant").fetchone()[0] == 2
+
+
+def test_a_lock_before_the_send_says_nothing_was_sent(wired, tmp_path):
+    allow(wired, mutating=True)
+    other = hold_the_database(wired, tmp_path)
+    opener = Opener()
+
+    try:
+        answer = call(wired, method="POST", opener=opener)
+    finally:
+        other.rollback()
+        other.close()
+
+    assert answer["code"] == "unavailable"
+    assert "Nothing was sent" in answer["refused"]
+    assert opener.sent == []
 
 
 def test_the_nonce_rises_and_survives_a_restart(wired):
@@ -1873,7 +1927,7 @@ def test_a_standing_approval_expires_rather_than_sliding(wired):
                           reason="nightly")
     was = row["expires_at"]
 
-    broker._extend(wired, row, True)
+    wired.execute(*broker._extend(row, True))
     wired.commit()
 
     now = wired.execute("SELECT * FROM secret_grant WHERE id = ?",

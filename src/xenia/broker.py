@@ -25,6 +25,7 @@ import posixpath
 import re
 import shlex
 import socket
+import sqlite3
 import struct
 import sys
 import threading
@@ -53,7 +54,8 @@ CODES = {
     "off-policy": "the credential is registered, and not for this",
     "no-value": "registered, but the credential store holds no value for it",
     "unavailable": "xenia cannot do this here — a missing signing scheme, a "
-                   "locked store, a service that is not running",
+                   "locked store, a busy database, a service that is not "
+                   "running. Nothing was sent",
     "timeout": "no answer inside the timeout, before any bytes were sent",
     "sent-outcome-unknown": "the request went out and no answer came back. "
                             "Whether the far side acted on it is NOT known "
@@ -597,7 +599,7 @@ def grants(conn, *, live_only: bool = True) -> list[dict]:
     return [dict(row) for row in conn.execute(sql, args)]
 
 
-def _extend(conn, row, mutating: bool) -> None:
+def _extend(row, mutating: bool) -> tuple[str, tuple]:
     """Slide the window forward, but never past the ceiling.
 
     The window sliding keeps a live piece of work from being interrupted; the
@@ -610,10 +612,10 @@ def _extend(conn, row, mutating: bool) -> None:
     window = stored if stored is not None else default_window(row["mutating"])
     ceiling = datetime.fromisoformat(row["ceiling_at"])
     expires = min(now + timedelta(seconds=window), ceiling)
-    conn.execute(
-        "UPDATE secret_grant SET expires_at = ?, last_used_at = ?, "
-        "uses = uses + 1 WHERE id = ?",
-        (stamp(expires), stamp(now), row["id"]))
+    return ("UPDATE secret_grant SET expires_at = max(expires_at, ?), "
+            "last_used_at = max(coalesce(last_used_at, ''), ?), "
+            "uses = uses + 1 WHERE id = ?",
+            (stamp(expires), stamp(now), row["id"]))
 
 
 # --------------------------------------------------------------------------
@@ -1355,6 +1357,11 @@ def fetch(conn, request: dict, *, store=None, opener=None,
             return refuse(Refusal("the keyring is locked", code="unavailable"))
         return refuse(Refusal(
             f"the credential store would not answer: {exc}", code="unavailable"))
+    except sqlite3.OperationalError as exc:
+        _rollback(conn)
+        return refuse(Refusal(
+            f"xenia's database would not take a write before sending: {exc}. "
+            f"Nothing was sent.", code="unavailable"))
 
     approval = grants[name]
     warnings: list[str] = []
@@ -1418,12 +1425,14 @@ def fetch(conn, request: dict, *, store=None, opener=None,
         # After the bytes went out a timeout is not a failure but an unknown:
         # the far side may have acted. Saying 'timeout' would invite a retry.
         code = "sent-outcome-unknown" if sent else "timeout"
-        _record(conn, name=name, client=client, host=host, method=method,
+        unrecorded = _record(conn, name=name, client=client, host=host, method=method,
                 url=url, placed=",".join(placed), decision="allowed",
                 reason=detail, code=code, grant_id=approval["id"], status=None,
                 size=None,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 echoed=False)
+        if unrecorded:
+            warnings.append(f"call not recorded: {unrecorded}")
         return {"error": detail, "code": code, "secret": name, "url": url,
                 "warnings": warnings, "signed": signed}
 
@@ -1493,18 +1502,22 @@ def fetch(conn, request: dict, *, store=None, opener=None,
         body_text += "…[response longer than xenia will read]"
 
     duration = int((time.monotonic() - started) * 1000)
-    _extend(conn, approval, mutating)
-    conn.execute("UPDATE secret SET last_used_at = ? WHERE name = ?",
-                 (stamp(utcnow()), name))
-    _record(conn, name=name, client=client, host=host, method=method, url=url,
-            placed=",".join(placed),
-            decision="allowed", reason=(f"action: {permitted[0]}"
-                                        if permitted else None),
-            code=None, grant_id=approval["id"], status=answer["status"],
-            size=size, duration_ms=duration, echoed=echoed, **{
-                key: captured.get(key) for key in
-                ("request_path", "response_path", "request_sha256",
-                 "response_sha256")})
+    unrecorded = _bookkeep(conn, [
+        _extend(approval, mutating),
+        ("UPDATE secret SET last_used_at = max(coalesce(last_used_at, ''), ?) "
+         "WHERE name = ?", (stamp(utcnow()), name)),
+        _use(name=name, client=client, host=host, method=method, url=url,
+             placed=",".join(placed),
+             decision="allowed", reason=(f"action: {permitted[0]}"
+                                         if permitted else None),
+             code=None, grant_id=approval["id"], status=answer["status"],
+             size=size, duration_ms=duration, echoed=echoed, **{
+                 key: captured.get(key) for key in
+                 ("request_path", "response_path", "request_sha256",
+                  "response_sha256")}),
+    ], name)
+    if unrecorded:
+        warnings.append(f"call not recorded: {unrecorded}")
 
     if cookies:
         warnings.append(
@@ -1621,22 +1634,39 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
             return refuse(Refusal("the keyring is locked", code="unavailable"))
         return refuse(Refusal(f"the credential store would not answer: {exc}",
                               code="unavailable"))
+    except sqlite3.OperationalError as exc:
+        _rollback(conn)
+        return refuse(Refusal(
+            f"xenia's database would not take a write before signing: {exc}. "
+            f"Nothing was signed.", code="unavailable"))
 
-    _extend(conn, approval, True)
-    _record(conn, name=name, client=client, host=SIGN_SCOPE, method="SIGN",
-            url=f"profile:{profile_name}", placed=f"sign:{profile_name}",
-            decision="allowed", reason=None, code=None,
-            grant_id=approval["id"], status=None, size=len(text),
-            duration_ms=int((time.monotonic() - started) * 1000), echoed=False)
-    return {"signature": signature, "secret": name, "profile": profile_name,
-            "nonce": context.nonce, "signed_bytes": len(text),
-            "headers": dict(context.headers)}
+    unrecorded = _bookkeep(conn, [
+        _extend(approval, True),
+        _use(name=name, client=client, host=SIGN_SCOPE, method="SIGN",
+             url=f"profile:{profile_name}", placed=f"sign:{profile_name}",
+             decision="allowed", reason=None, code=None,
+             grant_id=approval["id"], status=None, size=len(text),
+             duration_ms=int((time.monotonic() - started) * 1000),
+             echoed=False),
+    ], name)
+    reply = {"signature": signature, "secret": name, "profile": profile_name,
+             "nonce": context.nonce, "signed_bytes": len(text),
+             "headers": dict(context.headers)}
+    if unrecorded:
+        reply["warnings"] = [f"signature not recorded: {unrecorded}"]
+    return reply
 
 
-def _record(conn, **row) -> None:
-    try:
-        conn.execute(
-            "INSERT INTO secret_use (at, name, client, host, method, url, "
+DEFERRED_LIMIT = 1000
+
+DEFERRED_ATTEMPTS = 20
+
+_deferred: list[tuple[str, tuple, int, str | None]] = []
+_deferred_lock = threading.Lock()
+
+
+def _use(**row) -> tuple[str, tuple]:
+    return ("INSERT INTO secret_use (at, name, client, host, method, url, "
             "  placed, decision, reason, code, grant_id, status, bytes, "
             "  duration_ms, echoed, request_path, response_path, "
             "  request_sha256, response_sha256) "
@@ -1647,21 +1677,56 @@ def _record(conn, **row) -> None:
              row["size"], row["duration_ms"], int(bool(row["echoed"])),
              row.get("request_path"), row.get("response_path"),
              row.get("request_sha256"), row.get("response_sha256")))
-        conn.commit()
+
+
+def _record(conn, **row) -> str | None:
+    return _bookkeep(conn, [_use(**row)], row.get("name"))
+
+
+def _rollback(conn) -> None:
+    try:
+        conn.rollback()
     except Exception:
-        # A call that worked is not reported as failed because the record of
-        # it could not be written. The record is the point of xenia, so this
-        # is not silence — it goes to the same log every other capture failure
-        # goes to.
-        try:
-            from . import ingest
-            path = config.fallback_log()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a") as handle:
-                handle.write(f"{ingest.utcnow()}\tbroker\tcould not record a "
-                             f"credential use for {row.get('name')}\n")
-        except Exception:
-            pass
+        pass
+
+
+def _bookkeep(conn, writes: list[tuple[str, tuple]], name: str | None) -> str | None:
+    with _deferred_lock:
+        waiting = list(_deferred)
+        _deferred.clear()
+    fresh = [(sql, params, 0, name) for sql, params in writes]
+    try:
+        for sql, params, _tries, _owner in waiting + fresh:
+            conn.execute(sql, params)
+        conn.commit()
+        return None
+    except Exception as exc:
+        _rollback(conn)
+        problem = str(exc) or type(exc).__name__
+        busy = isinstance(exc, sqlite3.OperationalError) and any(
+            word in problem.lower() for word in ("locked", "busy"))
+    if busy:
+        retry = waiting + fresh
+    else:
+        retry = [(sql, params, tries + 1, owner)
+                 for sql, params, tries, owner in waiting
+                 if tries + 1 < DEFERRED_ATTEMPTS]
+    with _deferred_lock:
+        _deferred[:0] = retry
+        overflow = max(0, len(_deferred) - DEFERRED_LIMIT)
+        del _deferred[:overflow]
+    lost = len(waiting) + len(fresh) - len(retry) + overflow
+    try:
+        from . import ingest
+        path = config.fallback_log()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(f"{ingest.utcnow()}\tbroker\tcould not record a "
+                         f"credential use for {name}: {problem}; "
+                         f"{len(retry)} write(s) queued, {lost} dropped\n")
+    except Exception:
+        pass
+    return problem
 
 
 #: How long a prompt stays in front of the user before the call gives up on
@@ -2165,14 +2230,20 @@ class Server:
                                  for name in sorted(signing.SCHEMES)}}
         elif op in ("fetch", "sign"):
             from . import db
-            conn = db.connect(self.db_path)
             try:
-                message = dict(message)
-                message.setdefault("client", _describe(who))
-                reply = (fetch(conn, message) if op == "fetch"
-                         else sign_only(conn, message))
-            finally:
-                conn.close()
+                conn = db.connect(self.db_path)
+            except sqlite3.OperationalError as exc:
+                reply = {"refused": f"xenia's database could not be opened: "
+                                    f"{exc}. Nothing was sent.",
+                         "code": "unavailable"}
+            else:
+                try:
+                    message = dict(message)
+                    message.setdefault("client", _describe(who))
+                    reply = (fetch(conn, message) if op == "fetch"
+                             else sign_only(conn, message))
+                finally:
+                    conn.close()
         else:
             reply = {"refused": f"unknown op: {op}. This socket speaks: "
                                 f"{', '.join(sorted(OPS))}.",
