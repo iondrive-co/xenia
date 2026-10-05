@@ -1005,6 +1005,92 @@ def test_the_capture_is_recorded_against_the_use(wired, monkeypatch, tmp_path):
     assert row["response_path"] and row["response_sha256"]
 
 
+TIMING_KEYS = {"received_wall_ms", "queued_ms", "approval_ms", "keyring_ms",
+               "sign_ms", "upstream_ms", "bookkeep_ms", "total_ms"}
+
+
+class SlowStore(Store):
+
+    def get(self, name):
+        time.sleep(0.05)
+        return super().get(name)
+
+
+class SlowOpener(Opener):
+
+    def open(self, request, timeout=None):
+        time.sleep(0.08)
+        return super().open(request, timeout)
+
+
+def test_a_reply_says_where_its_time_went(wired):
+    allow(wired)
+    before = time.time() * 1000
+
+    answer = call(wired, opener=SlowOpener(), store=SlowStore())
+
+    timing = answer["timing"]
+    assert set(timing) == TIMING_KEYS
+    assert timing["keyring_ms"] >= 45
+    assert timing["upstream_ms"] >= 75
+    assert timing["keyring_ms"] < timing["upstream_ms"]
+    assert timing["total_ms"] >= timing["keyring_ms"] + timing["upstream_ms"]
+    assert before - 1000 <= timing["received_wall_ms"] <= time.time() * 1000
+
+
+def test_time_spent_waiting_for_a_handler_is_counted_as_queued(wired):
+    allow(wired)
+    accepted = (time.monotonic() - 0.2, time.time() - 0.2)
+
+    timing = broker.fetch(wired, {"secret": "gitlab-pat",
+                                  "url": f"https://{HOST}/api/v4/projects",
+                                  "headers": {"PRIVATE-TOKEN":
+                                              broker.PLACEHOLDER}},
+                          store=Store(), opener=Opener(), notify=False,
+                          accepted=accepted)["timing"]
+
+    assert timing["queued_ms"] >= 195
+    assert timing["total_ms"] >= timing["queued_ms"]
+
+
+def test_a_refusal_is_timed_too(wired):
+    answer = call(wired)
+
+    assert answer["code"] == "unapproved"
+    assert set(answer["timing"]) == TIMING_KEYS
+    assert answer["timing"]["upstream_ms"] == 0
+
+
+def test_a_signature_says_how_long_signing_took(wired, monkeypatch):
+    profile(wired, "gitlab-pat", scheme="hmac", template="{body}",
+            encoding="hex")
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
+                 source="test")
+    real = broker.signing.sign
+
+    def slow(profile_config, context):
+        time.sleep(0.05)
+        return real(profile_config, context)
+
+    monkeypatch.setattr(broker.signing, "sign", slow)
+    answer = broker.sign_only(wired, {"secret": "gitlab-pat",
+                                      "payload": {"msg": "hello"}},
+                              store=Store(), notify=False)
+
+    assert len(answer["signature"]) == 64
+    assert set(answer["timing"]) == TIMING_KEYS
+    assert answer["timing"]["sign_ms"] >= 45
+    assert answer["timing"]["upstream_ms"] == 0
+
+
+def test_timing_does_not_leak_between_calls(wired):
+    allow(wired)
+    call(wired, opener=SlowOpener())
+
+    assert call(wired)["timing"]["upstream_ms"] < 75
+    assert getattr(broker._clock, "current", None) is None
+
+
 # -- signing without a request ----------------------------------------------
 
 def test_sign_returns_a_signature_for_a_chain_xenia_does_not_speak(wired):

@@ -14,6 +14,7 @@ makes no request, opens no store and holds no value.
 from __future__ import annotations
 
 import base64
+import contextlib
 import fnmatch
 import hashlib
 import http.client
@@ -83,6 +84,55 @@ CALLER_MAY_NOT_SET = frozenset({"host"})
 #: The pseudo-host a signature-only use is approved against. There is no
 #: hostname in a `sign` call, and a grant has to be scoped to something.
 SIGN_SCOPE = "(sign)"
+
+
+_clock = threading.local()
+
+
+class Timing:
+    STAGES = ("keyring", "sign", "upstream", "bookkeep")
+
+    def __init__(self, accepted: tuple[float, float] | None = None) -> None:
+        self.began = time.monotonic()
+        self.accepted, self.received_wall = accepted or (self.began, time.time())
+        self.spent = dict.fromkeys(self.STAGES, 0.0)
+
+    def report(self) -> dict:
+        ended = time.monotonic()
+        staged = sum(self.spent.values())
+
+        def ms(seconds: float) -> float:
+            return round(max(0.0, seconds) * 1000, 1)
+
+        return {"received_wall_ms": int(self.received_wall * 1000),
+                "queued_ms": ms(self.began - self.accepted),
+                "approval_ms": ms(ended - self.began - staged),
+                **{f"{stage}_ms": ms(spent)
+                   for stage, spent in self.spent.items()},
+                "total_ms": ms(ended - self.accepted)}
+
+
+@contextlib.contextmanager
+def _stage(name: str):
+    timing = getattr(_clock, "current", None)
+    began = time.monotonic()
+    try:
+        yield
+    finally:
+        if timing is not None:
+            timing.spent[name] += time.monotonic() - began
+
+
+def _timed(work, accepted: tuple[float, float] | None) -> dict:
+    timing = Timing(accepted)
+    previous = getattr(_clock, "current", None)
+    _clock.current = timing
+    try:
+        reply = work()
+    finally:
+        _clock.current = previous
+    reply["timing"] = timing.report()
+    return reply
 
 
 class BrokerError(RuntimeError):
@@ -917,7 +967,8 @@ def _resolve(url: str, headers: dict, body: Any, values: dict[str, str],
             headers=for_signing, body=text if body is not None else "",
             config=profile, nonce=nonce, now=now, extras=extras)
         try:
-            signature = signing.sign(profile, context)
+            with _stage("sign"):
+                signature = signing.sign(profile, context)
         except signing.SchemeError as exc:
             raise Refusal(str(exc), code=exc.code) from exc
 
@@ -1134,7 +1185,8 @@ def _authorise(conn, names: list[str], url: str, method: str, *,
         host, sending, pinned = permit(row, url, method)
         grants[name] = approval
 
-        value = (store or vault.backend(row["backend"])).get(name)
+        with _stage("keyring"):
+            value = (store or vault.backend(row["backend"])).get(name)
         if value is None:
             raise Refusal(
                 f"'{name}' is registered but the credential store has no "
@@ -1265,8 +1317,15 @@ _downloads = threading.BoundedSemaphore(max(1, MAX_DOWNLOADS))
 
 
 def fetch(conn, request: dict, *, store=None, opener=None,
-          notify: bool = True) -> dict:
+          notify: bool = True,
+          accepted: tuple[float, float] | None = None) -> dict:
     """Make one authenticated request on an agent's behalf."""
+    return _timed(lambda: _admitted(conn, request, store=store, opener=opener,
+                                    notify=notify), accepted)
+
+
+def _admitted(conn, request: dict, *, store=None, opener=None,
+              notify: bool = True) -> dict:
     if not request.get("binary") or not request.get("capture"):
         return _fetch(conn, request, store=store, opener=opener, notify=notify)
     if not _downloads.acquire(blocking=False):
@@ -1354,7 +1413,8 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
 
         for extra in names:
             scrubber.add(extra, values[extra])
-        nonce = next_nonce(conn, name, time.time())
+        with _stage("bookkeep"):
+            nonce = next_nonce(conn, name, time.time())
 
         rules = body_policy_of(rows[name])
         permitted: list[str] = []
@@ -1435,8 +1495,10 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
     deadline = time.monotonic() + timeout
     try:
         sent = True
-        answer = _send(target, method, sent_headers, data, timeout, opener,
-                       pinned, sink=sink, watch=watch, deadline=deadline)
+        with _stage("upstream"):
+            answer = _send(target, method, sent_headers, data, timeout,
+                           opener, pinned, sink=sink, watch=watch,
+                           deadline=deadline)
         for _hop in range(config.FETCH_MAX_REDIRECTS):
             location = answer["headers"].get("Location") or \
                 answer["headers"].get("location")
@@ -1465,8 +1527,10 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
                 warnings.append(f"stopped at a redirect: {refused}")
                 break
             target = following
-            answer = _send(target, method, sent_headers, data, timeout, opener,
-                           pinned, sink=sink, watch=watch, deadline=deadline)
+            with _stage("upstream"):
+                answer = _send(target, method, sent_headers, data, timeout,
+                               opener, pinned, sink=sink, watch=watch,
+                               deadline=deadline)
     except Exception as exc:
         detail = scrubber.text(f"{type(exc).__name__}: {exc}")
         # After the bytes went out a timeout is not a failure but an unknown:
@@ -1594,7 +1658,8 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
     }
 
 
-def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
+def sign_only(conn, request: dict, *, store=None, notify: bool = True,
+              accepted: tuple[float, float] | None = None) -> dict:
     """Sign a payload xenia is not going to send.
 
     Where the caller sends the request itself, there is nothing here to make
@@ -1602,6 +1667,11 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
     credential: it is specific to this payload and worth nothing against
     another.
     """
+    return _timed(lambda: _sign_only(conn, request, store=store,
+                                     notify=notify), accepted)
+
+
+def _sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
     started = time.monotonic()
     name = str(request.get("secret") or "").strip()
     profile_name = str(request.get("profile") or "default")
@@ -1652,7 +1722,8 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
                              source="prompt")
             _asked.pop((name, SIGN_SCOPE), None)
 
-        value = (store or vault.backend(row["backend"])).get(name)
+        with _stage("keyring"):
+            value = (store or vault.backend(row["backend"])).get(name)
         if value is None:
             raise Refusal(f"the credential store has no value for '{name}'",
                           code="no-value")
@@ -1665,12 +1736,14 @@ def sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
                 code="off-policy")
 
         text, is_json = _json_body(payload)
+        with _stage("bookkeep"):
+            nonce = next_nonce(conn, name, time.time())
         context = signing.Context(
             secret=value, method="SIGN", url="", headers={}, body=text,
-            config=profile, nonce=next_nonce(conn, name, time.time()),
-            now=time.time())
+            config=profile, nonce=nonce, now=time.time())
         try:
-            signature = signing.sign(profile, context)
+            with _stage("sign"):
+                signature = signing.sign(profile, context)
         except signing.SchemeError as exc:
             raise Refusal(str(exc), code=exc.code) from exc
     except Refusal as refusal:
@@ -1738,6 +1811,11 @@ def _rollback(conn) -> None:
 
 
 def _bookkeep(conn, writes: list[tuple[str, tuple]], name: str | None) -> str | None:
+    with _stage("bookkeep"):
+        return _write_down(conn, writes, name)
+
+
+def _write_down(conn, writes: list[tuple[str, tuple]], name: str | None) -> str | None:
     with _deferred_lock:
         waiting = list(_deferred)
         _deferred.clear()
@@ -2132,11 +2210,23 @@ OPS = {
              "response_sha256}. 'binary' needs 'capture' and streams the body "
              "to that file undecoded and uncut, up to FETCH_MAX_BINARY_BYTES: "
              "the ordinary path decodes as UTF-8 with 'replace', which "
-             "silently corrupts anything that is not text.",
+             "silently corrupts anything that is not text. 'timeout' bounds "
+             "the whole binary transfer, and at most MAX_DOWNLOADS binary "
+             "fetches run at once; past that one is refused 'unavailable'. "
+             "Every reply also carries 'timing'.",
     "sign": "sign a payload xenia will not send, for a chain the caller "
             "broadcasts to itself. Takes {secret, profile, payload}. -> "
-            "{signature, nonce, signed_bytes} or {refused, code}.",
+            "{signature, nonce, signed_bytes, timing} or {refused, code, "
+            "timing}.",
 }
+
+TIMING = ("{received_wall_ms: epoch ms when the broker accepted the "
+          "connection, queued_ms: accepted -> handler started, keyring_ms: "
+          "reading credentials from the store, sign_ms: computing signatures, "
+          "upstream_ms: connect, send and read the far side's answer, "
+          "bookkeep_ms: xenia's own database writes, approval_ms: everything "
+          "else the handler did (grants, policy, building the request), "
+          "total_ms}; monotonic clocks, milliseconds")
 
 
 #: How long an accepted connection has to finish sending its request, and how
@@ -2217,22 +2307,25 @@ class Server:
                 client, _ = self._sock.accept()
             except OSError:
                 break
+            accepted = (time.monotonic(), time.time())
             if not self._slots.acquire(blocking=False):
                 # Refusing is the answer, not queueing behind it: a caller
                 # told the broker is busy can retry, and a caller waiting on a
                 # thread that will never free is just another wedged client.
                 _turn_away(client)
                 continue
-            threading.Thread(target=self._one, args=(client,), daemon=True,
+            threading.Thread(target=self._one, args=(client, accepted), daemon=True,
                              name="xenia-broker-call").start()
 
-    def _one(self, client: socket.socket) -> None:
+    def _one(self, client: socket.socket,
+             accepted: tuple[float, float] | None = None) -> None:
         try:
-            self._answer(client)
+            self._answer(client, accepted)
         finally:
             self._slots.release()
 
-    def _answer(self, client: socket.socket) -> None:
+    def _answer(self, client: socket.socket,
+                accepted: tuple[float, float] | None = None) -> None:
         with client:
             client.settimeout(CLIENT_READ_TIMEOUT)
             try:
@@ -2244,7 +2337,7 @@ class Server:
                          "code": "off-policy"}).encode() + b"\n")
                     return
                 payload = _read_line(client)
-                reply = self.handle(json.loads(payload), who)
+                reply = self.handle(json.loads(payload), who, accepted)
             except Exception as exc:
                 # PROTOCOL BELONGS ON THIS REPLY TOO. Without it a caller that
                 # checks the version — which it must, since that is what the
@@ -2258,7 +2351,8 @@ class Server:
             except OSError:
                 pass
 
-    def handle(self, message: dict, who: dict | None = None) -> dict:
+    def handle(self, message: dict, who: dict | None = None,
+               accepted: tuple[float, float] | None = None) -> dict:
         """One request, one reply, both JSON. See OPS for the contract.
 
         Every reply carries `protocol`. Something outside this repo parses
@@ -2272,7 +2366,7 @@ class Server:
         if op == "ping":
             reply = {"ok": True, "pid": os.getpid()}
         elif op == "ops":
-            reply = {"ops": OPS, "codes": CODES,
+            reply = {"ops": OPS, "codes": CODES, "timing": TIMING,
                      "schemes": {name: signing.available(name)
                                  for name in sorted(signing.SCHEMES)}}
         elif op in ("fetch", "sign"):
@@ -2287,8 +2381,9 @@ class Server:
                 try:
                     message = dict(message)
                     message.setdefault("client", _describe(who))
-                    reply = (fetch(conn, message) if op == "fetch"
-                             else sign_only(conn, message))
+                    reply = (fetch(conn, message, accepted=accepted)
+                             if op == "fetch"
+                             else sign_only(conn, message, accepted=accepted))
                 finally:
                     conn.close()
         else:
