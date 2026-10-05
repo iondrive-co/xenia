@@ -23,7 +23,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 
 class SchemeError(Exception):
@@ -58,6 +58,11 @@ class Context:
     def parts(self):
         return urlsplit(self.url)
 
+    def form_fields(self) -> dict[str, str]:
+        if not self.body or self.body.lstrip()[:1] in ("{", "["):
+            return {}
+        return {f"form.{k}": v for k, v in parse_qsl(self.body, keep_blank_values=True)}
+
     def variables(self) -> dict[str, str]:
         parts = self.parts
         query = f"?{parts.query}" if parts.query else ""
@@ -77,6 +82,7 @@ class Context:
                       f".{int(self.now * 1000) % 1000:03d}Z",
             "amz_date": time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(self.now)),
             "amz_day": time.strftime("%Y%m%d", time.gmtime(self.now)),
+            **self.form_fields(),
             **self.extras,
         }
 
@@ -98,9 +104,11 @@ def render(template: str, variables: dict[str, str]) -> str:
         if not closed:
             raise SchemeError(f"unclosed '{{' in the signing template")
         if name not in variables:
+            known = sorted(k for k in variables if not k.startswith("form."))
             raise SchemeError(
-                f"the signing template names {{{name}}}, which is not one of: "
-                f"{', '.join(sorted(variables))}")
+                f"the signing template names {{{name}}}, which this request "
+                f"does not have; it may use {', '.join(known)}, or "
+                f"form.<field> for a field of a form body")
         out.append(variables[name])
     return "".join(out)
 
@@ -145,8 +153,13 @@ def hmac_scheme(ctx: Context) -> str:
             "to sign is config, not something the caller may choose")
     variables = ctx.variables()
     message = render(template, variables)
+    data = message.encode()
+    prehash = ctx.config.get("prehash_template")
+    if prehash:
+        data += _digest(ctx.config.get("prehash_digest", "sha256"))(
+            render(prehash, variables).encode()).digest()
     raw = hmac.new(_key_bytes(ctx.secret, ctx.config.get("key_encoding", "utf8")),
-                   message.encode(),
+                   data,
                    _digest(ctx.config.get("digest", "sha256"))).digest()
 
     # THE PUBLIC HALF OF A KEY PAIR. Most REST services send an identifier

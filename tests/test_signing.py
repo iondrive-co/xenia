@@ -300,3 +300,29 @@ def test_no_api_key_header_is_added_unless_the_profile_asks():
     ctx = _ctx("secret", scheme="hmac", template="{method}", key_id="unused")
     signing.hmac_scheme(ctx)
     assert ctx.headers == {}
+
+
+def test_a_prehash_appends_the_raw_digest_of_a_second_template():
+    body = ("nonce=1616492376594&ordertype=limit&pair=XBTUSD&price=37500"
+            "&type=buy&volume=1.25")
+    ctx = signing.Context(
+        secret="kQH5HW/8p1uGOVjbgWA7FunAmGO8lsSUXNsu3eow76sz84Q18fWxnyRzBHCd3pd5nE9qa99HAZtuZuj6F1huXg==",
+        method="POST", url="https://api.example.test/0/private/AddOrder",
+        headers={}, body=body,
+        config={"scheme": "hmac", "template": "{path}",
+                "prehash_template": "{form.nonce}{body}",
+                "prehash_digest": "sha256", "digest": "sha512",
+                "key_encoding": "base64", "encoding": "base64"},
+        nonce=1, now=1_600_000_000.0)
+
+    assert signing.hmac_scheme(ctx) == (
+        "4/dpxb3iT4tp/ZCVEwSnEsLxx0bqyhLpdfOpc6fn7OR8+UClSV5n9E6aSS8MPtnRfp32bAb0nmbRn6H8ndwLUQ==")
+
+
+def test_form_fields_are_only_read_from_a_form_body():
+    assert context(body="a=1&b=").variables()["form.b"] == ""
+    assert not any(k.startswith("form.")
+                   for k in context(body='{"a": 1}').variables())
+    with pytest.raises(signing.SchemeError, match="form.nonce"):
+        signing.sign({"scheme": "hmac", "template": "{path}",
+                      "prehash_template": "{form.nonce}"}, context())

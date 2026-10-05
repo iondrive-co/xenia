@@ -1366,12 +1366,13 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
     host = ""
 
     def refuse(exc: Refusal, placed=None, grant_id=None) -> dict:
+        reason = scrubber.text(str(exc))
         _record(conn, name=name, client=client, host=host, method=method,
-                url=url, placed=placed, decision="refused", reason=str(exc),
+                url=url, placed=placed, decision="refused", reason=reason,
                 code=exc.code, grant_id=grant_id, status=None, size=None,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 echoed=False)
-        return {"refused": str(exc), "code": exc.code, "secret": name,
+        return {"refused": reason, "code": exc.code, "secret": name,
                 "url": url}
 
     try:
@@ -1678,14 +1679,17 @@ def _sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
     payload = request.get("payload")
     client = request.get("client")
 
+    scrubber = Scrubber()
+
     def refuse(exc: Refusal) -> dict:
+        reason = scrubber.text(str(exc))
         _record(conn, name=name, client=client, host="(sign)", method="SIGN",
                 url=f"profile:{profile_name}", placed=None, decision="refused",
-                reason=str(exc), code=exc.code, grant_id=None, status=None,
+                reason=reason, code=exc.code, grant_id=None, status=None,
                 size=None,
                 duration_ms=int((time.monotonic() - started) * 1000),
                 echoed=False)
-        return {"refused": str(exc), "code": exc.code, "secret": name}
+        return {"refused": reason, "code": exc.code, "secret": name}
 
     try:
         if not name or payload is None:
@@ -1727,6 +1731,7 @@ def _sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
         if value is None:
             raise Refusal(f"the credential store has no value for '{name}'",
                           code="no-value")
+        scrubber.add(name, value)
 
         profiles = profiles_for(row, "SIGN")
         profile = profiles.get(profile_name)

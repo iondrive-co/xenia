@@ -2358,3 +2358,58 @@ def test_when_the_keyring_is_locked_sign_says_so_plainly(wired):
         store=LockedStore(), notify=False)
     assert answer["code"] == "unavailable"
     assert answer["refused"] == "the keyring is locked"
+
+
+def _form_signed(conn, template="{path}", prehash="{form.nonce}{body}"):
+    broker.register(conn, "form-api", backend="memory", hosts=[HOST],
+                    methods=["POST"])
+    broker.set_profile(conn, "form-api", "default", {
+        "scheme": "hmac", "template": template, "prehash_template": prehash})
+    broker.grant(conn, "form-api", HOST, mutating=True, source="test")
+    return {"secret": "form-api", "method": "POST",
+            "url": f"https://{HOST}/api/create",
+            "headers": {"Content-Type": "application/x-www-form-urlencoded",
+                        "X-SIGNATURE": "{{sign}}"},
+            "body": broker.PLACEHOLDER + "=x"}
+
+
+def test_a_credential_in_a_form_field_name_never_reaches_a_signing_error(conn):
+    out = broker.fetch(conn, _form_signed(conn),
+                       store=Store({"form-api": VALUE}), opener=Opener(),
+                       notify=False)
+
+    assert "refused" in out
+    assert VALUE not in json.dumps(out)
+    reasons = [r["reason"] for r in conn.execute("SELECT reason FROM secret_use")]
+    assert reasons and not any(VALUE in r for r in reasons)
+
+
+def test_a_refusal_that_carries_a_credential_is_scrubbed(conn, monkeypatch):
+    def leaky(profile, ctx):
+        raise broker.signing.SchemeError(f"cannot sign with {ctx.secret}")
+
+    monkeypatch.setattr(broker.signing, "sign", leaky)
+    out = broker.fetch(conn, _form_signed(conn),
+                       store=Store({"form-api": VALUE}), opener=Opener(),
+                       notify=False)
+
+    assert VALUE not in out["refused"] and "[REDACTED:form-api]" in out["refused"]
+    reason = conn.execute("SELECT reason FROM secret_use").fetchone()["reason"]
+    assert VALUE not in reason
+
+
+def test_a_signing_only_refusal_is_scrubbed(conn, monkeypatch):
+    def leaky(profile, ctx):
+        raise broker.signing.SchemeError(f"cannot sign with {ctx.secret}")
+
+    _form_signed(conn)
+    monkeypatch.setattr(broker.signing, "sign", leaky)
+    broker.grant(conn, "form-api", broker.SIGN_SCOPE, mutating=True,
+                 source="test")
+    out = broker.sign_only(conn, {"secret": "form-api", "payload": "a=1"},
+                           store=Store({"form-api": VALUE}), notify=False)
+
+    assert "refused" in out and VALUE not in out["refused"]
+    reason = conn.execute(
+        "SELECT reason FROM secret_use ORDER BY rowid DESC").fetchone()["reason"]
+    assert VALUE not in reason
