@@ -251,11 +251,90 @@ def test_the_connection_is_closed_even_when_the_call_fails(monkeypatch):
     assert bus.closed
 
 
-def test_a_clean_operation_closes_its_connection_at_once():
+def test_reads_share_one_connection_and_one_session():
     bus = FakeBus()
     bus.items["pat"] = b"value"
-    assert store(bus).get("pat") == "value"
-    assert bus.closed
+    made = []
+
+    def connect():
+        made.append(bus)
+        return bus
+
+    box = vault.SecretService(connect=connect, gate=vault.UnlockGate())
+    assert [box.get("pat") for _ in range(3)] == ["value"] * 3
+    assert len(made) == 1
+    assert [c[1] for c in bus.calls].count("OpenSession") == 1
+    assert not bus.closed
+
+
+def test_every_store_built_for_the_default_bus_shares_its_session(monkeypatch):
+    held = vault.HeldSession(lambda: None)
+    monkeypatch.setattr(vault, "HELD", held)
+    assert vault.SecretService()._held is held
+    assert vault.SecretService()._held is held
+
+
+class GoneBus(FakeBus):
+
+    def __init__(self, fail_on: str) -> None:
+        super().__init__()
+        self.fail_on = fail_on
+
+    def call(self, dest, path, interface, member, signature="", body=(), timeout=None):
+        if member == self.fail_on:
+            from xenia.dbus import DBusError
+            raise DBusError("org.freedesktop.DBus.Error.NoReply: Message "
+                            "recipient disconnected from message bus without "
+                            "replying")
+        return FakeBus.call(self, dest, path, interface, member, signature, body, timeout)
+
+
+def _restarting(monkeypatch, *failing):
+    monkeypatch.setattr(vault, "LINGER", 0.0)
+    monkeypatch.setattr(vault, "RETRY_PAUSES", (0.01,))
+    items = {"pat": b"value"}
+    made = []
+
+    def connect():
+        bus = GoneBus(failing[len(made)]) if len(made) < len(failing) else FakeBus()
+        bus.items = items
+        made.append(bus)
+        return bus
+    return vault.SecretService(connect=connect, gate=vault.UnlockGate()), made
+
+
+@pytest.mark.parametrize("fail_on", ["OpenSession", "SearchItems", "GetSecret"])
+def test_a_keyring_that_restarts_under_a_read_is_read_again(monkeypatch, fail_on):
+    box, made = _restarting(monkeypatch, fail_on)
+    assert box.get("pat") == "value"
+    assert len(made) == 2
+    assert made[0].closed and not made[1].closed
+
+
+def test_a_keyring_that_stays_down_is_given_up_on_inside_the_window(monkeypatch):
+    monkeypatch.setattr(vault, "RETRY_WINDOW", 0.1)
+    box, made = _restarting(monkeypatch, *["OpenSession"] * 1000)
+    with pytest.raises(vault.VaultError, match="could not open a session"):
+        box.get("pat")
+    assert 2 <= len(made) < 1000
+
+
+def test_a_locked_keyring_is_refused_once_and_keeps_its_connection(monkeypatch):
+    monkeypatch.setattr(vault, "RETRY_PAUSES", (0.01,))
+
+    class Refusing(vault.UnlockGate):
+        asked = 0
+
+        def unlock(self, connect, paths):
+            Refusing.asked += 1
+            raise vault.VaultError("the keyring is locked")
+
+    bus = FakeBus(locked=True)
+    bus.items["pat"] = b"value"
+    with pytest.raises(vault.VaultError, match="locked"):
+        store(bus, gate=Refusing()).get("pat")
+    assert Refusing.asked == 1
+    assert not bus.closed
 
 
 def test_describe_names_the_program_serving_the_store(monkeypatch):

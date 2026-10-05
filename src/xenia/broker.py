@@ -1065,7 +1065,8 @@ def _origin(url: str) -> tuple[str, str, int | None]:
 
 def _send(target: str, method: str, headers: dict, data: bytes | None,
           timeout: float, opener=None, pinned: str = "",
-          sink: Path | None = None, watch=None) -> dict:
+          sink: Path | None = None, watch=None,
+          deadline: float | None = None) -> dict:
     request = urllib.request.Request(target, data=data, method=method)
     for key, value in headers.items():
         request.add_header(key, value)
@@ -1080,7 +1081,8 @@ def _send(target: str, method: str, headers: dict, data: bytes | None,
         if sink is not None and 200 <= response.status < 300:
             return {"status": response.status, "reason": response.reason or "",
                     "headers": dict(response.headers.items()), "raw": b"",
-                    "streamed": _drain_to_file(response, sink, watch)}
+                    "streamed": _drain_to_file(response, sink, watch,
+                                               deadline, timeout)}
         raw = response.read(config.FETCH_MAX_BYTES + 1)
         return {"status": response.status, "reason": response.reason or "",
                 "headers": dict(response.headers.items()), "raw": raw}
@@ -1194,7 +1196,15 @@ def _capture(name: str, kind: str, payload: bytes) -> tuple[str, str]:
     return str(target), hashlib.sha256(payload).hexdigest()
 
 
-def _drain_to_file(response, target: Path, watch) -> dict:
+def _past(deadline: float | None, timeout: float, done: int) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError(
+            f"the response was still arriving when the {timeout:g}s timeout "
+            f"ran out ({done:,} bytes read)")
+
+
+def _drain_to_file(response, target: Path, watch,
+                   deadline: float | None = None, timeout: float = 0.0) -> dict:
     """Stream a response body to disk without decoding it, and without holding it.
 
     THE DECODE IS THE BUG THIS EXISTS TO AVOID. The text path does
@@ -1218,6 +1228,7 @@ def _drain_to_file(response, target: Path, watch) -> dict:
             except OSError:
                 pass
             while True:
+                _past(deadline, timeout, written)
                 chunk = response.read(BINARY_CHUNK)
                 if not chunk:
                     break
@@ -1233,6 +1244,12 @@ def _drain_to_file(response, target: Path, watch) -> dict:
                     written += len(chunk)
                 if truncated:
                     break
+    except BaseException:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise
     finally:
         try:
             response.close()
@@ -1242,9 +1259,38 @@ def _drain_to_file(response, target: Path, watch) -> dict:
             "sha256": digest.hexdigest(), "truncated": truncated}
 
 
+MAX_DOWNLOADS = int(os.environ.get("XENIA_BROKER_MAX_DOWNLOADS", 4))
+
+_downloads = threading.BoundedSemaphore(max(1, MAX_DOWNLOADS))
+
+
 def fetch(conn, request: dict, *, store=None, opener=None,
           notify: bool = True) -> dict:
     """Make one authenticated request on an agent's behalf."""
+    if not request.get("binary") or not request.get("capture"):
+        return _fetch(conn, request, store=store, opener=opener, notify=notify)
+    if not _downloads.acquire(blocking=False):
+        name = str(request.get("secret") or "").strip()
+        url = str(request.get("url") or "").strip()
+        method = str(request.get("method") or "GET").upper()
+        reason = (f"xenia is already streaming {MAX_DOWNLOADS} binary "
+                  f"downloads, and keeps its other slots for ordinary calls. "
+                  f"Nothing was sent. Retry when one of yours has finished.")
+        _record(conn, name=name, client=request.get("client"),
+                host=urlsplit(url).hostname or "", method=method, url=url,
+                placed=None, decision="refused", reason=reason,
+                code="unavailable", grant_id=None, status=None, size=None,
+                duration_ms=0, echoed=False)
+        return {"refused": reason, "code": "unavailable", "secret": name,
+                "url": url}
+    try:
+        return _fetch(conn, request, store=store, opener=opener, notify=notify)
+    finally:
+        _downloads.release()
+
+
+def _fetch(conn, request: dict, *, store=None, opener=None,
+           notify: bool = True) -> dict:
     started = time.monotonic()
     name = str(request.get("secret") or "").strip()
     url = str(request.get("url") or "").strip()
@@ -1386,10 +1432,11 @@ def fetch(conn, request: dict, *, store=None, opener=None,
         if not echoed_binary and scrubber.echoed_bytes(payload):
             echoed_binary = True
 
+    deadline = time.monotonic() + timeout
     try:
         sent = True
         answer = _send(target, method, sent_headers, data, timeout, opener,
-                       pinned, sink=sink, watch=watch)
+                       pinned, sink=sink, watch=watch, deadline=deadline)
         for _hop in range(config.FETCH_MAX_REDIRECTS):
             location = answer["headers"].get("Location") or \
                 answer["headers"].get("location")
@@ -1419,7 +1466,7 @@ def fetch(conn, request: dict, *, store=None, opener=None,
                 break
             target = following
             answer = _send(target, method, sent_headers, data, timeout, opener,
-                           pinned, sink=sink, watch=watch)
+                           pinned, sink=sink, watch=watch, deadline=deadline)
     except Exception as exc:
         detail = scrubber.text(f"{type(exc).__name__}: {exc}")
         # After the bytes went out a timeout is not a failure but an unknown:

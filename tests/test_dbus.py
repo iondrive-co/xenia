@@ -160,3 +160,30 @@ def test_no_bus_anywhere_is_a_clean_error(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
     with pytest.raises(dbus.DBusError):
         dbus.session_bus_address()
+
+
+def test_a_bus_that_hangs_up_fails_the_waiting_call_at_once():
+    import socket
+    import threading
+    import time
+
+    from xenia import dbus
+
+    ours, theirs = socket.socketpair()
+    conn = dbus.Connection(address="unix:path=/nowhere.invalid")
+    conn._sock = ours
+    conn._running = True
+    conn._thread = threading.Thread(target=conn._reader, daemon=True)
+    conn._thread.start()
+
+    threading.Timer(0.05, theirs.close).start()
+    began = time.monotonic()
+    with pytest.raises(dbus.DBusError, match="closed during"):
+        conn.call("org.example.Store", "/", "org.example.Store", "Get",
+                  timeout=5.0)
+    assert time.monotonic() - began < 2.0
+
+    with pytest.raises(dbus.DBusError, match="is closed"):
+        conn.call("org.example.Store", "/", "org.example.Store", "Get",
+                  timeout=5.0)
+    conn.close()

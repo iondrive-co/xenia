@@ -399,6 +399,10 @@ class Connection:
                 except Exception:
                     pass
         self._running = False
+        with self._lock:
+            waiting = list(self._replies.values())
+        for slot in waiting:
+            slot[1].set()
 
     def _dispatch(self, message: Message) -> None:
         if message.kind in (METHOD_RETURN, ERROR):
@@ -476,6 +480,9 @@ class Connection:
         with self._lock:
             self._replies[message.serial] = slot
         try:
+            if self._thread is not None and not self._running:
+                raise DBusError(f"the bus connection is closed: cannot call "
+                                f"{interface}.{member}")
             self.send(message)
             if not event.wait(timeout):
                 raise DBusError(f"timed out calling {interface}.{member}")
@@ -484,6 +491,9 @@ class Connection:
                 self._replies.pop(message.serial, None)
 
         reply: Message = slot[0]
+        if reply is None:
+            raise DBusError(f"the bus connection closed during "
+                            f"{interface}.{member}")
         if reply.kind == ERROR:
             detail = reply.body[0] if reply.body else ""
             raise DBusError(f"{reply.error_name}: {detail}")

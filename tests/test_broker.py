@@ -1812,6 +1812,70 @@ def test_an_error_body_is_never_streamed_away(wired, monkeypatch, tmp_path):
     assert answer["binary"] is False
 
 
+class Trickle(Stream):
+
+    def __init__(self, body, pause):
+        super().__init__(200, body)
+        self.pause = pause
+
+    def read(self, size=None):
+        time.sleep(self.pause)
+        return super().read(size)
+
+
+def test_a_download_still_arriving_at_its_timeout_is_abandoned(wired, monkeypatch,
+                                                               tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(broker, "BINARY_CHUNK", 64)
+    allow(wired)
+
+    began = time.monotonic()
+    answer = call(wired, opener=Opener(Trickle(LZ4ISH, 0.02)),
+                  capture="slow", binary=True, timeout=0.2)
+
+    assert time.monotonic() - began < 2.0
+    assert answer["code"] == "sent-outcome-unknown"
+    assert "timeout ran out" in answer["error"]
+    assert not any((tmp_path / "captures").rglob("*slow*"))
+
+
+def test_a_download_inside_its_timeout_is_untouched(wired, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(broker, "BINARY_CHUNK", 4096)
+    allow(wired)
+
+    answer = call(wired, opener=Opener(Trickle(LZ4ISH, 0.001)),
+                  capture="quick", binary=True, timeout=5)
+
+    assert Path(answer["response_path"]).read_bytes() == LZ4ISH
+
+
+def test_downloads_past_the_cap_are_refused_and_other_calls_still_go(
+        wired, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    monkeypatch.setattr(broker, "MAX_DOWNLOADS", 1)
+    monkeypatch.setattr(broker, "_downloads", threading.BoundedSemaphore(1))
+    allow(wired)
+
+    assert broker._downloads.acquire(blocking=False)
+    try:
+        opener = Opener(Stream(200, LZ4ISH))
+        refused = call(wired, opener=opener, capture="queued", binary=True)
+        assert refused["code"] == "unavailable"
+        assert "Nothing was sent" in refused["refused"]
+        assert opener.sent == []
+
+        assert call(wired)["status"] == 200
+    finally:
+        broker._downloads.release()
+
+    answer = call(wired, opener=Opener(Stream(200, LZ4ISH)),
+                  capture="queued", binary=True)
+    assert Path(answer["response_path"]).read_bytes() == LZ4ISH
+    assert broker._downloads.acquire(blocking=False)
+    broker._downloads.release()
+
+
 # -- the nonce, and the write lock ------------------------------------------
 #
 # `fetch` calls `next_nonce` BEFORE it sends, so an uncommitted nonce would

@@ -37,6 +37,10 @@ CALL_TIMEOUT = 10.0
 
 DIALOG_LIFETIME = float(os.environ.get("XENIA_DIALOG_LIFETIME", 600.0))
 
+RETRY_WINDOW = float(os.environ.get("XENIA_KEYRING_RETRY_WINDOW", 8.0))
+
+RETRY_PAUSES = (0.25, 0.5, 1.0, 2.0)
+
 PROMPT_COOLDOWN = float(os.environ.get("XENIA_PROMPT_COOLDOWN", 120.0))
 
 
@@ -133,6 +137,41 @@ def _hold_prompt(conn, path: str, lifetime: float) -> bool:
 GATE = UnlockGate()
 
 
+class HeldSession:
+    def __init__(self, connect: Callable[[], Any]) -> None:
+        self._connect = connect
+        self._lock = threading.Lock()
+        self._conn: Any = None
+        self._session: str | None = None
+
+    def take(self, open_session: Callable[[Any], str]) -> tuple[Any, str]:
+        with self._lock:
+            if self._conn is None:
+                conn = self._connect()
+                try:
+                    session = open_session(conn)
+                except BaseException:
+                    _close(conn)
+                    raise
+                self._conn, self._session = conn, session
+            return self._conn, self._session
+
+    def drop(self, conn: Any) -> None:
+        with self._lock:
+            if conn is not self._conn:
+                return
+            self._conn = self._session = None
+        _close(conn)
+
+
+def _transient(exc: BaseException) -> bool:
+    from .dbus import DBusError
+
+    if isinstance(exc, VaultError):
+        return isinstance(exc.__cause__, (DBusError, OSError))
+    return isinstance(exc, (DBusError, OSError))
+
+
 class SecretService:
     """The freedesktop Secret Service, over xenia's own D-Bus client.
 
@@ -142,24 +181,38 @@ class SecretService:
 
     kind = "secret-service"
 
-    def __init__(self, connect: Callable[[], Any] | None = None, gate: UnlockGate | None = None) -> None:
+    def __init__(self, connect: Callable[[], Any] | None = None, gate: UnlockGate | None = None,
+                 held: HeldSession | None = None) -> None:
         self._connect = connect or _session_bus
         self._gate = gate or GATE
+        self._held = held or (HELD if connect is None else HeldSession(self._connect))
 
     # -- interface ---------------------------------------------------------
 
     def get(self, name: str) -> str | None:
-        conn = self._connect()
-        try:
-            session = self._session(conn)
-            item = self._find(conn, name)
-            if item is None:
-                return None
-            secret = conn.call(SERVICE, item, I_ITEM, "GetSecret", "o",
-                               [session], timeout=CALL_TIMEOUT)[0]
-            return bytes(secret[2]).decode()
-        finally:
-            _close(conn)
+        deadline = time.monotonic() + RETRY_WINDOW
+        pauses = iter(RETRY_PAUSES)
+        while True:
+            conn = None
+            try:
+                conn, session = self._held.take(self._session)
+                return self._read(conn, session, name)
+            except Exception as exc:
+                transient = _transient(exc)
+                if conn is not None and (transient or not isinstance(exc, VaultError)):
+                    self._held.drop(conn)
+                pause = next(pauses, RETRY_PAUSES[-1])
+                if not transient or time.monotonic() + pause > deadline:
+                    raise
+                time.sleep(pause)
+
+    def _read(self, conn, session: str, name: str) -> str | None:
+        item = self._find(conn, name)
+        if item is None:
+            return None
+        secret = conn.call(SERVICE, item, I_ITEM, "GetSecret", "o",
+                           [session], timeout=CALL_TIMEOUT)[0]
+        return bytes(secret[2]).decode()
 
     def set(self, name: str, value: str) -> None:
         from .dbus import Variant
@@ -323,6 +376,9 @@ class SecretService:
 def _session_bus():
     from .dbus import Connection
     return Connection().connect()
+
+
+HELD = HeldSession(_session_bus)
 
 
 LINGER = float(os.environ.get("XENIA_LINGER", 60.0))
