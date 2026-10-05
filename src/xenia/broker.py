@@ -645,7 +645,7 @@ def _resolved_addresses(host: str) -> list[str]:
         info = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise Refusal(f"{host} does not resolve: {exc}") from exc
-    return sorted({item[4][0] for item in info})
+    return list(dict.fromkeys(item[4][0] for item in info))
 
 
 def check_target(url: str) -> tuple[str, str, str]:

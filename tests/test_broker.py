@@ -60,6 +60,9 @@ class Opener:
         return self.replies[min(len(self.sent) - 1, len(self.replies) - 1)]
 
 
+_REAL_RESOLVED_ADDRESSES = broker._resolved_addresses
+
+
 @pytest.fixture(autouse=True)
 def _dns(monkeypatch):
     """Every test host resolves somewhere ordinary unless it says otherwise.
@@ -615,6 +618,21 @@ def test_a_name_resolving_into_link_local_space_is_refused(wired, monkeypatch):
 
     assert "link-local" in answer["refused"]
     assert "169.254.169.254" in answer["refused"]
+
+
+def test_the_pinned_address_is_the_resolvers_first_choice(monkeypatch):
+    tcp = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "")
+    tcp6 = (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "")
+    monkeypatch.setattr(broker.socket, "getaddrinfo", lambda *a, **k: [
+        (*tcp, ("203.0.113.20", 0)),
+        (*tcp6, ("2001:db8::20", 0, 0, 0)),
+        (*tcp, ("203.0.113.20", 0))])
+    monkeypatch.setattr(broker, "_resolved_addresses", _REAL_RESOLVED_ADDRESSES)
+
+    assert broker._resolved_addresses("dual.test") == [
+        "203.0.113.20", "2001:db8::20"]
+    assert broker.check_target("https://dual.test/v1/items")[2] == \
+        "203.0.113.20"
 
 
 def test_a_name_that_resolves_nowhere_is_refused_rather_than_tried(wired,
