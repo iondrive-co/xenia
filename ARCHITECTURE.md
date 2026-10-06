@@ -12,14 +12,10 @@
 
 ## Capture
 
-Turning a hook payload into rows. This runs inside an agent's own tool call,
-which is why every part of it fails soft.
-
 | Module | What is in it |
 | --- | --- |
-| `hook.py` | the recording hook. It says nothing back, so it can stay installed on its own |
-| `guard.py` | the hook that talks back, in its own settings entry so it can be removed without the record: the one call xenia refuses (`selfmatch.py`), or else the agora nudge. It runs beside `xenia-hook`, not after it, so neither depends on the other having run |
-| `selfmatch.py` | whether a `pkill -f` / `pgrep -f` matches the agent's own `bash -c` shell, which kills that shell (`Exit code 144`), makes a wait on it never end, or makes a check on it always say "running". Names `-A` (`--ignore-ancestors`) as the fix. Fails open: a pattern it cannot read lets the call run |
+| `hook.py` | record calls |
+| `guard.py` |  warn an agent about dangerous calls |
 | `ingest.py` | hook payload → ledger → projections |
 | `classify.py` | remote-call and filesystem-change detection — `RemoteFact`, `FsFact`, `Result` |
 | `plan.py` | the agent's own plan, read out of its tool calls — `Plan`, `PlanItem` |
@@ -36,14 +32,12 @@ which is why every part of it fails soft.
 
 ## Credentials
 
-Values live in the operating system's store; xenia holds the name, the policy
-and the record. Only the service ever reads a value, and only for the length of
-one outbound request.
+Values live in the operating system's store; xenia holds the name, the policy and the record.
 
 | Module | What is in it |
 | --- | --- |
 | `vault.py` | the OS stores — Secret Service over `dbus.py`, Keychain over `security` — behind `get`/`set`/`delete` |
-| `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing — `Refusal`, `Scrubber`, `Server`, `OPS`, `CODES`. `Server.start()` REFUSES rather than replacing a socket something is still answering on (`socket_is_live`, `BrokerAlreadyListening`), and `stop()` unlinks only the inode it bound: a second instance that took the path and then left would strand the first on an anonymous inode, while `ss -lx` still showed a listener |
+| `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing |
 | `signing.py` | how a credential authenticates a request without appearing in it — `Context`, `SCHEMES`, `SchemeError` |
 | `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
 | `secrets.py` | first-use setup for the store, and adding, renaming, removing and approving credentials — `add`, `rename`, `remove`, shared by the command and the page |
@@ -52,35 +46,15 @@ one outbound request.
 
 | Module | What is in it |
 | --- | --- |
-| `agora.py` | the agora — what agents have told each other they are running, what it costs, and whether it is safe to kill. Posting, updating and releasing a claim, the process and memory probing behind `assess`, the totals in `summary`, and `nudge` — what xenia-guard tells an agent starting something heavy for the first time in a session |
-
-The claim table is the one thing an agent writes. It is not part of the
-record: a claim is authored by the agent rather than derived from its events,
-it is released when the work is done rather than kept forever, and nothing
-about what an agent *did* can be reached through it. The holder of a claim is
-the `xenia-mcp` process that posted it — one per agent session — so liveness
-needs no heartbeat, and a claim outliving its session says so by itself.
-
-Two rules hold the write path up. A claim is released by its own holder, or by
-anyone once it is no longer live work, so the agora cannot be used to clear a
-peer's claim out from under it. And liveness that cannot be measured is
-reported as live: `_ps` returns `None` rather than an empty result when the
-process table cannot be read, and every claim then reads as held.
+| `agora.py` | the agora — what agents have told each other they are running, what it costs, and whether it is safe to kill |
 
 ## Read
-
-Two front ends over one read path. Neither returns file content, and neither
-can write to the record — what an agent did is not editable from the page that
-reports it. Two things are the exception, and both are somebody else's rather
-than the record's: the credentials, which are the user's, added, renamed and
-removed through `secrets.py`; and the agora, which is the agents', written
-through `agora.py`. Both go through their own module whichever front end asks.
 
 | Module | What is in it |
 | --- | --- |
 | `readonly.py` | every query there is, and the credential boundary — `StaleReader`. `claims` reads the agora as stored; what is live about it is `agora.assess` |
-| `mcp.py` | the MCP protocol and the five tool definitions — `Server`. `xenia_fetch` is forwarded to the broker's socket: this server makes no request, opens no store and holds no value. `xenia_claim` is the one call that opens a read-write connection, through `_writable`, which re-runs the stale-reader check first because opening one is what would migrate the file |
-| `report.py` | the local page and its JSON API — `Report`. Every view is served from a read-only connection; the three paths in `WRITES` are the only ones that answer a POST at all |
+| `mcp.py` | the MCP protocol and the tool definitions |
+| `report.py` | the local page and its JSON API |
 | `readers.py` | the register of long-lived readers, and retiring them on a migration |
 
 ## Desktop

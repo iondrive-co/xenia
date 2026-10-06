@@ -48,6 +48,13 @@ def main(argv: list[str] | None = None) -> int:
             "permissionDecisionReason": refused}}))
         return 0
 
+    held = _hold(payload)
+    if held:
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "permissionDecision": "deny",
+            "permissionDecisionReason": held}}))
+        return 0
+
     said = _nudge(payload)
     if said:
         # A notice, not a refusal. PreToolUse shows the model nothing but
@@ -65,6 +72,20 @@ def _refusal(payload: dict[str, Any]) -> str | None:
         return selfmatch.check(payload)
     except Exception as exc:
         _fallback("guard", f"{type(exc).__name__}: {exc}")
+        return None
+
+
+def _hold(payload: dict[str, Any]) -> str | None:
+    try:
+        from . import relatives
+
+        said = relatives.warning(payload)
+        if not said or relatives.held_before(payload):
+            return None
+        relatives.hold(payload)
+        return said
+    except Exception as exc:
+        _fallback("hold", f"{type(exc).__name__}: {exc}")
         return None
 
 

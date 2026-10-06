@@ -20,6 +20,7 @@ def guard_env(tmp_path, monkeypatch):
     monkeypatch.setenv("XENIA_DB", str(tmp_path / "audit.db"))
     monkeypatch.setenv("XENIA_FALLBACK_LOG", str(tmp_path / "errors.log"))
     monkeypatch.delenv("XENIA_DEBUG", raising=False)
+    monkeypatch.setenv("XENIA_GUARD_HELD", str(tmp_path / "held"))
     return tmp_path
 
 
@@ -69,9 +70,22 @@ def test_only_pre_tool_use_is_answered(guard_env, monkeypatch, capsys):
     assert said("pkill -f worker.sh", monkeypatch, capsys, event="PostToolUse") is None
 
 
+def test_a_kill_of_the_cli_is_held_once_then_runs(guard_env, monkeypatch, capsys):
+    from test_relatives import FakeTree
+
+    monkeypatch.setattr("xenia.relatives.Tree", FakeTree)
+    monkeypatch.setattr("xenia.ingest.detect_agent", lambda _payload: "claude")
+    first = said("kill $PPID", monkeypatch, capsys)
+    assert first["permissionDecision"] == "deny"
+    assert "run exactly the same command again" in first["permissionDecisionReason"]
+    assert said("kill $PPID", monkeypatch, capsys) is None
+    assert said("kill $PPID", monkeypatch, capsys)["permissionDecision"] == "deny"
+
+
 @pytest.mark.parametrize("broken, command", [
     ("xenia.selfmatch.check", "pkill -f worker.sh"),
     ("xenia.agora.nudge", "python3 -m pytest -q"),
+    ("xenia.relatives.warning", "kill $PPID"),
 ])
 def test_nothing_that_breaks_here_costs_the_call(broken, command, guard_env, monkeypatch, capsys):
     def explode(*_args, **_kw):

@@ -56,6 +56,18 @@ def broker_socket() -> Path:
     return base / "xenia" / "broker.sock"
 
 
+def guard_held_dir() -> Path:
+    explicit = os.environ.get("XENIA_GUARD_HELD")
+    if explicit:
+        return Path(explicit).expanduser()
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime else _xdg("XDG_STATE_HOME", ".local/state")
+    return base / "xenia" / "guard-held"
+
+
+GUARD_HOLD_SECONDS = float(os.environ.get("XENIA_GUARD_HOLD_SECONDS", 3600))
+
+
 def site_config_path() -> Path:
     explicit = os.environ.get("XENIA_CONFIG")
     if explicit:
