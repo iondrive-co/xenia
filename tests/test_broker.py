@@ -955,6 +955,86 @@ def test_the_nonce_rises_and_survives_a_restart(wired):
     assert broker.next_nonce(wired, "gitlab-pat", 0.0) > second
 
 
+@pytest.fixture
+def writer(monkeypatch):
+    background = broker.Writer()
+    background.start()
+    monkeypatch.setattr(broker, "_writer", background)
+    monkeypatch.setattr(broker, "_issued", {})
+    yield background
+    background.stop()
+
+
+def test_a_held_database_neither_delays_nor_refuses_a_call(wired, tmp_path,
+                                                          writer):
+    allow(wired, mutating=True)
+    other = db.connect(tmp_path / "audit.db")
+    other.execute("BEGIN IMMEDIATE")
+    opener = Opener()
+
+    try:
+        answer = call(wired, method="POST", opener=opener)
+        assert answer["status"] == 200
+        assert len(opener.sent) == 1
+        assert answer["timing"]["bookkeep_ms"] < 500
+    finally:
+        other.rollback()
+        other.close()
+
+    assert writer.flush()
+    rows = wired.execute("SELECT method, decision FROM secret_use").fetchall()
+    assert [tuple(r) for r in rows] == [("POST", "allowed")]
+
+
+def test_queued_nonces_are_unique_and_outlive_a_restart(wired, writer,
+                                                       tmp_path):
+    issued = []
+    lock = threading.Lock()
+
+    def take():
+        own = db.connect(tmp_path / "audit.db")
+        try:
+            n = broker.next_nonce(own, "gitlab-pat", 1.0)
+        finally:
+            own.close()
+        with lock:
+            issued.append(n)
+
+    threads = [threading.Thread(target=take) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(set(issued)) == 20
+    assert writer.flush()
+    held = wired.execute("SELECT last_nonce FROM secret WHERE name = ?",
+                         ("gitlab-pat",)).fetchone()[0]
+    assert held == max(issued)
+
+    broker._issued.clear()
+    assert broker.next_nonce(wired, "gitlab-pat", 1.0) > max(issued)
+
+
+def test_stopping_the_server_writes_down_what_it_queued(tmp_path, monkeypatch):
+    path = tmp_path / "queued.db"
+    conn = db.connect(path)
+    broker.register(conn, "gitlab-pat", backend="memory", hosts=[HOST],
+                    methods=["GET"])
+    broker.grant(conn, "gitlab-pat", HOST, source="test")
+    server = broker.Server(path=str(tmp_path / "w.sock"), db_path=path)
+    server.start()
+    try:
+        assert broker._writer is not None
+        call(conn)
+    finally:
+        server.stop()
+
+    assert broker._writer is None
+    assert conn.execute("SELECT count(*) FROM secret_use").fetchone()[0] == 1
+    conn.close()
+
+
 def test_the_whole_response_can_be_written_to_a_file(wired, monkeypatch,
                                                      tmp_path):
     """A cut JSON body does not fail loudly, it parses to a different price."""

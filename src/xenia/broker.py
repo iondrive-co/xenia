@@ -850,11 +850,36 @@ def next_nonce(conn, name: str, now: float) -> int:
     reissued.
     """
     floor = int(now * 1000)
-    row = conn.execute(
-        "UPDATE secret SET last_nonce = max(?, coalesce(last_nonce, 0) + 1) "
-        "WHERE name = ? RETURNING last_nonce", (floor, name)).fetchone()
-    conn.commit()
-    return row["last_nonce"] if row else floor
+    writer = _writer
+    if writer is None:
+        row = conn.execute(
+            "UPDATE secret SET last_nonce = max(?, coalesce(last_nonce, 0) + 1) "
+            "WHERE name = ? RETURNING last_nonce", (floor, name)).fetchone()
+        conn.commit()
+        return row["last_nonce"] if row else floor
+    row = conn.execute("SELECT last_nonce FROM secret WHERE name = ?",
+                       (name,)).fetchone()
+    stored = (row["last_nonce"] or 0) if row else 0
+    key = (_database_of(conn), name)
+    with _nonce_lock:
+        issued = max(floor, _issued.get(key, 0) + 1, stored + 1)
+        _issued[key] = issued
+    writer.put(conn, [("UPDATE secret SET last_nonce = "
+                       "max(coalesce(last_nonce, 0), ?) WHERE name = ?",
+                       (issued, name))], name)
+    return issued
+
+
+_nonce_lock = threading.Lock()
+
+_issued: dict[tuple[str, str], int] = {}
+
+
+def _database_of(conn) -> str:
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            return row[2] or ""
+    return ""
 
 
 def _json_body(body: Any) -> tuple[str, bool]:
@@ -1817,7 +1842,86 @@ def _rollback(conn) -> None:
 
 def _bookkeep(conn, writes: list[tuple[str, tuple]], name: str | None) -> str | None:
     with _stage("bookkeep"):
+        writer = _writer
+        if writer is not None:
+            writer.put(conn, writes, name)
+            return None
         return _write_down(conn, writes, name)
+
+
+class Writer:
+
+    def __init__(self) -> None:
+        import queue
+
+        self._jobs: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._conns: dict[str, sqlite3.Connection] = {}
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="xenia-broker-writer")
+        self._thread.start()
+
+    def put(self, conn, writes: list[tuple[str, tuple]], name: str | None) -> None:
+        self._jobs.put((_database_of(conn), list(writes), name))
+
+    def flush(self, timeout: float = 30.0) -> bool:
+        done = threading.Event()
+        self._jobs.put(done)
+        return done.wait(timeout)
+
+    def stop(self, timeout: float = 30.0) -> None:
+        self.flush(timeout)
+        self._jobs.put(None)
+        if self._thread is not None:
+            self._thread.join(timeout)
+        for conn in self._conns.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._conns.clear()
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            if isinstance(job, threading.Event):
+                job.set()
+                continue
+            path, writes, name = job
+            try:
+                conn = self._conns.get(path)
+                if conn is None:
+                    from . import db
+                    conn = self._conns[path] = db.connect(path)
+                _write_down(conn, writes, name)
+            except Exception as exc:
+                self._conns.pop(path, None)
+                _write_down_failed(writes, name, exc)
+
+
+def _write_down_failed(writes, name, exc) -> None:
+    with _deferred_lock:
+        _deferred.extend((sql, params, 0, name) for sql, params in writes)
+        overflow = max(0, len(_deferred) - DEFERRED_LIMIT)
+        del _deferred[:overflow]
+    try:
+        from . import ingest
+        path = config.fallback_log()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(f"{ingest.utcnow()}\tbroker\tcould not open the "
+                         f"database to record a credential use for {name}: "
+                         f"{type(exc).__name__}: {exc}; {len(writes)} write(s) "
+                         f"queued, {overflow} dropped\n")
+    except Exception:
+        pass
+
+
+_writer: Writer | None = None
 
 
 def _write_down(conn, writes: list[tuple[str, tuple]], name: str | None) -> str | None:
@@ -2253,6 +2357,7 @@ class Server:
         self._running = False
         self._inode: int | None = None
         self._slots = threading.Semaphore(MAX_CLIENTS)
+        self._writer: Writer | None = None
 
     def start(self) -> str:
         parent = os.path.dirname(self.path)
@@ -2286,6 +2391,10 @@ class Server:
         except OSError:
             self._inode = None
         self._sock.listen(8)
+        global _writer
+        self._writer = Writer()
+        self._writer.start()
+        _writer = self._writer
         self._running = True
         self._thread = threading.Thread(target=self._accept, daemon=True,
                                         name="xenia-broker")
@@ -2305,6 +2414,12 @@ class Server:
         except OSError:
             pass
         self._inode = None
+        global _writer
+        if self._writer is not None:
+            if _writer is self._writer:
+                _writer = None
+            self._writer.stop()
+            self._writer = None
 
     def _accept(self) -> None:
         while self._running and self._sock is not None:
