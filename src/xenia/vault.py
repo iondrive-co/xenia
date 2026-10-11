@@ -71,6 +71,7 @@ class _Attempt:
     def __init__(self) -> None:
         self.done = threading.Event()
         self.unlocked = False
+        self.conn: Any = None
 
 
 class UnlockGate:
@@ -80,6 +81,10 @@ class UnlockGate:
         self._quiet_until = 0.0
 
     def unlock(self, connect: Callable[[], Any], paths: list[str]) -> None:
+        with self._lock:
+            attempt = self._current
+        if attempt is not None and getattr(attempt.conn, "closed", False):
+            self._settle(attempt, False)
         with self._lock:
             attempt = self._current
             if attempt is None:
@@ -95,43 +100,47 @@ class UnlockGate:
             raise VaultError("the unlock prompt was dismissed: the keyring is locked")
 
     def _run(self, connect: Callable[[], Any], paths: list[str], attempt: _Attempt) -> None:
-        conn = None
         try:
-            conn = connect()
-            _unlocked, prompt = conn.call(SERVICE, ROOT, I_SERVICE, "Unlock", "ao", [paths],
-                                          timeout=CALL_TIMEOUT)
-            attempt.unlocked = True if prompt == NO_OBJECT else _hold_prompt(conn, prompt, DIALOG_LIFETIME)
+            attempt.conn = connect()
+            _unlocked, prompt = attempt.conn.call(SERVICE, ROOT, I_SERVICE, "Unlock", "ao", [paths],
+                                                  timeout=CALL_TIMEOUT)
+            if prompt == NO_OBJECT:
+                self._settle(attempt, True)
+                return
+            _hold_prompt(attempt.conn, prompt, lambda unlocked: self._settle(attempt, unlocked))
         except Exception:
-            attempt.unlocked = False
-        finally:
-            with self._lock:
+            self._settle(attempt, False)
+            return
+        attempt.done.wait(DIALOG_LIFETIME)
+
+    def _settle(self, attempt: _Attempt, unlocked: bool) -> None:
+        with self._lock:
+            if attempt.done.is_set():
+                return
+            attempt.unlocked = unlocked
+            if self._current is attempt:
                 self._current = None
-                if not attempt.unlocked:
-                    self._quiet_until = time.monotonic() + PROMPT_COOLDOWN
+            if not unlocked:
+                self._quiet_until = time.monotonic() + PROMPT_COOLDOWN
             attempt.done.set()
-            if conn is not None:
-                _close(conn)
+        if attempt.conn is not None:
+            _close(attempt.conn)
 
 
-def _hold_prompt(conn, path: str, lifetime: float) -> bool:
-    done = threading.Event()
-    outcome: dict[str, Any] = {"dismissed": True}
-
+def _hold_prompt(conn, path: str, settle: Callable[[bool], None]) -> None:
     def completed(message) -> None:
         body = message.body or []
-        outcome["dismissed"] = bool(body[0]) if body else True
-        done.set()
+        settle(not body[0] if body else False)
 
+    def owner_changed(message) -> None:
+        body = message.body or []
+        if len(body) >= 3 and body[0] == SERVICE and not body[2]:
+            settle(False)
+
+    conn.on_signal("/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                   owner_changed, arg0=SERVICE)
     conn.on_signal(path, I_PROMPT, "Completed", completed)
     conn.call(SERVICE, path, I_PROMPT, "Prompt", "s", [""], timeout=CALL_TIMEOUT)
-    if not done.wait(lifetime):
-        try:
-            conn.call(SERVICE, path, I_PROMPT, "Dismiss", timeout=CALL_TIMEOUT)
-        except Exception:
-            pass
-        done.wait(CALL_TIMEOUT)
-        return False
-    return not outcome["dismissed"]
 
 
 GATE = UnlockGate()

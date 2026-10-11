@@ -379,6 +379,10 @@ class Connection:
             self._sock = None
 
 
+    @property
+    def closed(self) -> bool:
+        return self._sock is None or (self._thread is not None and not self._running)
+
     def _reader(self) -> None:
         buffer = b""
         while self._running:
@@ -509,7 +513,7 @@ class Connection:
         self._handlers[(path, interface)] = handler
 
     def on_signal(self, path: str, interface: str, member: str,
-                  handler: Callable) -> None:
+                  handler: Callable, arg0: str | None = None) -> None:
         """Route one signal to handler, and ask the bus to deliver it.
 
         Signals are not sent to a connection unless it has matched them, so
@@ -520,7 +524,7 @@ class Connection:
         self.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
                   "org.freedesktop.DBus", "AddMatch", "s",
                   [f"type='signal',path='{path}',interface='{interface}',"
-                   f"member='{member}'"])
+                   f"member='{member}'" + (f",arg0='{arg0}'" if arg0 else "")])
 
     def request_name(self, name: str) -> int:
         return self.call("org.freedesktop.DBus", "/org/freedesktop/DBus",

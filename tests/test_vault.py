@@ -25,7 +25,7 @@ class FakeBus:
     def name_has_owner(self, name):
         return True
 
-    def on_signal(self, path, interface, member, handler):
+    def on_signal(self, path, interface, member, handler, arg0=None):
         self._signals[(path, interface, member)] = handler
 
     def close(self):
@@ -174,6 +174,10 @@ class PromptBus(FakeBus):
         self.locked = False
         self._signals[(path, vault.I_PROMPT, "Completed")](type("M", (), {"body": [False, None]})())
 
+    def vanish(self):
+        self._signals[("/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged")](
+            type("M", (), {"body": [vault.SERVICE, ":1.9", ""]})())
+
 
 def _buses():
     items, state, made = {"pat": b"value"}, {}, []
@@ -204,19 +208,64 @@ def test_one_dialog_serves_every_caller_and_its_connection_outlives_them(monkeyp
     assert box.get("pat") == "value"
 
 
-def test_a_dialog_left_open_is_dismissed_by_xenia_never_dropped(monkeypatch):
+def _dialog(made):
+    return [b for b in made if any(c[1] == "Prompt" for c in b.calls)][0]
+
+
+def _until(check):
+    for _ in range(100):
+        if check():
+            return True
+        __import__("time").sleep(0.01)
+    return False
+
+
+def test_a_dialog_outliving_its_lifetime_is_left_open_and_never_dismissed(monkeypatch):
     monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.05)
     monkeypatch.setattr(vault, "DIALOG_LIFETIME", 0.1)
     gate, (connect, made) = vault.UnlockGate(), _buses()
-    with pytest.raises(vault.VaultError):
-        vault.SecretService(connect=connect, gate=gate).get("pat")
-    dialog = [b for b in made if any(c[1] == "Prompt" for c in b.calls)][0]
-    for _ in range(100):
-        if dialog.closed:
-            break
-        __import__("time").sleep(0.01)
-    assert dialog.dismissed and dialog.closed
-    assert [c[1] for c in dialog.calls].index("Dismiss") > [c[1] for c in dialog.calls].index("Prompt")
+    box = vault.SecretService(connect=connect, gate=gate)
+    before = set(__import__("threading").enumerate())
+    with pytest.raises(vault.VaultError, match="waiting for the password"):
+        box.get("pat")
+    waits = [t for t in __import__("threading").enumerate() if t not in before and t.name == "xenia-unlock"]
+    assert len(waits) == 1
+    assert _until(lambda: not waits[0].is_alive())
+    dialog = _dialog(made)
+    assert not dialog.dismissed and not dialog.closed
+    assert "Dismiss" not in [c[1] for c in dialog.calls]
+    with pytest.raises(vault.VaultError, match="waiting for the password"):
+        box.get("pat")
+    assert sum(1 for b in made for c in b.calls if c[1] == "Prompt") == 1
+    dialog.answer()
+    assert _until(lambda: dialog.closed)
+    assert not dialog.dismissed
+    assert box.get("pat") == "value"
+
+
+def test_a_keyring_that_goes_away_under_its_dialog_ends_the_wait(monkeypatch):
+    monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.05)
+    gate, (connect, made) = vault.UnlockGate(), _buses()
+    box = vault.SecretService(connect=connect, gate=gate)
+    with pytest.raises(vault.VaultError, match="waiting for the password"):
+        box.get("pat")
+    dialog = _dialog(made)
+    dialog.vanish()
+    assert dialog.closed and not dialog.dismissed
+    with pytest.raises(vault.VaultError, match="no new one"):
+        box.get("pat")
+
+
+def test_a_dialog_whose_bus_connection_dropped_is_not_waited_on(monkeypatch):
+    monkeypatch.setattr(vault, "PROMPT_TIMEOUT", 0.05)
+    gate, (connect, made) = vault.UnlockGate(), _buses()
+    box = vault.SecretService(connect=connect, gate=gate)
+    with pytest.raises(vault.VaultError, match="waiting for the password"):
+        box.get("pat")
+    _dialog(made).closed = True
+    with pytest.raises(vault.VaultError, match="no new one"):
+        box.get("pat")
+    assert "Dismiss" not in [c[1] for b in made for c in b.calls]
 
 
 def test_a_dismissed_dialog_is_not_raised_again_during_the_cooldown(monkeypatch):
