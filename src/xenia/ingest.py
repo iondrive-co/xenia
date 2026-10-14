@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import sqlite3
@@ -139,7 +140,17 @@ def response_bytes(payload: dict[str, Any]) -> int | None:
 
 
 def outcome_of(payload: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    hook = payload.get("hook_event_name") or ""
+    top_error = payload.get("error")
     response = payload.get("tool_response")
+
+    if hook == "PostToolUseFailure" or top_error:
+        err = top_error or (response.get("error") if isinstance(response, dict) else response) or "tool failure"
+        if isinstance(err, dict):
+            err = err.get("message") or json.dumps(err)
+        err_str = str(err)
+        summary = _cap(err_str, config.RESPONSE_LIMIT)
+        return "error", _cap_ends(err_str, 500), summary
 
     if isinstance(response, str):
         summary = _cap(response, config.RESPONSE_LIMIT)
@@ -152,7 +163,7 @@ def outcome_of(payload: dict[str, Any]) -> tuple[str, str | None, str | None]:
 
     flagged = bool(response.get("isError") or response.get("is_error"))
     exit_code = response.get("exit_code", response.get("exitCode"))
-    interrupted = bool(response.get("interrupted"))
+    interrupted = bool(response.get("interrupted")) or bool(payload.get("is_interrupt"))
 
     error_text = response.get("error")
     if isinstance(error_text, dict):
@@ -235,6 +246,36 @@ def reconcile_agent(conn: sqlite3.Connection, session_id: int, stored: str,
         conn.execute("UPDATE session SET agent = ? WHERE id = ?", (settled, session_id))
 
 
+def is_session_interactive(payload: dict[str, Any]) -> bool:
+    if "interactive" in payload:
+        return bool(payload["interactive"])
+    if "is_interactive" in payload:
+        return bool(payload["is_interactive"])
+    if payload.get("headless"):
+        return False
+    if payload.get("entrypoint") in ("cli", "headless", "print", "cron"):
+        return False
+    if payload.get("source") in ("cli", "headless", "print"):
+        return False
+    try:
+        pid = os.getppid()
+        for _ in range(3):
+            if pid <= 1:
+                break
+            cmdline_path = f"/proc/{pid}/cmdline"
+            if os.path.exists(cmdline_path):
+                with open(cmdline_path, "rb") as f:
+                    args = [a.decode("utf-8", "replace") for a in f.read().split(b"\x00")]
+                for arg in args:
+                    if arg in ("-p", "--print", "--headless"):
+                        return False
+            with open(f"/proc/{pid}/stat", "r") as f:
+                pid = int(f.read().split()[3])
+    except Exception:
+        pass
+    return True
+
+
 def ensure_session(conn: sqlite3.Connection, payload: dict[str, Any], agent: str) -> int:
     uid = payload.get("session_id") or f"anon-{agent}-{os.getppid()}"
     row = conn.execute("SELECT id, agent FROM session WHERE session_uid = ?",
@@ -245,12 +286,13 @@ def ensure_session(conn: sqlite3.Connection, payload: dict[str, Any], agent: str
 
     cwd = payload.get("cwd") or os.getcwd()
     repo, repo_path = repo_for(cwd)
+    interactive = int(is_session_interactive(payload))
     cursor = conn.execute(
         "INSERT INTO session (session_uid, agent, repo, repo_path, cwd, host, "
-        "                     os_user, started_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "                     os_user, started_at, interactive) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (uid, agent, repo, repo_path, cwd, socket.gethostname(),
-         os.environ.get("USER") or os.environ.get("LOGNAME"), utcnow()),
+         os.environ.get("USER") or os.environ.get("LOGNAME"), utcnow(), interactive),
     )
     return int(cursor.lastrowid)
 
@@ -771,6 +813,21 @@ def _analyse_web(tool: str, args: dict[str, Any]) -> classify.Result:
     return result
 
 
+def is_task_notification(prompt: str, payload: dict[str, Any] | None = None) -> bool:
+    if payload:
+        if payload.get("prompt_source") == "system" or payload.get("promptSource") == "system":
+            return True
+        if payload.get("origin") == "system":
+            return True
+    p = (prompt or "").strip()
+    return (
+        p.startswith("<task-notification")
+        or p.startswith("<SYSTEM_MESSAGE>")
+        or (p.startswith("[Message]") and "sender=" in p)
+        or ("Task id " in p and "finished with result" in p)
+    )
+
+
 def record(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
     agent = detect_agent(payload)
     event_id = append_event(conn, payload, agent)
@@ -779,10 +836,12 @@ def record(conn: sqlite3.Connection, payload: dict[str, Any]) -> int:
     session_id = ensure_session(conn, payload, agent)
 
     if hook == "UserPromptSubmit":
-        add_goal(conn, session_id, str(payload.get("prompt") or ""))
+        prompt_text = str(payload.get("prompt") or "")
+        if not (is_task_notification(prompt_text, payload) and current_goal(conn, session_id)):
+            add_goal(conn, session_id, prompt_text)
     elif hook == "PreToolUse":
         _open_action(conn, event_id, session_id, payload)
-    elif hook == "PostToolUse":
+    elif hook in ("PostToolUse", "PostToolUseFailure"):
         _close_action(conn, event_id, session_id, payload)
     elif hook in ("Stop", "SubagentStop", "SessionEnd"):
         close_session(conn, session_id, reason=hook.lower(),
@@ -875,7 +934,19 @@ def _close_action(
 
     status, error, summary = outcome_of(payload)
     ended = utcnow()
-    duration = _elapsed_ms(row["started_at"], ended)
+    total_elapsed = _elapsed_ms(row["started_at"], ended)
+    tool_duration = payload.get("duration_ms")
+    if tool_duration is not None:
+        try:
+            tool_ms = int(tool_duration)
+            duration = tool_ms
+            approval_ms = max(0, total_elapsed - tool_ms) if total_elapsed is not None else 0
+        except (ValueError, TypeError):
+            duration = total_elapsed
+            approval_ms = 0
+    else:
+        duration = total_elapsed
+        approval_ms = 0
 
     args = payload.get("tool_input") or {}
     stated = plan_mod.read(payload.get("tool_name"), args,
@@ -885,9 +956,9 @@ def _close_action(
 
     conn.execute(
         "UPDATE action SET status = ?, error = ?, ended_at = ?, duration_ms = ?, "
-        "                  result_bytes = ?, end_event_id = ? WHERE id = ?",
+        "                  approval_ms = ?, result_bytes = ?, end_event_id = ? WHERE id = ?",
         (status, _cap_ends(redact.redact(error), 1000), ended, duration,
-         response_bytes(payload), event_id, row["id"]),
+         approval_ms, response_bytes(payload), event_id, row["id"]),
     )
     if summary:
         conn.execute(
@@ -1114,18 +1185,13 @@ def close_session(conn: sqlite3.Connection, session_id: int, reason: str,
     conn.execute(
         "UPDATE action SET status = 'error', ended_at = ?, "
         "                  error = COALESCE(error, ?) "
-        "WHERE session_id = ? AND status = 'started' "
+        "WHERE session_id = ? AND status IN ('started', 'unanswered') "
         "  AND EXISTS (SELECT 1 FROM action later "
         "               WHERE later.session_id = action.session_id "
         "                 AND later.seq > action.seq "
         "                 AND later.status IN ('ok', 'error'))",
         (utcnow(), UNEXPLAINED_ERROR, session_id),
     )
-    # Not 'blocked'. Nothing refused these — the session ended with the call
-    # still in flight, usually on an approval prompt nobody answered before
-    # closing the window. Scored as breakage it would sit in every failures
-    # query where no fix would ever remove it, so it gets an outcome of its
-    # own and the failure predicates do not match it.
     conn.execute(
         "UPDATE action SET status = 'unanswered', ended_at = ?, "
         "                  error = COALESCE(error, ?) "
@@ -1133,7 +1199,7 @@ def close_session(conn: sqlite3.Connection, session_id: int, reason: str,
         (utcnow(), OUTSTANDING_ERROR, session_id),
     )
     conn.execute(
-        "UPDATE session SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL",
+        "UPDATE session SET ended_at = ?, end_reason = ? WHERE id = ?",
         (utcnow(), reason, session_id),
     )
     resolve.resolve_session(conn, session_id)
@@ -1145,3 +1211,242 @@ def log_ingest_error(conn: sqlite3.Connection, stage: str, detail: str, raw: str
         (utcnow(), stage, _cap(detail, 2000), _cap(redact.redact(raw), 400)),
     )
     conn.commit()
+
+
+def backfill(conn: sqlite3.Connection, *, limit: int | None = None) -> dict[str, int]:
+    import glob
+    existing = {
+        r["session_uid"]
+        for r in conn.execute("SELECT session_uid FROM session").fetchall()
+    }
+    roots = [Path.home()]
+    cur = Path.home()
+    while cur.parent != cur:
+        if (cur / ".claude").exists() or (cur / ".codex").exists() or (cur / ".local" / "share" / "nop").exists():
+            roots.append(cur)
+        cur = cur.parent
+
+    files: list[str] = []
+    for root in set(roots):
+        patterns = [
+            str(root / ".claude" / "projects" / "**" / "*.jsonl"),
+            str(root / ".local" / "share" / "nop" / "agent" / "homes" / "*" / "projects" / "**" / "*.jsonl"),
+            str(root / ".codex" / "sessions" / "**" / "*.jsonl"),
+            str(root / ".local" / "share" / "nop" / "agent" / "homes" / "*" / ".codex" / "sessions" / "**" / "*.jsonl"),
+        ]
+        for pat in patterns:
+            for p in glob.glob(pat, recursive=True):
+                if "/subagents/" not in p and os.path.isfile(p) and os.path.getsize(p) > 0:
+                    files.append(p)
+
+    counts = {"sessions": 0}
+    for path in sorted(set(files), key=lambda f: os.path.getmtime(f)):
+        if "/.codex/" in path:
+            imported = _backfill_codex(conn, path, existing)
+        else:
+            imported = _backfill_claude(conn, path, existing)
+        if imported:
+            counts["sessions"] += 1
+            if limit and counts["sessions"] >= limit:
+                break
+    return counts
+
+
+def _backfill_claude(conn: sqlite3.Connection, path: str,
+                     existing: set[str]) -> bool:
+    stem = Path(path).stem
+    if stem in existing:
+        return False
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+    except Exception:
+        return False
+
+    if not lines:
+        return False
+
+    sid = None
+    for line in lines:
+        if line.get("sessionId"):
+            sid = line["sessionId"]
+            break
+    if not sid:
+        sid = stem
+
+    if sid in existing:
+        return False
+
+    existing.add(sid)
+    cwd = None
+    for line in lines:
+        if line.get("cwd"):
+            cwd = line["cwd"]
+            break
+    cwd = cwd or str(Path.home())
+
+    tools_by_id: dict[str, dict[str, Any]] = {}
+    last_ts = None
+
+    for line in lines:
+        ts = line.get("timestamp")
+        if ts:
+            last_ts = ts
+        t = line.get("type")
+        msg = line.get("message") or {}
+
+        with replay_at(ts):
+            if t == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    record(conn, {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": sid,
+                        "prompt": content,
+                        "cwd": cwd,
+                        "transcript_path": path,
+                        "entrypoint": line.get("entrypoint"),
+                    })
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            uid = b.get("tool_use_id")
+                            tool_info = tools_by_id.get(uid, {})
+                            record(conn, {
+                                "hook_event_name": "PostToolUse",
+                                "session_id": sid,
+                                "tool_name": tool_info.get("name", "tool"),
+                                "tool_input": tool_info.get("input", {}),
+                                "tool_use_id": uid,
+                                "tool_response": b,
+                                "cwd": cwd,
+                                "transcript_path": path,
+                            })
+            elif t == "assistant":
+                content = msg.get("content") or []
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            uid = b.get("id")
+                            name = b.get("name")
+                            inp = b.get("input", {})
+                            tools_by_id[uid] = {"name": name, "input": inp}
+                            record(conn, {
+                                "hook_event_name": "PreToolUse",
+                                "session_id": sid,
+                                "tool_name": name,
+                                "tool_input": inp,
+                                "tool_use_id": uid,
+                                "cwd": cwd,
+                                "transcript_path": path,
+                            })
+
+    with replay_at(last_ts):
+        record(conn, {
+            "hook_event_name": "Stop",
+            "session_id": sid,
+            "cwd": cwd,
+            "transcript_path": path,
+        })
+    return True
+
+
+def _backfill_codex(conn: sqlite3.Connection, path: str,
+                    existing: set[str]) -> bool:
+    stem = Path(path).stem
+    if stem in existing:
+        return False
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+    except Exception:
+        return False
+
+    if not lines:
+        return False
+
+    sid = None
+    for line in lines:
+        if line.get("type") == "session_meta":
+            p = line.get("payload") or {}
+            sid = p.get("id")
+            break
+    if not sid:
+        sid = stem
+
+    if sid in existing:
+        return False
+
+    existing.add(sid)
+    cwd = None
+    for line in lines:
+        p = line.get("payload") or {}
+        if p.get("cwd"):
+            cwd = p.get("cwd")
+            break
+    cwd = cwd or str(Path.home())
+
+    tools_by_id: dict[str, dict[str, Any]] = {}
+    last_ts = None
+
+    for line in lines:
+        ts = line.get("timestamp")
+        if ts:
+            last_ts = ts
+        t = line.get("type")
+        p = line.get("payload") or {}
+
+        with replay_at(ts):
+            if t == "event_msg" and p.get("type") == "user_message":
+                msg = p.get("message")
+                if msg:
+                    record(conn, {
+                        "hook_event_name": "UserPromptSubmit",
+                        "session_id": sid,
+                        "prompt": str(msg),
+                        "cwd": cwd,
+                        "transcript_path": path,
+                    })
+            elif t == "response_item" and p.get("type") == "function_call":
+                cid = p.get("call_id")
+                name = p.get("name")
+                args_str = p.get("arguments") or "{}"
+                try:
+                    args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except Exception:
+                    args = {}
+                tools_by_id[cid] = {"name": name, "input": args}
+                record(conn, {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": sid,
+                    "tool_name": name,
+                    "tool_input": args,
+                    "tool_use_id": cid,
+                    "cwd": cwd,
+                    "transcript_path": path,
+                })
+            elif t == "response_item" and p.get("type") == "function_call_output":
+                cid = p.get("call_id")
+                tool_info = tools_by_id.get(cid, {})
+                out = p.get("output") or ""
+                record(conn, {
+                    "hook_event_name": "PostToolUse",
+                    "session_id": sid,
+                    "tool_name": tool_info.get("name", "tool"),
+                    "tool_input": tool_info.get("input", {}),
+                    "tool_use_id": cid,
+                    "tool_response": {"result": out},
+                    "cwd": cwd,
+                    "transcript_path": path,
+                })
+
+    with replay_at(last_ts):
+        record(conn, {
+            "hook_event_name": "Stop",
+            "session_id": sid,
+            "cwd": cwd,
+            "transcript_path": path,
+        })
+    return True

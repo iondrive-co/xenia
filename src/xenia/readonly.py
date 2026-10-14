@@ -615,7 +615,7 @@ def summary(conn: sqlite3.Connection, *, since: str | None = None) -> dict[str, 
 
 def goals(conn: sqlite3.Connection, *, since: str | None = None,
           status: str | None = None, repo: str | None = None,
-          goal_id: int | None = None,
+          goal_id: int | None = None, interactive: bool | None = True,
           limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
     where = ["1=1"]
     params: dict[str, Any] = {}
@@ -632,11 +632,16 @@ def goals(conn: sqlite3.Connection, *, since: str | None = None,
     if goal_id:
         where.append("goal_id = :goal_id")
         params["goal_id"] = int(goal_id)
+    if interactive is not None:
+        where.append("interactive = :interactive")
+        params["interactive"] = 1 if interactive else 0
     params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
 
     return _rows(conn.execute(f"""
         SELECT goal_id, at, repo, agent, status, prompt, actions,
-               remote_calls, fs_changes, failures
+               remote_calls, fs_changes, failures,
+               agent_work_ms, approval_wait_ms, question_wait_ms,
+               next_prompt_wait_ms, note
         FROM v_goal_outcomes
         WHERE {' AND '.join(where)}
         ORDER BY at DESC LIMIT :limit
@@ -645,13 +650,8 @@ def goals(conn: sqlite3.Connection, *, since: str | None = None,
 
 def _task_scope(since: str | None, repo: str | None, source: str | None,
                 agent: str | None, goal: int | None,
-                search: str | None) -> tuple[list[str], dict[str, Any]]:
-    """Which tasks the question is about, before any outcome narrows it.
-
-    Split out from the outcome filters on purpose: this is the population a
-    row has to be read against, and `task_totals` counts it while `tasks`
-    returns a page of it.
-    """
+                search: str | None,
+                interactive: bool | None = True) -> tuple[list[str], dict[str, Any]]:
     where = ["1=1"]
     params: dict[str, Any] = {}
     cutoff = parse_since(since)
@@ -673,12 +673,14 @@ def _task_scope(since: str | None, repo: str | None, source: str | None,
     if search:
         where.append("(label LIKE :q OR goal_prompt LIKE :q)")
         params["q"] = f"%{search}%"
+    if interactive is not None:
+        where.append("interactive = :interactive")
+        params["interactive"] = 1 if interactive else 0
     return where, params
 
 
 def _task_outcome_filter(status: str | None,
                          overstated_only: bool) -> tuple[list[str], dict[str, Any]]:
-    """The part of a task query that selects on how the work turned out."""
     where: list[str] = []
     params: dict[str, Any] = {}
     if status in TASK_STATUSES:
@@ -693,23 +695,12 @@ def task_totals(conn: sqlite3.Connection, *, since: str | None = None,
                 repo: str | None = None, status: str | None = None,
                 source: str | None = None, agent: str | None = None,
                 goal: int | None = None, overstated_only: bool = False,
-                search: str | None = None) -> dict[str, Any]:
-    """The denominator for a page of task rows.
-
-    The tasks view is ordered worst-first by design, so the top of it is all
-    failures whenever there are any — and a client that reads a page of it
-    and nothing else concludes the window is all failures.
-
-    So the shape of the whole window ships with the page. `by_status` is
-    counted over the window and its subject filters but *not* over the
-    outcome ones, because it is there to say what the rows returned are a
-    slice of; `matched` is the same count with the whole query applied.
-    """
-    where, params = _task_scope(since, repo, source, agent, goal, search)
+                search: str | None = None,
+                interactive: bool | None = True) -> dict[str, Any]:
+    where, params = _task_scope(since, repo, source, agent, goal, search,
+                                interactive=interactive)
     outcome, outcome_params = _task_outcome_filter(status, overstated_only)
     params.update(outcome_params)
-    # One scan, not two: a second query for the matched count can disagree
-    # with the breakdown it is printed beside if a session closes between them.
     matched = f"SUM({' AND '.join(outcome)})" if outcome else "COUNT(*)"
 
     rows = conn.execute(f"""
@@ -731,8 +722,10 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
           source: str | None = None, agent: str | None = None,
           goal: int | None = None, overstated_only: bool = False,
           search: str | None = None, order: str = "significance",
+          interactive: bool | None = True,
           limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
-    where, params = _task_scope(since, repo, source, agent, goal, search)
+    where, params = _task_scope(since, repo, source, agent, goal, search,
+                                interactive=interactive)
     outcome, outcome_params = _task_outcome_filter(status, overstated_only)
     where += outcome
     params.update(outcome_params)
@@ -762,6 +755,47 @@ def tasks(conn: sqlite3.Connection, *, since: str | None = None,
         ) w ON w.task_id = t.task_id
         WHERE {' AND '.join(where)}
         ORDER BY {sort} LIMIT :limit
+    """, params))
+
+
+def sessions(
+    conn: sqlite3.Connection,
+    *,
+    since: str | None = None,
+    repo: str | None = None,
+    agent: str | None = None,
+    interactive: bool | None = True,
+    limit: int = DEFAULT_LIMIT,
+) -> list[dict[str, Any]]:
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    cutoff = parse_since(since)
+    if cutoff:
+        where.append("s.started_at >= :since")
+        params["since"] = cutoff
+    if repo:
+        where.append("s.repo = :repo")
+        params["repo"] = repo
+    if agent:
+        where.append("s.agent = :agent")
+        params["agent"] = agent
+    if interactive is not None:
+        where.append("s.interactive = :interactive")
+        params["interactive"] = 1 if interactive else 0
+    params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
+
+    return _rows(conn.execute(f"""
+        SELECT s.id, s.session_uid AS session, s.agent, s.repo, s.cwd, s.host,
+               s.started_at AS started_at, s.ended_at AS ended_at,
+               s.end_reason AS end_reason, s.interactive,
+               COUNT(DISTINCT g.id) AS instructions,
+               COUNT(DISTINCT a.id) AS actions
+        FROM session s
+        LEFT JOIN goal g ON g.session_id = s.id
+        LEFT JOIN action a ON a.session_id = s.id
+        WHERE {' AND '.join(where)}
+        GROUP BY s.id
+        ORDER BY s.started_at DESC LIMIT :limit
     """, params))
 
 
@@ -1118,7 +1152,10 @@ def redundancy(
             JOIN session s ON s.id = a.session_id
             LEFT JOIN task t ON t.id = a.task_id
             LEFT JOIN remote_call r ON r.action_id = a.id
-            LEFT JOIN fs_change f ON f.action_id = a.id
+            LEFT JOIN (
+                SELECT action_id, MIN(sha256_after) AS sha256_after
+                FROM fs_change GROUP BY action_id
+            ) f ON f.action_id = a.id
             WHERE {' AND '.join(where)}
         ),
         flagged AS (
@@ -1444,7 +1481,7 @@ def trace(conn: sqlite3.Connection, action_id: int) -> dict[str, Any]:
 #: what a reader has to type at `ps` or `kill` to act on the row, and a
 #: redacted one names nothing. They are agent-authored text like any other, so
 #: the rest of the row still goes through the redactor.
-CLAIM_KEEP = frozenset({"resource", "pattern"})
+CLAIM_KEEP = frozenset({"resource", "pattern", "holder_unit"})
 
 
 def claims(conn: sqlite3.Connection, *, since: str | None = None,
@@ -1469,16 +1506,25 @@ def claims(conn: sqlite3.Connection, *, since: str | None = None,
     params["limit"] = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
 
     try:
-        return _rows(conn.execute(f"""
-            SELECT id, posted_at, updated_at, released_at, release_note,
-                   holder_pid, holder_start, agent, repo, resource, purpose,
-                   ram_mb, pids, pattern, expires_at, kill_note
-            FROM claim
-            WHERE {' AND '.join(where)}
-            ORDER BY posted_at DESC
-            LIMIT :limit
-        """, params), keep=CLAIM_KEEP)
+        try:
+            return _rows(conn.execute(f"""
+                SELECT id, posted_at, updated_at, released_at, release_note,
+                       holder_pid, holder_start, agent, repo, resource, purpose,
+                       ram_mb, pids, pattern, expires_at, kill_note, holder_unit
+                FROM claim
+                WHERE {' AND '.join(where)}
+                ORDER BY posted_at DESC
+                LIMIT :limit
+            """, params), keep=CLAIM_KEEP)
+        except sqlite3.OperationalError:
+            return _rows(conn.execute(f"""
+                SELECT id, posted_at, updated_at, released_at, release_note,
+                       holder_pid, holder_start, agent, repo, resource, purpose,
+                       ram_mb, pids, pattern, expires_at, kill_note
+                FROM claim
+                WHERE {' AND '.join(where)}
+                ORDER BY posted_at DESC
+                LIMIT :limit
+            """, params), keep=CLAIM_KEEP)
     except sqlite3.OperationalError:
-        # A database from before the agora existed has no table to read. An
-        # empty agora is the truth about it, and is what a caller can act on.
         return []

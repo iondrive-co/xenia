@@ -1248,3 +1248,89 @@ def test_a_recovery_is_timed_as_well_as_counted(conn, clock, tmp_path):
         assert out["resolution_seconds"] >= 120
     finally:
         ro.close()
+
+
+def test_repeats_view_counts_calls_not_file_writes(conn, clock, tmp_path):
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "echo a > f1.txt && echo b > f2.txt"}))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "echo a > f1.txt && echo b > f2.txt"}))
+    action_id = conn.execute("SELECT id FROM action LIMIT 1").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO fs_change (action_id, path, abs_path, op, in_repo, bytes_after, sha256_after, sensitivity) "
+        "VALUES (?, 'f1.txt', '/tmp/f1.txt', 'create', 1, 10, 'sha1', 'normal')",
+        (action_id,),
+    )
+    conn.execute(
+        "INSERT INTO fs_change (action_id, path, abs_path, op, in_repo, bytes_after, sha256_after, sensitivity) "
+        "VALUES (?, 'f2.txt', '/tmp/f2.txt', 'create', 1, 10, 'sha2', 'normal')",
+        (action_id,),
+    )
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        rows = readonly.redundancy(ro)
+        assert len(rows) == 0
+    finally:
+        ro.close()
+
+
+def test_non_interactive_sessions_hidden_by_default(conn, clock, tmp_path):
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "interactive-1",
+                         "prompt": "Interactive prompt", "interactive": True})
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "ls"}, session="interactive-1"))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "ls"}, session="interactive-1"))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "interactive-1"})
+
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "headless-1",
+                         "prompt": "Headless prompt", "interactive": False, "entrypoint": "cli"})
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "ls"}, session="headless-1"))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "ls"}, session="headless-1"))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "headless-1"})
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        def s_ids(rows):
+            return [r["session"] for r in rows]
+
+        assert s_ids(readonly.sessions(ro)) == ["interactive-1"]
+        assert set(s_ids(readonly.sessions(ro, interactive=None))) == {"interactive-1", "headless-1"}
+        assert s_ids(readonly.sessions(ro, interactive=False)) == ["headless-1"]
+
+        assert [r["prompt"] for r in readonly.goals(ro)] == ["Interactive prompt"]
+        assert len(readonly.goals(ro, interactive=None)) == 2
+        assert [r["prompt"] for r in readonly.goals(ro, interactive=False)] == ["Headless prompt"]
+    finally:
+        ro.close()
+
+
+def test_goals_view_includes_wall_clock_timings(conn, clock, tmp_path):
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "Timing test"})
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "sleep 1"}))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "sleep 1"}))
+    clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1"})
+    conn.commit()
+
+    ro = readonly.connect(tmp_path / "audit.db")
+    try:
+        goal = readonly.goals(ro)[0]
+        assert "agent_work_ms" in goal
+        assert "approval_wait_ms" in goal
+        assert "question_wait_ms" in goal
+        assert "next_prompt_wait_ms" in goal
+    finally:
+        ro.close()

@@ -275,7 +275,13 @@ _ADDED_COLUMNS = (
     ("secret_use", "request_path", "TEXT"),
     ("secret_use", "response_path", "TEXT"),
     ("secret_use", "request_sha256", "TEXT"),
-    ("secret_use", "response_sha256", "TEXT"),
+    ("claim", "holder_unit", "TEXT"),
+    ("session", "interactive", "INTEGER NOT NULL DEFAULT 1"),
+    ("action", "approval_ms", "INTEGER"),
+    ("goal", "agent_work_ms", "INTEGER"),
+    ("goal", "approval_wait_ms", "INTEGER"),
+    ("goal", "question_wait_ms", "INTEGER"),
+    ("goal", "next_prompt_wait_ms", "INTEGER"),
 )
 
 _DROPPED_TABLES = ("finding", "finding_dismissal", "finding_mute",

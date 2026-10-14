@@ -7,9 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStop")
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+          "PostToolUseFailure", "Stop", "SubagentStop")
 
-MATCHED = ("PreToolUse", "PostToolUse")
+MATCHED = ("PreToolUse", "PostToolUse", "PostToolUseFailure")
 
 MARKER = "xenia-hook"
 

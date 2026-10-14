@@ -335,3 +335,38 @@ def test_losing_the_site_config_downgrades_a_past_finding_on_rebuild(conn, clock
     assert "bin/fleet-checks" in conn.execute(
         "SELECT payload FROM event WHERE payload LIKE '%fleet-checks%' LIMIT 1"
     ).fetchone()["payload"]
+
+
+def test_a_goal_with_interrupted_action_is_scored_interrupted(conn, clock):
+    prompt(conn, clock, "Run the server")
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "python3 server.py"}))
+    clock()
+    ingest.record(conn, post("Bash", {"command": "python3 server.py"}, response={"interrupted": True}))
+    stop(conn, clock)
+    row = conn.execute("SELECT status FROM goal").fetchone()
+    assert row["status"] == "interrupted"
+
+
+def test_a_goal_followed_by_correction_prompt_is_scored_corrected(conn, clock):
+    prompt(conn, clock, "Deploy v1")
+    run(conn, clock, "Bash", {"command": "deploy.sh"})
+    prompt(conn, clock, "No, that is wrong, stop and rollback")
+    run(conn, clock, "Bash", {"command": "rollback.sh"})
+    stop(conn, clock)
+    goals = [r["status"] for r in conn.execute("SELECT status FROM goal ORDER BY seq")]
+    assert goals[0] == "corrected"
+
+
+def test_wall_clock_timings_on_goal(conn, clock):
+    prompt(conn, clock, "First prompt")
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "ls"}))
+    clock()
+    ingest.record(conn, dict(post("Bash", {"command": "ls"}), duration_ms=100))
+    prompt(conn, clock, "Second prompt")
+    stop(conn, clock)
+    row = conn.execute("SELECT agent_work_ms, approval_wait_ms, question_wait_ms, next_prompt_wait_ms FROM goal WHERE seq = 1").fetchone()
+    assert row["agent_work_ms"] == 1100
+    assert row["approval_wait_ms"] == 900
+    assert row["next_prompt_wait_ms"] is not None

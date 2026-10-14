@@ -149,6 +149,8 @@ AGORA_NUDGE_SCAN = int(os.environ.get("XENIA_AGORA_NUDGE_SCAN", "400"))
 # The most processes one claim may name. A claim is a handle on work, not an
 # inventory of a process tree; past this, name the parent and give a pattern.
 AGORA_MAX_PIDS = int(os.environ.get("XENIA_AGORA_MAX_PIDS", "32"))
+AGORA_HEAVY_MB = float(os.environ.get("XENIA_AGORA_HEAVY_MB", "200"))
+AGORA_MAX_UNCLAIMED = int(os.environ.get("XENIA_AGORA_MAX_UNCLAIMED", "50"))
 
 BUSY_TIMEOUT_MS = int(os.environ.get("XENIA_BUSY_TIMEOUT_MS", "5000"))
 

@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS session (
     started_at  TEXT    NOT NULL,
     ended_at    TEXT,
     end_reason  TEXT,
-    current_task_id INTEGER
+    current_task_id INTEGER,
+    interactive INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS session_repo_idx ON session (repo, started_at);
@@ -58,6 +59,10 @@ CREATE TABLE IF NOT EXISTS goal (
     status          TEXT    NOT NULL DEFAULT 'open',
     resolved_at     TEXT,
     resolution_note TEXT,
+    agent_work_ms   INTEGER,
+    approval_wait_ms INTEGER,
+    question_wait_ms INTEGER,
+    next_prompt_wait_ms INTEGER,
     UNIQUE (session_id, seq)
 );
 
@@ -113,6 +118,7 @@ CREATE TABLE IF NOT EXISTS action (
     started_at      TEXT    NOT NULL,
     ended_at        TEXT,
     duration_ms     INTEGER,
+    approval_ms     INTEGER,
     result_bytes    INTEGER,
 
     attempt_no           INTEGER NOT NULL DEFAULT 1,
@@ -295,7 +301,8 @@ CREATE TABLE IF NOT EXISTS claim (
     pids          TEXT,
     pattern       TEXT,
     expires_at    TEXT,
-    kill_note     TEXT
+    kill_note     TEXT,
+    holder_unit   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS claim_open_idx  ON claim (released_at, posted_at);
@@ -345,6 +352,7 @@ CREATE VIEW v_goal_outcomes AS
 SELECT g.id                 AS goal_id,
        s.repo               AS repo,
        s.agent              AS agent,
+       s.interactive        AS interactive,
        g.created_at         AS at,
        g.status             AS status,
        g.prompt             AS prompt,
@@ -355,6 +363,10 @@ SELECT g.id                 AS goal_id,
        SUM(a.status IN ('error', 'blocked') AND a.resolved_by_action_id IS NOT NULL)
                                                               AS failures_fixed,
        SUM(a.status = 'blocked')                              AS blocked,
+       g.agent_work_ms                                        AS agent_work_ms,
+       g.approval_wait_ms                                     AS approval_wait_ms,
+       g.question_wait_ms                                     AS question_wait_ms,
+       g.next_prompt_wait_ms                                  AS next_prompt_wait_ms,
        g.resolution_note    AS note
 FROM goal g
 JOIN session s ON s.id = g.session_id
@@ -366,6 +378,7 @@ CREATE VIEW v_task_outcomes AS
 SELECT t.id                 AS task_id,
        s.repo               AS repo,
        s.agent              AS agent,
+       s.interactive        AS interactive,
        s.session_uid        AS session,
        t.goal_id            AS goal_id,
        g.prompt             AS goal_prompt,

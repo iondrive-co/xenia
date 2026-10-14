@@ -56,14 +56,30 @@ def resolve_session(conn: sqlite3.Connection, session_id: int) -> int:
     return linked
 
 
+def is_correction(prompt: str) -> bool:
+    if not prompt:
+        return False
+    text = prompt.strip().lower()
+    prefixes = (
+        "no,", "no.", "no!", "no ", "not that", "actually",
+        "wrong", "that's wrong", "thats wrong", "that is wrong",
+        "don't", "dont", "do not",
+        "stop", "wait,", "wait.", "wait ",
+        "undo", "revert",
+        "you didn't", "you didnt", "you forgot",
+        "i meant", "i said", "instead of",
+    )
+    return any(text.startswith(p) for p in prefixes)
+
+
 def _score_goals(conn: sqlite3.Connection, session_id: int) -> None:
     from . import ingest
 
     goals = conn.execute(
-        "SELECT id FROM goal WHERE session_id = ?", (session_id,)
+        "SELECT id, seq, prompt, created_at FROM goal WHERE session_id = ? ORDER BY seq", (session_id,)
     ).fetchall()
 
-    for goal in goals:
+    for idx, goal in enumerate(goals):
         stats = conn.execute(
             "SELECT COUNT(*) AS total, "
             "       SUM(status = 'ok') AS ok, "
@@ -81,7 +97,20 @@ def _score_goals(conn: sqlite3.Connection, session_id: int) -> None:
         unresolved = stats["unresolved"] or 0
         late_fix = stats["late_fix"] or 0
 
-        if total == 0:
+        interrupted = conn.execute(
+            "SELECT 1 FROM action WHERE goal_id = ? "
+            "  AND (status = 'interrupted' OR error = 'interrupted' OR error LIKE '%[Request interrupted%') "
+            "LIMIT 1",
+            (goal["id"],),
+        ).fetchone() is not None
+
+        next_goal = goals[idx + 1] if idx + 1 < len(goals) else None
+
+        if interrupted:
+            status, note = "interrupted", "Interrupted by user."
+        elif next_goal and is_correction(next_goal["prompt"]):
+            status, note = "corrected", "Corrected by follow-up instruction."
+        elif total == 0:
             status, note = "no_action", "No tool calls were made for this instruction."
         elif failed == 0:
             status, note = "achieved", f"{ok} action(s), no failures."
@@ -100,11 +129,42 @@ def _score_goals(conn: sqlite3.Connection, session_id: int) -> None:
             status = "failed"
             note = f"All {failed} action(s) failed with no successful retry."
 
+        actions = conn.execute(
+            "SELECT tool, kind, started_at, ended_at, duration_ms, approval_ms "
+            "FROM action WHERE goal_id = ? ORDER BY seq",
+            (goal["id"],),
+        ).fetchall()
+
+        approval_wait_ms = sum(a["approval_ms"] or 0 for a in actions)
+        question_wait_ms = sum(
+            (a["duration_ms"] or 0) + (a["approval_ms"] or 0)
+            for a in actions
+            if a["tool"] in ("AskUserQuestion", "ask_question", "ask_followup_question", "ask", "question")
+            or a["kind"] == "question"
+        )
+        if actions:
+            turn_end_at = max(a["ended_at"] or a["started_at"] for a in actions)
+        elif next_goal:
+            turn_end_at = next_goal["created_at"]
+        else:
+            s_row = conn.execute("SELECT ended_at FROM session WHERE id = ?", (session_id,)).fetchone()
+            turn_end_at = s_row["ended_at"] if s_row and s_row["ended_at"] else goal["created_at"]
+
+        total_span = ingest._elapsed_ms(goal["created_at"], turn_end_at)
+        agent_work_ms = max(0, (total_span or 0) - approval_wait_ms - question_wait_ms)
+        next_prompt_wait_ms = (
+            max(0, ingest._elapsed_ms(turn_end_at, next_goal["created_at"]) or 0)
+            if next_goal else None
+        )
+
         conn.execute(
             "UPDATE goal SET status = ?, resolution_note = ?, "
-            "                resolved_at = COALESCE(resolved_at, ?) "
+            "                resolved_at = COALESCE(resolved_at, ?), "
+            "                agent_work_ms = ?, approval_wait_ms = ?, "
+            "                question_wait_ms = ?, next_prompt_wait_ms = ? "
             "WHERE id = ?",
-            (status, note, ingest.utcnow(), goal["id"]),
+            (status, note, ingest.utcnow(), agent_work_ms, approval_wait_ms,
+             question_wait_ms, next_prompt_wait_ms, goal["id"]),
         )
 
 
@@ -320,10 +380,12 @@ def _replay(conn: sqlite3.Connection, event_id: int, payload: dict) -> None:
     hook = payload.get("hook_event_name") or ""
 
     if hook == "UserPromptSubmit":
-        ingest.add_goal(conn, session_id, str(payload.get("prompt") or ""))
+        prompt_text = str(payload.get("prompt") or "")
+        if not (ingest.is_task_notification(prompt_text, payload) and ingest.current_goal(conn, session_id)):
+            ingest.add_goal(conn, session_id, prompt_text)
     elif hook == "PreToolUse":
         ingest._open_action(conn, event_id, session_id, payload)
-    elif hook == "PostToolUse":
+    elif hook in ("PostToolUse", "PostToolUseFailure"):
         ingest._close_action(conn, event_id, session_id, payload)
     elif hook in ("Stop", "SubagentStop", "SessionEnd"):
         # The ledger stores the payload, so a rebuild can re-read the

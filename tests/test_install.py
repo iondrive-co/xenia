@@ -78,7 +78,7 @@ def test_tool_events_are_wired_with_a_wildcard_matcher(targets):
     install.apply(targets, HOOK)
     config = read(dict(targets)["claude"])
 
-    for event in ("PreToolUse", "PostToolUse"):
+    for event in install.MATCHED:
         recording = [e for e in config["hooks"][event]
                      if any("xenia-hook" in h["command"] for h in e["hooks"])]
         assert recording and all(e["matcher"] == "*" for e in recording)

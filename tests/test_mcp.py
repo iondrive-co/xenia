@@ -493,3 +493,10 @@ def test_fetch_says_plainly_when_the_service_is_not_running(server, monkeypatch)
     })["content"][0]["text"])
 
     assert "not listening" in answer["refused"]
+
+
+def test_sessions_view_in_mcp(server):
+    res = call(server, "xenia_report", {"view": "sessions"})
+    data = json.loads(res["content"][0]["text"])
+    assert "rows" in data
+    assert isinstance(data["rows"], list)

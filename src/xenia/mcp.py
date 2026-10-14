@@ -64,7 +64,7 @@ _SIGNATURE = {
 }
 
 VIEWS = ("tasks", "instructions", "failures", "repeats", "tools", "disk",
-         "credentials", "claims")
+         "credentials", "claims", "sessions")
 
 UNIVERSAL_PARAMS = frozenset({"view", "since", "repo", "limit"})
 VIEW_PARAMS: dict[str, frozenset[str]] = {
@@ -81,6 +81,7 @@ VIEW_PARAMS: dict[str, frozenset[str]] = {
                        "min_count"}),
     "credentials": frozenset(),
     "claims": frozenset({"state"}),
+    "sessions": frozenset({"agent", "interactive"}),
 }
 
 
@@ -274,11 +275,13 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Only claims in one state: 'held' "
                                    "(live work), 'overrun' (past the "
                                    "window its holder gave it, its "
-                                   "session still alive), 'abandoned' "
-                                   "(its session is gone — this is what "
-                                   "is free to reclaim), or 'released' "
-                                   "(finished with; kept as history and "
-                                   "not returned otherwise)."}),
+                                   "session still alive), 'detached' "
+                                   "(holder is gone but processes still "
+                                   "running), 'abandoned' (its session "
+                                   "is gone — this is what is free to "
+                                   "reclaim), or 'released' (finished "
+                                   "with; kept as history and not returned "
+                                   "otherwise)."}),
                 "min_count": {
                     "type": "integer",
                     "description": "[failures repeats tools disk] Drop rows "
@@ -550,6 +553,11 @@ TOOLS: list[dict[str, Any]] = [
                                         "is being cleared. Worth a sentence "
                                         "when you are clearing up after "
                                         "somebody else's abandoned claim."},
+                "unit": {"type": "string",
+                         "description": "Systemd unit holding this claim "
+                                        "(e.g. 'worker-job-1.service'). "
+                                        "The claim counts as alive while "
+                                        "this unit is active."},
             },
             "required": ["op"],
         },
@@ -723,7 +731,7 @@ def _lift(rows: list[dict[str, Any]], key: str, field: str) -> dict[str, Any]:
     return lifted
 
 
-def _report(conn, args: dict[str, Any]) -> Any:
+def _report(conn, args: dict[str, Any], db_path=None) -> Any:
     view = _one_of("view", args.get("view"), VIEWS)
     if view is None:
         raise KeyError(f"view is required, one of: {', '.join(VIEWS)}")
@@ -815,6 +823,14 @@ def _report(conn, args: dict[str, Any]) -> Any:
                 "rows": readonly.credentials(conn)}
 
     if view == "claims":
+        try:
+            wconn = _writable(db_path)
+            try:
+                agora.auto_release(wconn)
+            finally:
+                wconn.close()
+        except Exception:
+            pass
         state = _one_of("state", args.get("state"), agora.STATES)
         every = agora.order(agora.assess(readonly.claims(
             conn, since=since, repo=repo, released=state == "released",
@@ -829,6 +845,18 @@ def _report(conn, args: dict[str, Any]) -> Any:
                 "ordered_by": "what is free to reclaim first, then the "
                               "largest",
                 "ram": ram, "rows": rows}
+
+    if view == "sessions":
+        interactive = args.get("interactive")
+        if interactive is not None:
+            interactive = bool(interactive)
+        else:
+            interactive = True
+        return {"view": view, "ordered_by": "started_at",
+                "rows": readonly.sessions(
+                    conn, since=since, repo=repo,
+                    agent=args.get("agent"), interactive=interactive,
+                    limit=limit)}
 
     group_by = _one_of(
         "group_by", args.get("group_by"), readonly.DISK_GROUPS) or "path"
@@ -906,7 +934,8 @@ def _claim(args: dict[str, Any], db_path=None) -> Any:
                 purpose=args.get("purpose"), ram_mb=args.get("ram_mb"),
                 pids=args.get("pids"), pattern=args.get("pattern"),
                 holds_for=args.get("holds_for"),
-                kill_note=args.get("kill_note"), repo=args.get("repo"))
+                kill_note=args.get("kill_note"), repo=args.get("repo"),
+                unit=args.get("unit") or args.get("holder_unit"))
         elif op == "update":
             out = agora.update(conn, int(args["id"]),
                                **{k: args[k] for k in agora.UPDATABLE
@@ -929,7 +958,7 @@ def _dispatch(name: str, args: dict[str, Any], db_path=None) -> Any:
     try:
         readonly.require_current(conn)
         if name == "xenia_report":
-            return _report(conn, args)
+            return _report(conn, args, db_path=db_path)
         if name == "xenia_calls":
             order = args.get("order") or "bytes"
             return {"ordered_by": _ordered(order,

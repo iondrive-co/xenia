@@ -6,7 +6,7 @@ import pytest
 
 from conftest import SHOP
 
-from xenia import agora, config, ingest, mcp, readonly
+from xenia import agora, config, db, ingest, mcp, readonly
 
 
 def a_dead_pid() -> int:
@@ -123,13 +123,23 @@ def test_an_agora_that_cannot_see_the_process_table_says_hold(
 # ------------------------------------------------------------------ states
 
 
-def test_a_claim_whose_session_is_gone_is_free_to_reclaim(conn, sleeper):
+def test_a_claim_whose_session_is_gone_with_running_processes_is_detached(
+        conn, sleeper):
     pid = sleeper()
-    posted = claim(conn, ram_mb=6000, pids=[pid], holder_pid=a_dead_pid())
+    posted = claim(conn, ram_mb=6000, pids=[pid], holder_pid=a_dead_pid(),
+                   kill_note="ask before killing")
+
+    assert posted["state"] == "detached"
+    assert posted["may_kill"] == "ask"
+    assert str(pid) in posted["may_kill_why"]
+    assert "ask before killing" in posted["may_kill_why"]
+
+
+def test_a_claim_whose_session_is_gone_with_no_processes_is_abandoned(conn):
+    posted = claim(conn, ram_mb=6000, holder_pid=a_dead_pid())
 
     assert posted["state"] == "abandoned"
     assert posted["may_kill"] == "yes"
-    assert str(pid) in posted["may_kill_why"]
 
 
 def test_a_claim_past_its_own_window_is_asked_about_not_killed(conn,
@@ -229,17 +239,15 @@ def test_a_forecast_outranks_a_process_that_has_not_grown_into_it_yet(conn,
 
 
 def test_what_can_be_reclaimed_is_what_is_actually_resident(conn, sleeper):
-    # An orphan naming a process that is still up, and one naming nothing.
-    agora.post(conn, resource="a browser", purpose="gone", ram_mb=6000,
-               pids=[sleeper()], holder_pid=a_dead_pid())
+    posted = agora.post(conn, resource="a browser", purpose="gone", ram_mb=6000,
+                        pids=[sleeper()])
+    agora.release(conn, posted["id"])
     agora.post(conn, resource="a suite", purpose="also gone", ram_mb=9000,
                holder_pid=a_dead_pid())
 
-    totals = agora.summary(agora.assess(readonly.claims(conn)))
+    totals = agora.summary(agora.assess(readonly.claims(conn, released=True)))
 
     assert totals["claimed_mb"] == 0
-    # Only the live process counts; the 9000 MB forecast of a claim with
-    # nothing left running is not memory anyone can have back.
     assert 0 < totals["reclaimable_mb"] < 6000
 
 
@@ -428,3 +436,146 @@ def test_the_nudge_can_be_silenced(conn, monkeypatch):
     monkeypatch.setattr(config, "AGORA_NUDGE", False)
 
     assert agora.nudge(conn, a_call("python3 -m pytest -q")) is None
+
+
+def test_claim_held_by_systemd_unit_is_alive_when_unit_is_active(conn, monkeypatch):
+    monkeypatch.setattr(agora, "_units_active",
+                        lambda units: {u: (u == "worker-job-1.service") for u in units})
+    posted = claim(conn, unit="worker-job-1.service", holder_pid=a_dead_pid())
+
+    assert posted["state"] == "held"
+    assert posted["holder_alive"] is True
+    assert posted["holder_unit"] == "worker-job-1.service"
+    assert posted["unit"] == "worker-job-1.service"
+
+
+def test_claim_held_by_systemd_unit_when_unit_is_inactive_and_process_runs(
+        conn, sleeper, monkeypatch):
+    monkeypatch.setattr(agora, "_units_active", lambda units: {u: False for u in units})
+    pid = sleeper()
+    posted = claim(conn, unit="worker-job-1.service", pids=[pid],
+                   holder_pid=a_dead_pid(), kill_note="keep alive")
+
+    assert posted["state"] == "detached"
+    assert posted["may_kill"] == "ask"
+    assert posted["holder_alive"] is False
+    assert "keep alive" in posted["may_kill_why"]
+    assert "worker-job-1.service" in posted["may_kill_why"]
+
+
+def test_claim_held_by_systemd_unit_when_unit_is_inactive_and_processes_dead(
+        conn, monkeypatch):
+    monkeypatch.setattr(agora, "_units_active", lambda units: {u: False for u in units})
+    posted = claim(conn, unit="worker-job-1.service", holder_pid=a_dead_pid())
+
+    assert posted["state"] == "abandoned"
+    assert posted["may_kill"] == "yes"
+    assert posted["holder_alive"] is False
+    assert "worker-job-1.service" in posted["may_kill_why"]
+
+
+def test_claim_unit_can_be_updated(conn, monkeypatch):
+    monkeypatch.setattr(agora, "_units_active", lambda units: {u: True for u in units})
+    posted = claim(conn, unit="worker-job-1.service")
+    updated = agora.update(conn, posted["id"], unit="job-42.service")
+
+    assert updated["holder_unit"] == "job-42.service"
+    assert updated["unit"] == "job-42.service"
+
+
+def test_auto_release_releases_abandoned_claims(conn):
+    abandoned = claim(conn, holder_pid=a_dead_pid())
+    live = claim(conn)
+
+    released_ids = agora.auto_release(conn)
+
+    assert released_ids == [abandoned["id"]]
+    assert len(readonly.claims(conn)) == 1
+    assert readonly.claims(conn)[0]["id"] == live["id"]
+    hist = [c for c in readonly.claims(conn, released=True) if c["released_at"]]
+    assert len(hist) == 1
+    assert hist[0]["id"] == abandoned["id"]
+    assert hist[0]["release_note"] == (
+        "auto-released: holder is gone and no processes are running")
+
+
+def test_auto_release_does_not_release_detached_claims(conn, sleeper):
+    detached = claim(conn, pids=[sleeper()], holder_pid=a_dead_pid())
+
+    released_ids = agora.auto_release(conn)
+
+    assert released_ids == []
+    open_claims = readonly.claims(conn)
+    assert len(open_claims) == 1
+    assert open_claims[0]["id"] == detached["id"]
+
+
+def test_claims_view_auto_releases_abandoned_claims(server, tmp_path):
+    conn = db.connect(tmp_path / "audit.db")
+    claim(conn, holder_pid=a_dead_pid())
+    live = claim(conn)
+    conn.close()
+
+    reply = call(server, "xenia_report", {"view": "claims"})
+    rows = reply["structuredContent"]["rows"]
+    assert len(rows) == 1
+    assert rows[0]["id"] == live["id"]
+
+
+def test_ram_block_reports_unclaimed_heavy_processes(conn, monkeypatch):
+    fake_procs = [
+        {"pid": 999901, "rss_mb": 512.0, "command": "python3 worker.py"},
+        {"pid": 999902, "rss_mb": 300.0, "command": "node runner.js"},
+    ]
+    monkeypatch.setattr(agora, "_unclaimed_heavy",
+                        lambda claimed_pids: [p for p in fake_procs if p["pid"] not in claimed_pids])
+
+    totals = agora.summary([])
+    assert totals["unclaimed_mb"] == 812
+    assert totals["unclaimed"] == fake_procs
+
+    held = claim(conn, pids=[999901])
+    totals_with_claim = agora.summary(agora.assess([held]))
+    assert totals_with_claim["unclaimed_mb"] == 300
+    assert len(totals_with_claim["unclaimed"]) == 1
+    assert totals_with_claim["unclaimed"][0]["pid"] == 999902
+
+
+def test_unclaimed_heavy_reads_ps(monkeypatch):
+    ps_output = "  100   102400 python3 small.py\n  200   524288 /bin/heavy-worker arg\n"
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *args, **kw: subprocess.CompletedProcess(
+                            args=args[0], returncode=0, stdout=ps_output))
+    monkeypatch.setattr(config, "AGORA_HEAVY_MB", 200)
+
+    heavy = agora._unclaimed_heavy(claimed_pids={100})
+    assert len(heavy) == 1
+    assert heavy[0]["pid"] == 200
+    assert heavy[0]["rss_mb"] == 512.0
+    assert heavy[0]["command"] == "/bin/heavy-worker arg"
+
+
+def test_mcp_claim_with_unit(server):
+    reply = call(server, "xenia_claim", {
+        "op": "post",
+        "resource": "background worker",
+        "purpose": "processing queue",
+        "unit": "worker-job-1.service",
+    })
+    claim_dict = reply["structuredContent"]["claim"]
+    assert claim_dict["unit"] == "worker-job-1.service"
+    assert claim_dict["holder_unit"] == "worker-job-1.service"
+
+
+def test_the_agora_filters_detached_state(server, sleeper, monkeypatch):
+    monkeypatch.setattr(agora, "_units_active", lambda units: {u: False for u in units})
+    call(server, "xenia_claim", {
+        "op": "post", "resource": "a detached worker",
+        "purpose": "outliving session",
+        "unit": "worker-job-1.service",
+        "pids": [sleeper()],
+    })
+    rows = call(server, "xenia_report",
+                {"view": "claims", "state": "detached"})["structuredContent"]["rows"]
+    assert len(rows) == 1
+    assert rows[0]["state"] == "detached"

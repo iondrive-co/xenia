@@ -992,3 +992,72 @@ def test_a_long_error_keeps_the_half_that_says_what_to_do(conn, clock):
     # only the head stores the half the agent already knows.
     assert stored.endswith("ACTION: retry with --force")
     assert " chars]…" in stored, "and the cut says how much of it went"
+
+
+def test_post_tool_use_failure_settles_immediately(conn, clock):
+    clock()
+    ingest.record(conn, pre("mcp__grafana__query", {"query": "up"}))
+    clock()
+    ingest.record(conn, {
+        "hook_event_name": "PostToolUseFailure", "session_id": "s1", "cwd": SHOP,
+        "tool_name": "mcp__grafana__query", "tool_input": {"query": "up"},
+        "error": "403 Forbidden: access denied",
+    })
+    action = one(conn, "SELECT status, error FROM action")
+    assert action["status"] == "error"
+    assert "403 Forbidden" in action["error"]
+
+
+def test_task_notifications_do_not_create_new_goals(conn, clock):
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                         "prompt": "Start background job", "cwd": SHOP})
+    assert conn.execute("SELECT COUNT(*) AS c FROM goal").fetchone()["c"] == 1
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                         "prompt": "<task-notification> Task finished successfully", "cwd": SHOP})
+    assert conn.execute("SELECT COUNT(*) AS c FROM goal").fetchone()["c"] == 1
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                         "prompt": "[Message] sender=task-1 content=done", "cwd": SHOP})
+    assert conn.execute("SELECT COUNT(*) AS c FROM goal").fetchone()["c"] == 1
+
+
+def test_multiple_stop_events_update_ended_at(conn, clock):
+    clock()
+    ingest.record(conn, {"hook_event_name": "UserPromptSubmit", "session_id": "s1",
+                         "prompt": "Work", "cwd": SHOP})
+    t1 = clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1", "cwd": SHOP})
+    s1 = one(conn, "SELECT ended_at FROM session")
+    assert s1["ended_at"] == t1
+    clock()
+    ingest.record(conn, pre("Bash", {"command": "echo more"}))
+    t2 = clock()
+    ingest.record(conn, {"hook_event_name": "Stop", "session_id": "s1", "cwd": SHOP})
+    s2 = one(conn, "SELECT ended_at FROM session")
+    assert s2["ended_at"] == t2
+    assert s2["ended_at"] != t1
+
+
+def test_backfill_historical_transcripts(conn, tmp_path):
+    claude_dir = tmp_path / "claude_history"
+    claude_dir.mkdir()
+    t_file = claude_dir / "sample.jsonl"
+    lines = [
+        {"sessionId": "hist-session-1", "cwd": SHOP, "type": "user", "message": {"content": "Old prompt"}},
+        {"sessionId": "hist-session-1", "cwd": SHOP, "type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}},
+        {"sessionId": "hist-session-1", "cwd": SHOP, "type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "file1.txt"}]}},
+    ]
+    t_file.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+
+    existing = set()
+    res = ingest._backfill_claude(conn, str(t_file), existing)
+    assert res is True
+    assert "hist-session-1" in existing
+    s = one(conn, "SELECT * FROM session WHERE session_uid = 'hist-session-1'")
+    assert s is not None
+    g = one(conn, "SELECT * FROM goal WHERE session_id = ?", (s["id"],))
+    assert g["prompt"] == "Old prompt"
+    a = one(conn, "SELECT * FROM action WHERE session_id = ?", (s["id"],))
+    assert a["tool"] == "Bash"

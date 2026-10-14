@@ -45,7 +45,7 @@ from .classify import segments
 #: Where a claim can be in its life. 'held' is live work, 'overrun' is live
 #: work past the window its own holder gave it, 'abandoned' is a claim whose
 #: session is gone, 'released' is one the holder finished with.
-STATES = ("held", "overrun", "abandoned", "released")
+STATES = ("held", "overrun", "detached", "abandoned", "released")
 
 #: The three answers to "may I kill this", and the only three there are.
 #: 'yes' is reserved for work nobody is waiting on any more.
@@ -54,11 +54,12 @@ MAY_KILL = ("no", "ask", "yes")
 #: Fields `update` will take. Everything else about a claim is either xenia's
 #: (the holder, the clocks) or fixed at the moment it was posted.
 UPDATABLE = ("resource", "purpose", "ram_mb", "pids", "pattern", "holds_for",
-             "kill_note", "repo")
+             "kill_note", "repo", "unit", "holder_unit")
 
 _COLUMNS = ("id", "posted_at", "updated_at", "released_at", "release_note",
             "holder_pid", "holder_start", "agent", "repo", "resource",
-            "purpose", "ram_mb", "pids", "pattern", "expires_at", "kill_note")
+            "purpose", "ram_mb", "pids", "pattern", "expires_at", "kill_note",
+            "holder_unit")
 
 _UNITS = {"m": 1.0, "h": 60.0, "d": 1440.0, "w": 10080.0}
 
@@ -202,6 +203,61 @@ def machine_ram() -> dict[str, Any]:
     return out
 
 
+def _units_active(units: list[str]) -> dict[str, bool] | None:
+    wanted = [u.strip() for u in units if u and u.strip()]
+    if not wanted:
+        return {}
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "is-active", *wanted],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+    lines = [line.strip() for line in out.stdout.splitlines()]
+    if len(lines) == len(wanted):
+        return {u: (lines[i] == "active") for i, u in enumerate(wanted)}
+
+    found: dict[str, bool] = {}
+    for u in wanted:
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "is-active", u],
+                capture_output=True, text=True, timeout=5)
+            found[u] = (res.returncode == 0 and res.stdout.strip() == "active")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+    return found
+
+
+def _unclaimed_heavy(claimed_pids: set[int]) -> list[dict[str, Any]]:
+    threshold = config.AGORA_HEAVY_MB
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,rss=,args="],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+    procs = []
+    for line in out.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, rss_kb = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pid in claimed_pids:
+            continue
+        rss_mb = round(rss_kb / 1024, 1)
+        if rss_mb >= threshold:
+            cmd = parts[2].strip()
+            procs.append({"pid": pid, "rss_mb": rss_mb, "command": cmd[:160]})
+    procs.sort(key=lambda p: -p["rss_mb"])
+    return procs
+
+
 # -------------------------------------------------------------------- write
 
 
@@ -275,7 +331,8 @@ def _row(conn: sqlite3.Connection, claim_id: int) -> dict[str, Any] | None:
 def post(conn: sqlite3.Connection, *, resource: Any, purpose: Any,
          ram_mb: Any = None, pids: Any = None, pattern: Any = None,
          holds_for: Any = None, kill_note: Any = None, repo: Any = None,
-         agent: Any = None, holder_pid: int | None = None) -> dict[str, Any]:
+         agent: Any = None, holder_pid: int | None = None,
+         unit: Any = None, holder_unit: Any = None) -> dict[str, Any]:
     """Write a claim to the agora, and hand back what a reader of it will see.
 
     Posting BEFORE the work starts is the point — a peer weighing up a job of
@@ -286,13 +343,14 @@ def post(conn: sqlite3.Connection, *, resource: Any, purpose: Any,
     holder = os.getpid() if holder_pid is None else int(holder_pid)
     named = _pids(pids)
     here_agent, here_repo = _whoami()
+    unit_val = unit if unit is not None else holder_unit
     cursor = conn.execute("""
         INSERT INTO claim (posted_at, updated_at, holder_pid, holder_start,
                            agent, repo, resource, purpose, ram_mb, pids,
-                           pattern, expires_at, kill_note)
+                           pattern, expires_at, kill_note, holder_unit)
         VALUES (:posted_at, :updated_at, :holder_pid, :holder_start, :agent,
                 :repo, :resource, :purpose, :ram_mb, :pids, :pattern,
-                :expires_at, :kill_note)
+                :expires_at, :kill_note, :holder_unit)
     """, {
         "posted_at": now, "updated_at": now,
         "holder_pid": holder,
@@ -306,6 +364,7 @@ def post(conn: sqlite3.Connection, *, resource: Any, purpose: Any,
         "pattern": _text("pattern", pattern),
         "expires_at": _expiry(now, holds_for),
         "kill_note": _text("kill_note", kill_note, limit=1000),
+        "holder_unit": _text("unit", unit_val, limit=120),
     })
     conn.commit()
     return assess([_row(conn, int(cursor.lastrowid))])[0]
@@ -334,9 +393,11 @@ def update(conn: sqlite3.Connection, claim_id: int, *,
         return {"refused": f"claim {claim_id} was released at "
                            f"{row['released_at']} and is history now. Post a "
                            f"new one for new work.", "claim": seen}
-    if row["holder_pid"] != caller and seen["state"] != "abandoned":
+    if row["holder_pid"] != caller and seen["state"] not in ("abandoned", "detached"):
+        holder_desc = (f"unit {row['holder_unit']}" if row.get("holder_unit")
+                       else f"holder pid {row['holder_pid']}")
         return {"refused": f"claim {claim_id} belongs to a session that is "
-                           f"still running (holder pid {row['holder_pid']}). "
+                           f"still running ({holder_desc}). "
                            f"Only its own holder changes it while it is "
                            f"{seen['state']}.", "claim": seen}
 
@@ -358,9 +419,10 @@ def update(conn: sqlite3.Connection, claim_id: int, *,
         sets["repo"] = _text("repo", fields["repo"], limit=120)
     if "holds_for" in fields:
         sets["expires_at"] = _expiry(sets["updated_at"], fields["holds_for"])
+    if "unit" in fields or "holder_unit" in fields:
+        val = fields.get("unit") if "unit" in fields else fields.get("holder_unit")
+        sets["holder_unit"] = _text("unit", val, limit=120)
     if row["holder_pid"] != caller:
-        # Taking over an abandoned claim: the new holder is this session, and
-        # its liveness is what the claim is measured by from here.
         sets["holder_pid"] = caller
         sets["holder_start"] = (_ps([caller]) or {}).get(
             caller, {}).get("started")
@@ -390,9 +452,10 @@ def release(conn: sqlite3.Connection, claim_id: int, *, note: Any = None,
 
     seen = assess([dict(row)])[0]
     if row["holder_pid"] != caller and seen["may_kill"] == "no":
+        holder_desc = (f"unit {row['holder_unit']}" if row.get("holder_unit")
+                       else f"holder pid {row['holder_pid']}")
         return {"refused": f"claim {claim_id} is live work held by a session "
-                           f"that is still running (holder pid "
-                           f"{row['holder_pid']}). Ask there, or ask the "
+                           f"that is still running ({holder_desc}). Ask there, or ask the "
                            f"user; a claim is not released out from under "
                            f"its holder.", "claim": seen}
 
@@ -408,29 +471,65 @@ def release(conn: sqlite3.Connection, claim_id: int, *, note: Any = None,
 # --------------------------------------------------------------------- read
 
 
-def assess(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Stored claims, plus everything only the live machine can say.
+def auto_release(conn: sqlite3.Connection) -> list[int]:
+    try:
+        cursor = conn.execute(
+            f"SELECT {', '.join(_COLUMNS)} FROM claim WHERE released_at IS NULL")
+        open_rows = [dict(r) for r in cursor.fetchall()]
+    except sqlite3.OperationalError:
+        return []
+    if not open_rows:
+        return []
 
-    One `ps` for every pid in the agora — holders and claimed processes
-    together — because a read of the whole agora is one question and should
-    cost one subprocess.
-    """
+    assessed = assess(open_rows)
+    to_release = [r["id"] for r in assessed if r["state"] == "abandoned"]
+    if not to_release:
+        return []
+
+    now = _now()
+    note = "auto-released: holder is gone and no processes are running"
+    try:
+        for claim_id in to_release:
+            conn.execute(
+                "UPDATE claim SET released_at = :at, updated_at = :at, "
+                "release_note = :note WHERE id = :id",
+                {"at": now, "note": note, "id": claim_id})
+        conn.commit()
+    except sqlite3.OperationalError:
+        return []
+    return to_release
+
+
+def assess(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = [dict(r) for r in rows]
     wanted: set[int] = set()
+    units: list[str] = []
     for row in rows:
         wanted.add(int(row["holder_pid"]))
         wanted.update(int(p) for p in _stored_pids(row))
+        if row.get("holder_unit"):
+            units.append(str(row["holder_unit"]))
 
     probe = _ps(wanted)
-    return [_assess_one(row, probe) for row in rows]
+    unit_probe = _units_active(units)
+    return [_assess_one(row, probe, unit_probe) for row in rows]
 
 
 def _stored_pids(row: dict[str, Any]) -> dict[int, str | None]:
+    if "processes" in row and isinstance(row["processes"], list):
+        out: dict[int, str | None] = {}
+        for p in row["processes"]:
+            if isinstance(p, dict) and "pid" in p:
+                try:
+                    out[int(p["pid"])] = None
+                except (TypeError, ValueError):
+                    pass
+        return out
     try:
         stored = json.loads(row.get("pids") or "{}")
     except (ValueError, TypeError):
         return {}
-    out: dict[int, str | None] = {}
+    out = {}
     for pid, started in (stored or {}).items():
         try:
             out[int(pid)] = started
@@ -440,12 +539,23 @@ def _stored_pids(row: dict[str, Any]) -> dict[int, str | None]:
 
 
 def _assess_one(row: dict[str, Any],
-                probe: dict[int, dict[str, Any]] | None) -> dict[str, Any]:
+                probe: dict[int, dict[str, Any]] | None,
+                unit_probe: dict[str, bool] | None = None) -> dict[str, Any]:
     now = _now()
     blind = probe is None
     holder = int(row["holder_pid"])
-    holder_alive = True if blind else _same_process(
-        (probe or {}).get(holder), row.get("holder_start"))
+    if row.get("holder_unit"):
+        unit = str(row["holder_unit"])
+        if unit_probe is None:
+            holder_alive = True
+            unit_blind = True
+        else:
+            holder_alive = bool(unit_probe.get(unit, False))
+            unit_blind = False
+    else:
+        unit_blind = False
+        holder_alive = True if blind else _same_process(
+            (probe or {}).get(holder), row.get("holder_start"))
 
     processes = []
     measured: float | None = None
@@ -459,7 +569,7 @@ def _assess_one(row: dict[str, Any],
             measured = (measured or 0) + seen["rss_mb"]
         processes.append(entry)
 
-    state, may_kill, why = _verdict(row, now, holder_alive, blind, processes)
+    state, may_kill, why = _verdict(row, now, holder_alive, blind or unit_blind, processes)
 
     out: dict[str, Any] = {
         "id": row["id"], "state": state, "may_kill": may_kill,
@@ -467,10 +577,13 @@ def _assess_one(row: dict[str, Any],
         "resource": row["resource"], "purpose": row["purpose"],
         "ram_mb": row["ram_mb"],
         "holder_pid": holder,
-        "holder_alive": None if blind else holder_alive,
+        "holder_alive": None if (blind or unit_blind) else holder_alive,
         "posted_at": row["posted_at"], "expires_at": row["expires_at"],
         "age_minutes": _age(row["posted_at"], now),
     }
+    if row.get("holder_unit"):
+        out["holder_unit"] = row["holder_unit"]
+        out["unit"] = row["holder_unit"]
     if measured is not None:
         out["rss_mb"] = round(measured, 1)
     if processes:
@@ -479,7 +592,7 @@ def _assess_one(row: dict[str, Any],
                 "release_note"):
         if row.get(key):
             out[key] = row[key]
-    if blind:
+    if blind or unit_blind:
         out["unmeasured"] = ("the process table could not be read here, so "
                              "liveness is assumed rather than checked")
     return out
@@ -489,7 +602,7 @@ def _verdict(row: dict[str, Any], now: str, holder_alive: bool, blind: bool,
              processes: list[dict[str, Any]]) -> tuple[str, str, str]:
     live_pids = [p["pid"] for p in processes if p.get("alive")]
 
-    if row["released_at"]:
+    if row.get("released_at"):
         if live_pids:
             return ("released", "yes",
                     f"the holder released this at {row['released_at']} and "
@@ -501,12 +614,16 @@ def _verdict(row: dict[str, Any], now: str, holder_alive: bool, blind: bool,
                 f"released at {row['released_at']}; nothing here is running")
 
     if not holder_alive:
-        gone = ("nothing of it is still running, so there may be nothing left "
-                "to do" if not live_pids else
-                f"kill {', '.join(str(p) for p in live_pids)}")
+        holder_desc = (f"unit {row['holder_unit']}" if row.get("holder_unit")
+                       else f"pid {row.get('holder_pid')}")
+        if live_pids:
+            p_desc = f"{', '.join(str(p) for p in live_pids)} {'is' if len(live_pids) == 1 else 'are'} still running"
+            note = f" — {row['kill_note']}" if row.get("kill_note") else " — ask before killing"
+            return ("detached", "ask",
+                    f"the holder ({holder_desc}) is gone, but {p_desc}{note}")
         return ("abandoned", "yes",
-                f"the session that posted this (pid {row['holder_pid']}) is "
-                f"gone and never released it — {gone}")
+                f"the holder ({holder_desc}) is gone and never released it — "
+                f"nothing of it is still running, so there may be nothing left to do")
 
     if blind:
         return ("held", "no",
@@ -514,15 +631,19 @@ def _verdict(row: dict[str, Any], now: str, holder_alive: bool, blind: bool,
                 "read as live work; do not kill it on the strength of this "
                 "row")
 
-    if row["expires_at"] and row["expires_at"] < now:
+    if row.get("expires_at") and row["expires_at"] < now:
+        holder_desc = (f"unit {row['holder_unit']} is still active" if row.get("holder_unit")
+                       else "that session is still running")
         return ("overrun", "ask",
                 f"past the window its holder gave it ({row['expires_at']}), "
-                f"but that session is still running. It is more likely a "
+                f"but {holder_desc}. It is more likely a "
                 f"release nobody sent than work that died — check what the "
                 f"processes are doing, and ask before killing")
 
+    holder_desc = (f"active unit {row['holder_unit']}" if row.get("holder_unit")
+                   else "a running session")
     return ("held", "no",
-            f"live work, held by a running session until {row['expires_at']}")
+            f"live work, held by {holder_desc} until {row.get('expires_at')}")
 
 
 def _age(posted_at: str | None, now: str) -> float | None:
@@ -557,8 +678,17 @@ def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = dict(machine_ram())
     claimed = reclaimable = 0.0
     unstated = 0
+    claimed_pids: set[int] = set()
     for row in rows:
         declared, measured = row.get("ram_mb"), row.get("rss_mb")
+        if row.get("state") != "released":
+            if row.get("holder_pid"):
+                try:
+                    claimed_pids.add(int(row["holder_pid"]))
+                except (ValueError, TypeError):
+                    pass
+            for pid in _stored_pids(row):
+                claimed_pids.add(int(pid))
         if row["may_kill"] == "yes":
             # What killing it would actually hand back is what it is holding
             # now. A forecast is worth nothing here: the claim may name
@@ -579,6 +709,11 @@ def summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     out["reclaimable_mb"] = int(reclaimable)
     if unstated:
         out["unstated"] = unstated
+
+    heavy = _unclaimed_heavy(claimed_pids)
+    out["unclaimed_mb"] = int(sum(p["rss_mb"] for p in heavy))
+    if heavy:
+        out["unclaimed"] = heavy[:config.AGORA_MAX_UNCLAIMED]
     return out
 
 
@@ -711,7 +846,7 @@ def _advice(conn: sqlite3.Connection, what: str) -> str:
 
     rows = assess(readonly.claims(conn))
     ram = summary(rows)
-    live = [r for r in rows if r.get("state") in ("held", "overrun")]
+    live = [r for r in rows if r.get("state") in ("held", "overrun", "detached")]
     free = (f"{_gb(ram.get('available_mb'))} of {_gb(ram.get('total_mb'))} free"
             if ram.get("available_mb") else "")
 
