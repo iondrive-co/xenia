@@ -1,14 +1,3 @@
-"""Where credential values actually live: the operating system's own store.
-
-Xenia writes no crypto and holds no ciphertext. On Linux that is the Secret
-Service D-Bus API, which gnome-keyring, KWallet and KeePassXC all implement,
-so which one is the user's choice; on macOS it is the Keychain.
-
-A backend can get, set, delete, list its own items and describe itself.
-Listing is not a way in: anything running as the user can enumerate the store
-directly, so withholding it here would only cost the user a working
-`secret list`.
-"""
 
 from __future__ import annotations
 

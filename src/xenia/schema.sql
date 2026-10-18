@@ -200,7 +200,8 @@ CREATE TABLE IF NOT EXISTS secret (
     service           TEXT,
     scope             TEXT,
     scope_verified_at TEXT,
-    expires_hint      TEXT
+    expires_hint      TEXT,
+    revision          INTEGER
 );
 
 -- One approval, by a human, for one credential against one host. Two clocks:
@@ -234,6 +235,7 @@ CREATE TABLE IF NOT EXISTS secret_grant (
     -- one, because an approval nobody can account for later is the thing a
     -- ceiling was protecting against.
     reason       TEXT,
+    hold         INTEGER NOT NULL DEFAULT 0,
     revoked_at   TEXT
 );
 

@@ -619,11 +619,10 @@ def test_no_terminal_at_all_is_reported_rather_than_guessed(monkeypatch):
 # -- a signing profile that nests -------------------------------------------
 
 NESTED_PROFILE = {
-    "scheme": "secp256k1-eip712",
-    "domain": {"name": "Example", "version": "1", "chainId": 1,
-               "verifyingContract": "0x" + "00" * 20},
-    "types": {"Agent": [{"name": "nonce", "type": "uint64"}]},
-    "primary_type": "Agent",
+    "scheme": "hmac",
+    "template": "{method}{path}",
+    "options": {"headers": {"X-Sign": {"part": "signature"}},
+                "order": [{"name": "method"}, {"name": "path"}]},
     "payload_policy": {"actions": {"one": {
         "methods": ["SIGN"], "paths": ["/"], "required": ["nonce"]}}},
 }
@@ -638,19 +637,13 @@ def profile_on(cli, name="service-key"):
 
 
 def test_a_nested_signing_profile_is_stored_as_json_not_as_strings(cli):
-    """`key=value` cannot spell a domain, a schema or a message binding.
-
-    Stringifying them would store a profile the scheme then refuses at signing
-    time — the failure arriving one operator step after the mistake.
-    """
     assert cli("secret", "add", "service-key", "--host", "api.example.com",
                stdin=VALUE) == 0
     assert cli("secret", "sign", "service-key", "dispatch",
                stdin=json.dumps(NESTED_PROFILE)) == 0
 
     held = profile_on(cli)["dispatch"]
-    assert held["domain"] == NESTED_PROFILE["domain"]
-    assert held["types"] == NESTED_PROFILE["types"]
+    assert held["options"] == NESTED_PROFILE["options"]
     assert held["payload_policy"] == NESTED_PROFILE["payload_policy"]
 
 
@@ -710,3 +703,19 @@ def test_granting_for_signing_infers_mutating_even_without_write_flag(cli):
     assert status == 0
     row = cli.db().execute("SELECT mutating FROM secret_grant WHERE name = 'service-key'").fetchone()
     assert row["mutating"] == 1
+
+
+def test_a_standing_approval_can_hold_the_value(cli, capsys):
+    assert cli("secret", "add", "service-key", "--host", "api.example.com", stdin=VALUE) == 0
+    assert cli("secret", "sign", "service-key", "dispatch", "scheme=hmac", "template={body}") == 0
+    assert cli("grant", "service-key", "--host", "(sign)", "--for", "10m", "--hold") == 2
+    assert "--hold belong to a standing approval" in capsys.readouterr().err
+
+    assert cli("grant", "service-key", "--host", "(sign)", "--until", "30d",
+               "--profiles", "dispatch", "--reason", "batch processing", "--hold") == 0
+    assert "holds    the value in xenia's memory" in capsys.readouterr().out
+    assert cli("grants") == 0
+    assert "holds the value in memory" in capsys.readouterr().out
+    row = cli.db().execute("SELECT hold FROM secret_grant WHERE name = 'service-key' "
+                           "AND revoked_at IS NULL").fetchone()
+    assert row["hold"] == 1

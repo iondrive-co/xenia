@@ -39,7 +39,7 @@ from typing import Any
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
-from . import config, policy as bodies, signing, vault
+from . import config, policy as bodies, providers, signing, vault
 
 PLACEHOLDER = "{{secret}}"
 
@@ -219,9 +219,9 @@ def set_profile(conn, name: str, profile: str, config_json: dict) -> dict:
     if row is None:
         raise ValueError(f"no credential called '{name}'")
     scheme = config_json.get("scheme")
-    if scheme not in signing.SCHEMES:
+    if not isinstance(scheme, str) or scheme not in signing.schemes():
         raise ValueError(f"no signing scheme called {scheme!r} — xenia has: "
-                         f"{', '.join(sorted(signing.SCHEMES))}")
+                         f"{', '.join(sorted(signing.schemes()))}")
     try:
         held = json.loads(row["schemes"]) if row["schemes"] else {}
     except (TypeError, ValueError):
@@ -365,7 +365,8 @@ def default_window(mutating: bool) -> float:
 def grant(conn, name: str, host: str, *, mutating: bool = False,
           seconds: float | None = None, source: str = "cli",
           ceiling_seconds: float | None = None,
-          profiles: list[str] | None = None, reason: str | None = None) -> dict:
+          profiles: list[str] | None = None, reason: str | None = None,
+          hold: bool = False) -> dict:
     """Approve one credential against one host, until one of two clocks stops.
 
     `ceiling_seconds` is the clock that does not slide. It defaults to the
@@ -376,6 +377,8 @@ def grant(conn, name: str, host: str, *, mutating: bool = False,
     """
     if entry(conn, name) is None:
         raise ValueError(f"no credential called '{name}'")
+    if hold and source != "standing":
+        raise ValueError("only a standing approval can hold a credential's value")
 
     now = utcnow()
     window = seconds if seconds is not None else default_window(mutating)
@@ -416,10 +419,10 @@ def grant(conn, name: str, host: str, *, mutating: bool = False,
     cursor = conn.execute(
         "INSERT INTO secret_grant (name, host, mutating, granted_at, "
         "                          window_s, expires_at, ceiling_at, source, "
-        "                          profiles, reason) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "                          profiles, reason, hold) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (name, host, int(mutating), stamp(now), window, stamp(expires),
-         stamp(ceiling), source, profiles_json, (reason or None)))
+         stamp(ceiling), source, profiles_json, (reason or None), int(hold)))
     conn.commit()
     return dict(conn.execute("SELECT * FROM secret_grant WHERE id = ?",
                              (cursor.lastrowid,)).fetchone())
@@ -427,7 +430,8 @@ def grant(conn, name: str, host: str, *, mutating: bool = False,
 
 def standing(conn, name: str, host: str, *, until: datetime,
              profiles: list[str] | None = None, reason: str = "",
-             mutating: bool = True, source: str = "standing") -> dict:
+             mutating: bool = True, source: str = "standing",
+             hold: bool = False) -> dict:
     """An approval for work that runs while nobody is at the keyboard.
 
     THE PROBLEM IT SOLVES. An ordinary grant assumes a person: the first use
@@ -484,12 +488,19 @@ def standing(conn, name: str, host: str, *, until: datetime,
                 f"'{suggest_profiles(installed)}' would cover the installed set")
     return grant(conn, name, host, mutating=mutating, seconds=seconds,
                  source=source, ceiling_seconds=seconds, profiles=profiles,
-                 reason=reason)
+                 reason=reason, hold=hold)
 
 
 def is_standing(row) -> bool:
     try:
         return (row["source"] or "") == "standing"
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def holds(row) -> bool:
+    try:
+        return is_standing(row) and bool(row["hold"])
     except (KeyError, IndexError, TypeError):
         return False
 
@@ -1204,14 +1215,14 @@ def _authorise(conn, names: list[str], url: str, method: str, *,
 
         approval = live_grant(conn, name, host, method in MUTATING)
         if approval is None or not _approved_for(row, host, method):
+            _let_go(conn, name)
             row, approval = _decide(conn, row, host, method, notify=notify)
 
         rows[name] = row
         host, sending, pinned = permit(row, url, method)
         grants[name] = approval
 
-        with _stage("keyring"):
-            value = (store or vault.backend(row["backend"])).get(name)
+        value = _value_of(conn, row, approval, store)
         if value is None:
             raise Refusal(
                 f"'{name}' is registered but the credential store has no "
@@ -1236,6 +1247,103 @@ def profiles_for(row, method: str) -> dict[str, dict]:
         loaded = {}
     return {key: {**profile, "_method": method}
             for key, profile in loaded.items()}
+
+
+_profiles: dict[tuple[str, str], tuple[int, dict[str, str]]] = {}
+_profiles_lock = threading.Lock()
+
+
+def _profile_texts(conn, name: str) -> dict[str, str] | None:
+    key = (_database_of(conn), name)
+    found = conn.execute("SELECT revision FROM secret WHERE name = ?",
+                         (name,)).fetchone()
+    if found is None:
+        return None
+    with _profiles_lock:
+        cached = _profiles.get(key)
+    if cached is not None and found["revision"] is not None \
+            and cached[0] == found["revision"]:
+        return cached[1]
+    row = conn.execute("SELECT revision, schemes FROM secret WHERE name = ?",
+                       (name,)).fetchone()
+    if row is None:
+        return None
+    try:
+        loaded = json.loads(row["schemes"]) if row["schemes"] else {}
+    except (TypeError, ValueError):
+        loaded = {}
+    texts = ({str(key): json.dumps(value) for key, value in loaded.items()
+              if isinstance(value, dict)} if isinstance(loaded, dict) else {})
+    if row["revision"] is not None:
+        with _profiles_lock:
+            _profiles[key] = (row["revision"], texts)
+    return texts
+
+
+def profile_of(conn, name: str, profile: str, method: str) -> dict | None:
+    texts = _profile_texts(conn, name)
+    if not texts or profile not in texts:
+        return None
+    return {**json.loads(texts[profile]), "_method": method}
+
+
+_held: dict[tuple[str, str], tuple[int, int, str]] = {}
+_held_lock = threading.Lock()
+
+
+def _value_of(conn, row, approval, store=None) -> str | None:
+    key = (_database_of(conn), row["name"])
+    keep = holds(approval) and row["revision"] is not None
+    with _held_lock:
+        found = _held.get(key)
+        if not keep:
+            _held.pop(key, None)
+        elif found is not None and found[:2] == (approval["id"], row["revision"]):
+            return found[2]
+    with _stage("keyring"):
+        value = (store or vault.backend(row["backend"])).get(row["name"])
+    if keep and value is not None:
+        with _held_lock:
+            _held[key] = (approval["id"], row["revision"], value)
+    return value
+
+
+def _let_go(conn, name: str) -> None:
+    with _held_lock:
+        _held.pop((_database_of(conn), name), None)
+
+
+def held_names() -> list[str]:
+    with _held_lock:
+        return sorted({name for _database, name in _held})
+
+
+def sweep_held(conn) -> int:
+    database = _database_of(conn)
+    with _held_lock:
+        held = [(key, found[:2]) for key, found in _held.items()
+                if key[0] == database]
+    now = stamp(utcnow())
+    dropped = 0
+    for key, (grant_id, revision) in held:
+        live = conn.execute(
+            "SELECT 1 FROM secret_grant JOIN secret USING (name) "
+            "WHERE secret_grant.id = ? AND secret_grant.name = ? "
+            "  AND secret_grant.hold = 1 AND secret_grant.revoked_at IS NULL "
+            "  AND secret_grant.expires_at > ? AND secret_grant.ceiling_at > ? "
+            "  AND secret.revision = ?",
+            (grant_id, key[1], now, now, revision)).fetchone()
+        if live is None:
+            with _held_lock:
+                if _held.get(key, (None, None))[:2] == (grant_id, revision):
+                    del _held[key]
+                    dropped += 1
+    return dropped
+
+
+def forget_held() -> None:
+    with _held_lock:
+        _held.clear()
 
 
 #: How much of a binary body is read at a time, and how much of the previous
@@ -1719,7 +1827,8 @@ def _sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
     try:
         if not name or payload is None:
             raise Refusal("sign needs 'secret' and 'payload'", code="malformed")
-        row = entry(conn, name)
+        row = conn.execute("SELECT name, backend, revision FROM secret "
+                           "WHERE name = ?", (name,)).fetchone()
         if row is None:
             raise Refusal(f"no credential called '{name}'", code="off-policy")
 
@@ -1730,6 +1839,7 @@ def _sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
         # signing oracle for every other profile on the same credential.
         approval = live_grant(conn, name, SIGN_SCOPE, True, profile_name)
         if approval is None:
+            _let_go(conn, name)
             # ASK THE SAME WAY A REQUEST DOES. The prompt, the cool-off and the
             # grant are the same on both.
             ended: dict[str, Any] = {}
@@ -1751,15 +1861,13 @@ def _sign_only(conn, request: dict, *, store=None, notify: bool = True) -> dict:
                              source="prompt")
             _asked.pop((name, SIGN_SCOPE), None)
 
-        with _stage("keyring"):
-            value = (store or vault.backend(row["backend"])).get(name)
+        value = _value_of(conn, row, approval, store)
         if value is None:
             raise Refusal(f"the credential store has no value for '{name}'",
                           code="no-value")
         scrubber.add(name, value)
 
-        profiles = profiles_for(row, "SIGN")
-        profile = profiles.get(profile_name)
+        profile = profile_of(conn, name, profile_name, "SIGN")
         if profile is None:
             raise Refusal(
                 f"'{name}' has no signing profile called '{profile_name}'",
@@ -2344,6 +2452,7 @@ TIMING = ("{received_wall_ms: epoch ms when the broker accepted the "
 #: forever — the broker stops answering anyone, having refused nothing.
 CLIENT_READ_TIMEOUT = float(os.environ.get("XENIA_BROKER_READ_TIMEOUT", 20))
 MAX_CLIENTS = int(os.environ.get("XENIA_BROKER_MAX_CLIENTS", 16))
+HELD_SWEEP_S = float(os.environ.get("XENIA_HELD_SWEEP_S", 30))
 
 
 class Server:
@@ -2358,6 +2467,8 @@ class Server:
         self._inode: int | None = None
         self._slots = threading.Semaphore(MAX_CLIENTS)
         self._writer: Writer | None = None
+        self._migrated = False
+        self._stopping = threading.Event()
 
     def start(self) -> str:
         parent = os.path.dirname(self.path)
@@ -2399,6 +2510,10 @@ class Server:
         self._thread = threading.Thread(target=self._accept, daemon=True,
                                         name="xenia-broker")
         self._thread.start()
+        self._stopping.clear()
+        threading.Thread(target=self._sweep, daemon=True,
+                         name="xenia-broker-held").start()
+        providers.start()
         return self.path
 
     def stop(self) -> None:
@@ -2420,6 +2535,28 @@ class Server:
                 _writer = None
             self._writer.stop()
             self._writer = None
+        self._stopping.set()
+        forget_held()
+        providers.stop()
+
+    def _connection(self) -> sqlite3.Connection:
+        from . import db
+        conn = db.connect(self.db_path, migrated=self._migrated)
+        self._migrated = True
+        return conn
+
+    def _sweep(self) -> None:
+        while not self._stopping.wait(HELD_SWEEP_S):
+            try:
+                conn = self._connection()
+            except Exception:
+                continue
+            try:
+                sweep_held(conn)
+            except Exception:
+                pass
+            finally:
+                conn.close()
 
     def _accept(self) -> None:
         while self._running and self._sock is not None:
@@ -2488,11 +2625,12 @@ class Server:
         elif op == "ops":
             reply = {"ops": OPS, "codes": CODES, "timing": TIMING,
                      "schemes": {name: signing.available(name)
-                                 for name in sorted(signing.SCHEMES)}}
+                                 for name in sorted(signing.schemes())},
+                     "providers": providers.status(),
+                     "held": held_names()}
         elif op in ("fetch", "sign"):
-            from . import db
             try:
-                conn = db.connect(self.db_path)
+                conn = self._connection()
             except sqlite3.OperationalError as exc:
                 reply = {"refused": f"xenia's database could not be opened: "
                                     f"{exc}. Nothing was sent.",

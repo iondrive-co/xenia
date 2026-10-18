@@ -51,3 +51,6 @@ For posting, updating or releasing a claim on a resource.
 Where `tool`, `via`, `channel`, `session` and `signature` are accepted they match exactly or as a glob (`via: "acme-*"`), and a `signature` from any view drills straight into the calls behind that row.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Custom request signing can be supplied by an executable using the
+[signing provider protocol](SIGNING.md).

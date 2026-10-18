@@ -148,23 +148,6 @@ def test_variables_are_read_off_the_request_and_not_from_the_caller():
     assert variables["host"] == "h.test"
 
 
-# -- the curves -------------------------------------------------------------
-
-@pytest.mark.parametrize("scheme", ["secp256k1-eip712", "stark"])
-def test_a_curve_scheme_is_absent_by_name_rather_than_approximated(scheme):
-    """A pure-Python scalar multiply leaks the key through timing, and the
-    signature it produces verifies exactly as well as a sound one, so xenia
-    binds to a reviewed implementation rather than carrying its own."""
-    if signing.available(scheme):
-        pytest.skip(f"{scheme} has its optional dependency installed here")
-
-    with pytest.raises(signing.SchemeError) as raised:
-        signing.sign({"scheme": scheme}, context())
-
-    assert raised.value.code == "unavailable"
-    assert "pip install" in str(raised.value)
-
-
 def test_every_scheme_reports_whether_it_can_run_here():
     reported = {name: signing.available(name) for name in signing.SCHEMES}
 
@@ -175,34 +158,7 @@ def test_every_scheme_reports_whether_it_can_run_here():
 
 def test_an_unknown_scheme_lists_the_known_ones():
     with pytest.raises(signing.SchemeError, match="aws-sigv4"):
-        signing.sign({"scheme": "ed25519-magic"}, context())
-
-
-def test_profile_bound_eip712_signing_commits_to_the_checked_message():
-    if not signing.available("secp256k1-eip712"):
-        pytest.skip("eth-account, coincurve and msgpack are optional")
-    from eth_account import Account
-    from eth_account.messages import encode_typed_data
-
-    key = "0x" + "11" * 32
-    profile = {
-        "scheme": "secp256k1-eip712",
-        "domain": {"name": "Example", "version": "1", "chainId": 1,
-                   "verifyingContract": "0x0000000000000000000000000000000000000000"},
-        "types": {"Agent": [{"name": "nonce", "type": "uint64"}]},
-        "primary_type": "Agent",
-        "payload_policy": {"actions": {"one": {
-            "methods": ["SIGN"], "paths": ["/"],
-            "required": ["nonce"], "max": {"nonce": 100}}}},
-    }
-    message = {"nonce": 7}
-    got = signing.sign(profile, context(secret=key, body=json.dumps(message)))
-    structured = encode_typed_data(full_message={
-        "types": profile["types"], "domain": profile["domain"],
-        "primaryType": profile["primary_type"], "message": message})
-    recovered = Account.recover_message(
-        structured, signature=bytes.fromhex(got[2:]))
-    assert recovered == Account.from_key(key).address
+        signing.sign({"scheme": "unknown-method"}, context())
 
 
 # -- key encoding and the timestamp that has to match ----------------------

@@ -10,8 +10,6 @@ caller's request. A caller that could choose what gets signed could have
 arbitrary bytes signed with the key and reuse them elsewhere; it also means a
 format guessed wrong costs a config change rather than a code change.
 
-A scheme is a callable in SCHEMES taking a Context and returning the string to
-place. `available()` says whether it can run here.
 """
 
 from __future__ import annotations
@@ -19,11 +17,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 from urllib.parse import parse_qsl, quote, urlsplit
+
+from . import providers
 
 
 class SchemeError(Exception):
@@ -283,180 +282,39 @@ def sigv4_scheme(ctx: Context) -> str:
             f"SignedHeaders={signed_headers}, Signature={signature}")
 
 
-# --------------------------------------------------------------------------
-# Elliptic curves — optional, and absent rather than approximated
-# --------------------------------------------------------------------------
-
-def _optional(module: str, install: str) -> Callable:
-    """A scheme that is real when its library is installed, and honest when not.
-
-    Xenia carries no cryptographic implementation of its own. A pure-Python
-    scalar multiplication leaks the private key through timing, and the
-    signature it produces verifies exactly as well as a sound one — so the
-    failure would be invisible. These bind to a reviewed implementation, are
-    optional, and say so by name when it is missing.
-    """
-
-    def scheme(ctx: Context) -> str:
-        raise SchemeError(
-            f"the '{ctx.config.get('scheme')}' signing scheme needs {module}, "
-            f"which is not installed here ({install}). It is optional on "
-            f"purpose: xenia binds to a reviewed implementation rather than "
-            f"carrying its own.",
-            code="unavailable")
-
-    def available() -> bool:
-        try:
-            __import__(module)
-            return True
-        except ImportError:
-            return False
-
-    scheme.available = available          # type: ignore[attr-defined]
-    scheme.needs = module                 # type: ignore[attr-defined]
-    return scheme
-
-
-def eip712_scheme(ctx: Context) -> str:
-    """Sign a profile-bound EIP-712 message with a reviewed account library.
-
-    The profile fixes the domain, schema, input policy and message bindings.
-    Hash fields are derived here from the input the policy checks. Accepting
-    a caller-supplied hash would hide the request from that policy.
-    """
-    try:
-        from eth_account import Account
-        from eth_account.messages import encode_typed_data
-        from eth_keys.backends import CoinCurveECCBackend
-        import coincurve  # noqa: F401 -- never fall back to Python scalar multiplication
-    except ImportError as exc:
-        raise SchemeError(
-            "the 'secp256k1-eip712' signing scheme needs eth-account and coincurve "
-            "(pip install 'xenia[eip712]'). It is optional "
-            "on purpose: xenia binds to a reviewed implementation.",
-            code="unavailable") from exc
-
-    primary = ctx.config.get("primary_type")
-    domain = ctx.config.get("domain")
-    types = ctx.config.get("types")
-    if not isinstance(primary, str) or not primary:
-        raise SchemeError("an eip712 profile needs a non-empty 'primary_type'")
-    if not isinstance(domain, dict) or not isinstance(types, dict):
-        raise SchemeError("an eip712 profile needs 'domain' and 'types' objects")
-    try:
-        message = json.loads(ctx.body)
-    except (TypeError, ValueError) as exc:
-        raise SchemeError("an eip712 message must be a JSON object") from exc
-    if not isinstance(message, dict):
-        raise SchemeError("an eip712 message must be a JSON object")
-    from . import policy
-    try:
-        policy.check(ctx.config.get("payload_policy") or {}, "SIGN", "/",
-                     {"Content-Type": "application/json"}, ctx.body)
-    except (policy.Denied, policy.Unparsed) as exc:
-        raise SchemeError(f"typed-signing input refused: {exc}") from exc
-    bindings = ctx.config.get("message")
-    if bindings is not None:
-        if not isinstance(bindings, dict):
-            raise SchemeError("typed-signing message bindings must be an object")
-        message = {key: _binding(spec, message, ctx)
-                   for key, spec in bindings.items()}
-    full_message = {"types": types, "domain": domain,
-                    "primaryType": primary, "message": message}
-    try:
-        account = Account()
-        account.set_key_backend(CoinCurveECCBackend())
-        signed = account.sign_message(encode_typed_data(full_message=full_message),
-                                      private_key=ctx.secret)
-    except (TypeError, ValueError, KeyError) as exc:
-        # Parser errors can contain the value they were parsing, including a key.
-        raise SchemeError("invalid typed message, profile or signing key") from exc
-    return "0x" + signed.signature.hex()
-
-
-def _eip712_available() -> bool:
-    try:
-        import eth_account  # noqa: F401
-        import coincurve  # noqa: F401
-        import msgpack  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-eip712_scheme.available = _eip712_available  # type: ignore[attr-defined]
-eip712_scheme.needs = "eth-account, coincurve, msgpack"  # type: ignore[attr-defined]
-
-
-def _binding(spec: dict, payload: dict, ctx: Context, depth: int = 0) -> Any:
-    """A small declarative byte recipe, held in the profile, never caller code.
-
-    Input paths, literals, nonce, MessagePack, fixed-width integers and Keccak
-    cover typed messages that commit to structured actions. No evaluation,
-    imports, service knowledge or network calls come from configuration.
-    """
-    if depth > 8 or not isinstance(spec, dict) or len(spec) != 1:
-        raise SchemeError("invalid typed-signing message binding")
-    kind, value = next(iter(spec.items()))
-    try:
-        if kind == "literal":
-            return value
-        if kind == "field":
-            from .policy import _at
-            found = _at(payload, value)
-            if found is None:
-                raise SchemeError("typed-signing input field is absent")
-            return found
-        if kind == "nonce" and value is True:
-            return ctx.nonce
-        if kind == "hex":
-            return bytes.fromhex(value)
-        if kind == "msgpack":
-            import msgpack
-            return msgpack.packb(_binding(value, payload, ctx, depth + 1))
-        if kind == "uint64":
-            number = _binding(value, payload, ctx, depth + 1)
-            if type(number) is not int or not 0 <= number < 2**64:
-                raise SchemeError("typed-signing uint64 is out of range")
-            return number.to_bytes(8, "big")
-        if kind == "keccak" and isinstance(value, list) and 0 < len(value) <= 16:
-            from eth_utils import keccak
-            parts = [_binding(part, payload, ctx, depth + 1) for part in value]
-            if any(not isinstance(part, bytes) for part in parts):
-                raise SchemeError("typed-signing hash inputs must be bytes")
-            return keccak(b"".join(parts))
-    except ImportError as exc:
-        raise SchemeError("typed-signing dependency is unavailable", code="unavailable") from exc
-    except (ValueError, TypeError, OverflowError) as exc:
-        raise SchemeError("invalid typed-signing message binding") from exc
-    raise SchemeError("unknown typed-signing message binding")
-
-
-stark_scheme = _optional("crypto_cpp_py", "pip install crypto-cpp-py")
-
-
 SCHEMES: dict[str, Callable[[Context], str]] = {
     "hmac": hmac_scheme,
     "aws-sigv4": sigv4_scheme,
-    "secp256k1-eip712": eip712_scheme,
-    "stark": stark_scheme,
 }
+
+
+def schemes() -> set[str]:
+    return set(SCHEMES) | set(providers.configured())
 
 
 def available(name: str) -> bool:
     scheme = SCHEMES.get(name)
     if scheme is None:
-        return False
+        return providers.available(name)
     check = getattr(scheme, "available", None)
     return check() if check else True
 
 
 def sign(profile: dict[str, Any], ctx: Context) -> str:
     name = profile.get("scheme")
+    if not isinstance(name, str):
+        raise SchemeError("a signing profile needs a scheme name")
     scheme = SCHEMES.get(name or "")
-    if scheme is None:
+    ctx.config = profile
+    if scheme is not None:
+        return scheme(ctx)
+    if name not in providers.configured():
         raise SchemeError(
             f"no signing scheme called {name!r} — xenia has: "
-            f"{', '.join(sorted(SCHEMES))}")
-    ctx.config = profile
-    return scheme(ctx)
+            f"{', '.join(sorted(schemes()))}")
+    try:
+        signature, headers = providers.invoke(name, asdict(ctx))
+    except providers.ProviderError as exc:
+        raise SchemeError(str(exc), code=exc.code) from exc
+    ctx.headers.update(headers)
+    return signature

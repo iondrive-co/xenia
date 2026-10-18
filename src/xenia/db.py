@@ -9,7 +9,8 @@ from . import config
 _SCHEMA = Path(__file__).with_name("schema.sql")
 
 
-def connect(path: Path | str | None = None, *, read_only: bool = False) -> sqlite3.Connection:
+def connect(path: Path | str | None = None, *, read_only: bool = False,
+            migrated: bool = False) -> sqlite3.Connection:
     target = Path(path) if path is not None else config.db_path()
     if not read_only:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -19,9 +20,11 @@ def connect(path: Path | str | None = None, *, read_only: bool = False) -> sqlit
     conn.execute(f"PRAGMA busy_timeout = {config.BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
     if not read_only:
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not migrated:
+            conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
-        migrate(conn)
+        if not migrated:
+            migrate(conn)
     return conn
 
 
@@ -36,6 +39,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     # So this runs first and always. It is one PRAGMA per table, not per
     # column, and it only ALTERs what is actually absent.
     _add_columns(conn)
+    _add_triggers(conn)
 
     current = schema_version(conn)
     if current == config.SCHEMA_VERSION:
@@ -45,6 +49,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     _add_columns(conn)
     conn.executescript(_SCHEMA.read_text())
     _add_columns(conn)
+    _add_triggers(conn)
     _drop_removed(conn)
     _set_chain_mode(conn)
     _agree_on_the_agent(conn)
@@ -282,6 +287,18 @@ _ADDED_COLUMNS = (
     ("goal", "approval_wait_ms", "INTEGER"),
     ("goal", "question_wait_ms", "INTEGER"),
     ("goal", "next_prompt_wait_ms", "INTEGER"),
+    ("secret", "revision", "INTEGER"),
+    ("secret_grant", "hold", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+_REVISION = ("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'secret_revision'; "
+             "UPDATE secret SET revision = (SELECT CAST(value AS INTEGER) FROM meta "
+             "WHERE key = 'secret_revision') WHERE name = new.name;")
+
+_ADDED_TRIGGERS = (
+    ("secret_added", f"AFTER INSERT ON secret BEGIN {_REVISION} END"),
+    ("secret_revised", "AFTER UPDATE OF name, backend, hosts, methods, paths, schemes, body_policy, "
+                       f"service, scope ON secret BEGIN {_REVISION} END"),
 )
 
 _DROPPED_TABLES = ("finding", "finding_dismissal", "finding_mute",
@@ -308,6 +325,24 @@ def _add_columns(conn: sqlite3.Connection) -> None:
         for column, kind in columns:
             if column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+
+
+def _add_triggers(conn: sqlite3.Connection) -> None:
+    names = [name for name, _body in _ADDED_TRIGGERS]
+    present = conn.execute(
+        f"SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ({', '.join('?' * len(names))})",
+        names).fetchone()[0]
+    if present == len(names):
+        return
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('meta', 'secret')")}
+    if tables != {"meta", "secret"}:
+        return
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) "
+                 "VALUES ('secret_revision', (SELECT coalesce(max(rowid), 0) FROM secret))")
+    conn.execute("UPDATE secret SET revision = rowid WHERE revision IS NULL")
+    for name, body in _ADDED_TRIGGERS:
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} {body}")
 
 
 def _drop_removed(conn: sqlite3.Connection) -> None:

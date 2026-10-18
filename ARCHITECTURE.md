@@ -37,8 +37,9 @@ Values live in the operating system's store; xenia holds the name, the policy an
 | Module | What is in it |
 | --- | --- |
 | `vault.py` | the OS stores — Secret Service over `dbus.py`, Keychain over `security` — behind `get`/`set`/`delete` |
-| `broker.py` | policy, grants, the request itself, the socket contract and the scrubbing |
+| `broker.py` | policy, grants, held values and cached profiles ([SIGNING](SIGNING.md#holding-a-value)), the request itself, the socket contract and the scrubbing |
 | `signing.py` | how a credential authenticates a request without appearing in it — `Context`, `SCHEMES`, `SchemeError` |
+| `providers.py` | configured external signing commands, one-shot or resident, their pins and their bounded JSON protocols — [contract](SIGNING.md) |
 | `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
 | `secrets.py` | first-use setup for the store, and adding, renaming, removing and approving credentials — `add`, `rename`, `remove`, shared by the command and the page |
 

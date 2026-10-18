@@ -743,10 +743,6 @@ def _secret(conn, broker, argv: list[str]) -> int:
             return 2
         name, profile = rest[0], rest[1]
         settings: dict[str, Any] = {}
-        # `key=value` carries a flat profile; a nested one (a typed-signing
-        # domain, its schema, its message bindings) has no flat spelling, and
-        # a value stringified here reaches the scheme as a string and is
-        # refused there. So the same stdin form as `secret body`.
         if len(rest) > 2:
             for item in rest[2:]:
                 if "=" not in item:
@@ -830,9 +826,21 @@ def _secret(conn, broker, argv: list[str]) -> int:
     if action == "schemes":
         from xenia import signing
         print(f"{'SCHEME':22} AVAILABLE")
-        for scheme in sorted(signing.SCHEMES):
-            state = "yes" if signing.available(scheme) else "no — optional"
+        for scheme in sorted(signing.schemes()):
+            state = "yes" if signing.available(scheme) else "no — unavailable"
             print(f"{scheme:22} {state}")
+        return 0
+
+    if action == "digest":
+        from xenia import providers
+        if not rest or any(not os.path.isabs(path) for path in rest):
+            print("xenia: xenia secret digest /absolute/path…", file=sys.stderr)
+            return 2
+        try:
+            print(providers.digest(rest))
+        except (OSError, providers.ProviderError) as exc:
+            print(f"xenia: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     if action == "test":
@@ -1018,21 +1026,22 @@ def _grant(conn, broker, argv: list[str]) -> int:
     reason = _flag_value(argv, "--reason") or ""
     profiles = [p.strip() for p in (_flag_value(argv, "--profiles") or "").split(",")
                 if p.strip()]
+    hold = "--hold" in argv
 
     if window and until:
         print("xenia: --for and --until say different things; give one",
               file=sys.stderr)
         return 2
-    if not until and (profiles or reason):
-        print("xenia: --profiles and --reason belong to a standing approval; "
-              "add --until DATE", file=sys.stderr)
+    if not until and (profiles or reason or hold):
+        print("xenia: --profiles, --reason and --hold belong to a standing "
+              "approval; add --until DATE", file=sys.stderr)
         return 2
 
     try:
         if until:
             row = broker.standing(conn, name, host, until=until_moment(until),
                                   profiles=profiles or None, reason=reason,
-                                  mutating=mutating)
+                                  mutating=mutating, hold=hold)
         else:
             seconds = duration(window) if window else None
             row = broker.grant(conn, name, host, mutating=mutating,
@@ -1049,6 +1058,10 @@ def _grant(conn, broker, argv: list[str]) -> int:
         print(f"  until    {row['expires_at'][:19]}Z  and not a moment past it")
         print(f"  covers   {', '.join(covers) if covers else 'every profile'}")
         print(f"  because  {row['reason']}")
+        if broker.holds(row):
+            print("  holds    the value in xenia's memory from its first use "
+                  "until this ends or is revoked: locking the credential "
+                  "store does not stop it")
         print(f"  No prompt will be raised for this while it lasts. End it "
               f"with `xenia revoke {shlex.quote(name)}`, or from the report's "
               f"Credentials tab.")
@@ -1075,6 +1088,7 @@ def _grants(conn, broker, everything: bool) -> int:
             covers = broker.grant_profiles(row)
             print(f"{'':{wide}} unattended, no prompt · covers "
                   f"{', '.join(covers) if covers else 'EVERY profile'} · "
+                  f"{'holds the value in memory · ' if broker.holds(row) else ''}"
                   f"{row['reason'] or 'no reason recorded'}")
     return 0
 
@@ -1102,8 +1116,7 @@ def _usage() -> int:
                                   string it signs are config, not something a
                                   caller may choose — a caller who picks what
                                   gets signed has a signing oracle. Give it as
-                                  JSON when the profile nests: a typed-signing
-                                  domain, schema and message bindings have no
+                                  JSON when the profile nests, which has no
                                   `key=value` spelling
   xenia secret body NAME [--show] < policy.json
                                   the actions this credential may take, over
@@ -1112,6 +1125,8 @@ def _usage() -> int:
                                   cannot separate a harmless call from a
                                   damaging one
   xenia secret schemes            which signing schemes work on this machine
+  xenia secret digest PATH…       the sha256 a signing provider's `files`
+                                  pin is checked against
   xenia secret new                add and scope one, interactively — the same
                                   thing the tray's Credentials → Add… opens
   xenia secret list               what is registered, and what is approved.
@@ -1148,6 +1163,11 @@ def _usage() -> int:
                                   for one job is not a signing oracle for the
                                   rest. A bare date means the end of that day,
                                   UTC. Revocable at any moment.
+                                  --hold keeps the value in xenia's memory
+                                  while the approval lasts instead of reading
+                                  the store on every use, for work where that
+                                  read's delay matters. Locking the store then
+                                  no longer stops it; revoking still does.
                                   The report's Credentials tab does this with
                                   a mouse: Approve… on the credential's row.
   xenia grants [--all]            what is approved right now, session and

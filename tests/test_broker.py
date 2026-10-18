@@ -768,17 +768,6 @@ def test_a_credential_with_no_profile_cannot_sign(wired):
     assert "no signing profile" in answer["refused"]
 
 
-def test_an_unavailable_scheme_refuses_by_name(wired):
-    if broker.signing.available("secp256k1-eip712"):
-        pytest.skip("the optional curve dependency is installed here")
-    profile(wired, "gitlab-pat", scheme="secp256k1-eip712")
-    allow(wired)
-    answer = call(wired, headers={"SIGN": "{{sign}}"})
-
-    assert answer["code"] == "unavailable"
-    assert "pip install" in answer["refused"]
-
-
 def test_several_credentials_in_one_call_are_each_checked(conn):
     """Some APIs want a key, a secret and a passphrase in one request.
 

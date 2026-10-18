@@ -16,24 +16,14 @@ STDLIB = {
     "argparse", "ast", "base64", "contextlib", "ctypes", "dataclasses",
     "datetime", "decimal", "fnmatch", "getpass", "hashlib", "hmac", "http", "io",
     "ipaddress", "json", "os", "pathlib", "platform",
-    "plistlib", "posixpath", "re", "secrets", "shlex", "shutil", "signal",
-    "socket", "ssl",
+    "plistlib", "posixpath", "re", "secrets", "selectors", "shlex", "shutil", "signal",
+    "socket", "ssl", "stat",
     "sqlite3", "struct", "subprocess", "sys", "threading", "time", "typing",
     "urllib", "webbrowser", "zlib",
 }
 
 
 def imported_modules(path: pathlib.Path) -> set[str]:
-    """What importing this module PULLS IN, which is not every name it mentions.
-
-    An import inside a function body runs when that function is called, so it
-    cannot fail a fresh machine at import time — and a scheme that binds to a
-    reviewed cryptographic library has to reach for one somewhere. What must
-    stay clean is module scope: that is what `import xenia` executes, and an
-    absent library there is a xenia that will not start rather than a feature
-    that reports itself unavailable. So this descends into `if` and `try` at
-    module level, and stops at the first `def`.
-    """
     found = set()
 
     def visit(node):
