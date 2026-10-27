@@ -289,6 +289,9 @@ _ADDED_COLUMNS = (
     ("goal", "next_prompt_wait_ms", "INTEGER"),
     ("secret", "revision", "INTEGER"),
     ("secret_grant", "hold", "INTEGER NOT NULL DEFAULT 0"),
+    ("secret", "quota_bytes", "INTEGER"),
+    ("secret", "quota_requests", "INTEGER"),
+    ("secret", "quota_window_s", "INTEGER"),
 )
 
 _REVISION = ("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'secret_revision'; "

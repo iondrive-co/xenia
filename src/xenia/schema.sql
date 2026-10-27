@@ -201,7 +201,10 @@ CREATE TABLE IF NOT EXISTS secret (
     scope             TEXT,
     scope_verified_at TEXT,
     expires_hint      TEXT,
-    revision          INTEGER
+    revision          INTEGER,
+    quota_bytes       INTEGER,
+    quota_requests    INTEGER,
+    quota_window_s    INTEGER
 );
 
 -- One approval, by a human, for one credential against one host. Two clocks:

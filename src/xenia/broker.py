@@ -62,6 +62,9 @@ CODES = {
                             "Whether the far side acted on it is NOT known "
                             "from here, so it must not simply be repeated",
     "malformed": "the request could not be understood",
+    "quota": "the credential's byte or request quota for its window is "
+             "spent. A refusal sent nothing; a download cut by it is an "
+             "error, and the bytes that did arrive are not the object",
 }
 
 METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
@@ -1153,7 +1156,7 @@ def _origin(url: str) -> tuple[str, str, int | None]:
 def _send(target: str, method: str, headers: dict, data: bytes | None,
           timeout: float, opener=None, pinned: str = "",
           sink: Path | None = None, watch=None,
-          deadline: float | None = None) -> dict:
+          deadline: float | None = None, meter=None) -> dict:
     request = urllib.request.Request(target, data=data, method=method)
     for key, value in headers.items():
         request.add_header(key, value)
@@ -1161,6 +1164,9 @@ def _send(target: str, method: str, headers: dict, data: bytes | None,
     opener = opener or _opener(pinned)
     try:
         response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        response = exc
+    try:
         # ONLY a success is streamed. A redirect's body is routing, not
         # content, and has to stay in `raw` for the hop loop to read; an error
         # body is the reason the call failed, and a caller handed a file path
@@ -1169,19 +1175,15 @@ def _send(target: str, method: str, headers: dict, data: bytes | None,
             return {"status": response.status, "reason": response.reason or "",
                     "headers": dict(response.headers.items()), "raw": b"",
                     "streamed": _drain_to_file(response, sink, watch,
-                                               deadline, timeout)}
-        raw = response.read(config.FETCH_MAX_BYTES + 1)
+                                               deadline, timeout, meter)}
+        raw, cut = _read_response(response, config.FETCH_MAX_BYTES + 1, meter)
         return {"status": response.status, "reason": response.reason or "",
-                "headers": dict(response.headers.items()), "raw": raw}
-    except urllib.error.HTTPError as exc:
-        # An HTTPError *is* the response — status, headers and body — and for
-        # a brokered call it is usually the interesting one. It is never
-        # streamed, whatever the caller asked for: an error body is small and
-        # is text, and a caller handed a file path instead of the reason is
-        # left guessing why its download failed.
-        raw = exc.read(config.FETCH_MAX_BYTES + 1)
-        return {"status": exc.code, "reason": exc.reason or "",
-                "headers": dict(exc.headers.items()), "raw": raw}
+                "headers": dict(response.headers.items()), "raw": raw,
+                "cut": cut}
+    finally:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
 
 
 def _authorise(conn, names: list[str], url: str, method: str, *,
@@ -1388,8 +1390,49 @@ def _past(deadline: float | None, timeout: float, done: int) -> None:
             f"ran out ({done:,} bytes read)")
 
 
+def _response_complete(response, done: int) -> bool:
+    remaining = getattr(response, "length", None)
+    if remaining is not None:
+        return remaining == 0
+    isclosed = getattr(response, "isclosed", None)
+    if callable(isclosed) and isclosed():
+        return True
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    if getattr(response, "chunked", False) or "transfer-encoding" in headers:
+        return False
+    try:
+        length = int(headers["content-length"])
+        return length >= 0 and done >= length
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _read_response(response, size: int, meter=None, done: int = 0):
+    if _response_complete(response, done):
+        return b"", None
+    granted = meter.take(size) if meter is not None else size
+    if not granted:
+        return b"", "quota"
+    try:
+        chunk = response.read(granted)
+    except BaseException as exc:
+        if meter is not None:
+            partial = getattr(exc, "partial", None)
+            if partial is None:
+                meter.uncertain = True
+            else:
+                meter.refund(max(0, granted - len(partial)))
+        raise
+    if meter is not None:
+        meter.refund(granted - len(chunk))
+    cut = ("quota" if granted < size and len(chunk) == granted
+           and not _response_complete(response, done + len(chunk)) else None)
+    return chunk, cut
+
+
 def _drain_to_file(response, target: Path, watch,
-                   deadline: float | None = None, timeout: float = 0.0) -> dict:
+                   deadline: float | None = None, timeout: float = 0.0,
+                   meter=None) -> dict:
     """Stream a response body to disk without decoding it, and without holding it.
 
     THE DECODE IS THE BUG THIS EXISTS TO AVOID. The text path does
@@ -1403,7 +1446,7 @@ def _drain_to_file(response, target: Path, watch,
     """
     digest = hashlib.sha256()
     written = 0
-    truncated = False
+    cut = None
     tail = b""
     ceiling = config.FETCH_MAX_BINARY_BYTES
     try:
@@ -1414,12 +1457,15 @@ def _drain_to_file(response, target: Path, watch,
                 pass
             while True:
                 _past(deadline, timeout, written)
-                chunk = response.read(BINARY_CHUNK)
+                chunk, cut = _read_response(
+                    response, min(BINARY_CHUNK, ceiling - written + 1),
+                    meter, written)
                 if not chunk:
                     break
-                if written + len(chunk) > ceiling:
-                    chunk = chunk[:max(0, ceiling - written)]
-                    truncated = True
+                keep = min(len(chunk), max(0, ceiling - written))
+                if keep < len(chunk):
+                    cut = "ceiling"
+                chunk = chunk[:keep]
                 if chunk:
                     if watch is not None:
                         watch(tail + chunk)
@@ -1427,7 +1473,7 @@ def _drain_to_file(response, target: Path, watch,
                     handle.write(chunk)
                     digest.update(chunk)
                     written += len(chunk)
-                if truncated:
+                if cut:
                     break
     except BaseException:
         try:
@@ -1441,12 +1487,181 @@ def _drain_to_file(response, target: Path, watch,
         except Exception:
             pass
     return {"path": str(target), "bytes": written,
-            "sha256": digest.hexdigest(), "truncated": truncated}
+            "sha256": digest.hexdigest(), "truncated": cut is not None,
+            "cut": cut}
 
 
 MAX_DOWNLOADS = int(os.environ.get("XENIA_BROKER_MAX_DOWNLOADS", 4))
 
 _downloads = threading.BoundedSemaphore(max(1, MAX_DOWNLOADS))
+
+
+def set_quota(conn, name: str, *, max_bytes: int | None = None,
+              max_requests: int | None = None,
+              per_s: int | None = None) -> None:
+    if entry(conn, name) is None:
+        raise ValueError(f"no credential named '{name}'")
+    bounded = max_bytes is not None or max_requests is not None
+    if bounded and not per_s:
+        raise ValueError("a quota needs a window: how long its count runs")
+    for value in (max_bytes, max_requests, per_s):
+        if value is not None and value <= 0:
+            raise ValueError("a quota's bytes, requests and window are positive")
+    conn.execute("UPDATE secret SET quota_bytes = ?, quota_requests = ?, "
+                 "quota_window_s = ? WHERE name = ?",
+                 (max_bytes, max_requests, per_s if bounded else None, name))
+    conn.commit()
+
+
+def _ledger_use(conn, name: str, window_s: int) -> tuple[int, int]:
+    since = stamp(utcnow() - timedelta(seconds=window_s))
+    used_bytes, used_requests = conn.execute(
+        "SELECT coalesce(sum(bytes), 0), count(*) FROM secret_use "
+        "WHERE name = ? AND decision = 'allowed' AND method <> 'SIGN' AND at >= ?",
+        (name, since)).fetchone()
+    return int(used_bytes), int(used_requests)
+
+
+def quota_left(conn, name: str) -> dict | None:
+    row = entry(conn, name)
+    if row is None or not row["quota_window_s"]:
+        return None
+    with _metered_lock:
+        used_bytes, used_requests = _quota_use(conn, name, row["quota_window_s"])
+    return {
+        "window_s": row["quota_window_s"],
+        "max_bytes": row["quota_bytes"],
+        "max_requests": row["quota_requests"],
+        "used_bytes": used_bytes,
+        "used_requests": used_requests,
+        "bytes": (None if row["quota_bytes"] is None
+                  else row["quota_bytes"] - used_bytes),
+        "requests": (None if row["quota_requests"] is None
+                     else row["quota_requests"] - used_requests),
+    }
+
+
+class _Reservation:
+    def __init__(self) -> None:
+        self.bytes = 0
+        self.at: str | None = None
+
+
+_metered: dict[tuple[str, str], list[_Reservation]] = {}
+_pending_uses: dict[int, tuple[tuple, tuple[str, str], _Reservation]] = {}
+_metered_lock = threading.Lock()
+
+
+def _quota_use(conn, name: str, window_s: int) -> tuple[int, int]:
+    used_bytes, used_requests = _ledger_use(conn, name, window_s)
+    since = stamp(utcnow() - timedelta(seconds=window_s))
+    for reservation in _metered.get((_database_of(conn), name), ()):
+        if reservation.at is None or reservation.at >= since:
+            used_bytes += reservation.bytes
+            used_requests += 1
+    return used_bytes, used_requests
+
+
+def _forget_reservation(key, reservation) -> None:
+    reservations = _metered.get(key, [])
+    if reservation in reservations:
+        reservations.remove(reservation)
+    if not reservations:
+        _metered.pop(key, None)
+
+
+class _Meter:
+    def __init__(self) -> None:
+        self.conn = None
+        self.rows = {}
+        self.active = {}
+        self.bytes = 0
+        self.sent = False
+        self.uncertain = False
+
+    def open(self, conn, names: str | list[str]) -> None:
+        names = [names] if isinstance(names, str) else names
+        rows = {name: entry(conn, name) for name in names}
+        with _metered_lock:
+            if sum(map(len, _metered.values())) + len(names) > DEFERRED_LIMIT:
+                raise Refusal(
+                    "too many credential uses are waiting to be recorded "
+                    "to account for another request. Nothing was sent.",
+                    code="unavailable")
+            for name, row in rows.items():
+                if row is None or not row["quota_window_s"]:
+                    continue
+                spent_bytes, spent_requests = _quota_use(
+                    conn, name, row["quota_window_s"])
+                for unit, spent, maximum in (
+                        ("requests", spent_requests, row["quota_requests"]),
+                        ("bytes", spent_bytes, row["quota_bytes"])):
+                    if maximum is not None and spent >= maximum:
+                        raise Refusal(
+                            f"'{name}' has used its {maximum:,} {unit} for "
+                            f"the last {_window_words(row['quota_window_s'])}. "
+                            f"Nothing was sent. The quota rolls as old calls "
+                            f"leave the window; `xenia secret quota "
+                            f"{shlex.quote(name)}` shows it.", code="quota")
+            for name in names:
+                reservation = _Reservation()
+                _metered.setdefault((_database_of(conn), name), []).append(
+                    reservation)
+                self.active[name] = reservation
+        self.conn = conn
+        self.rows = rows
+        self.bytes = 0
+        self.sent = False
+        self.uncertain = False
+
+    def take(self, size: int) -> int:
+        with _metered_lock:
+            granted = size
+            for name, row in self.rows.items():
+                if row is not None and row["quota_bytes"] is not None:
+                    used, _requests = _quota_use(
+                        self.conn, name, row["quota_window_s"])
+                    granted = max(0, min(granted, row["quota_bytes"] - used))
+            for reservation in self.active.values():
+                reservation.bytes += granted
+            self.bytes += granted
+        return granted
+
+    def refund(self, size: int) -> None:
+        with _metered_lock:
+            for reservation in self.active.values():
+                reservation.bytes -= size
+            self.bytes -= size
+
+    def record(self, conn, *, grants, writes=(), **row) -> str | None:
+        uses = list(writes)
+        with _metered_lock:
+            for name, reservation in self.active.items():
+                use = _use(**{**row, "name": name, "size": self.bytes,
+                              "grant_id": grants[name]["id"]})
+                reservation.at = use[1][0]
+                _pending_uses[id(use[1])] = (
+                    use[1], (_database_of(conn), name), reservation)
+                uses.append(use)
+            self.active = {}
+        return _bookkeep(conn, uses, row["name"])
+
+    def close(self) -> None:
+        with _metered_lock:
+            for name, reservation in self.active.items():
+                if self.sent:
+                    reservation.at = stamp(utcnow())
+                else:
+                    _forget_reservation((_database_of(self.conn), name),
+                                        reservation)
+            self.active = {}
+
+
+def _window_words(seconds: int) -> str:
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
 
 
 def fetch(conn, request: dict, *, store=None, opener=None,
@@ -1459,8 +1674,19 @@ def fetch(conn, request: dict, *, store=None, opener=None,
 
 def _admitted(conn, request: dict, *, store=None, opener=None,
               notify: bool = True) -> dict:
+    meter = _Meter()
+    try:
+        return _admitted_metered(conn, request, store=store, opener=opener,
+                                 notify=notify, meter=meter)
+    finally:
+        meter.close()
+
+
+def _admitted_metered(conn, request: dict, *, store, opener, notify,
+                      meter: _Meter) -> dict:
     if not request.get("binary") or not request.get("capture"):
-        return _fetch(conn, request, store=store, opener=opener, notify=notify)
+        return _fetch(conn, request, store=store, opener=opener, notify=notify,
+                      meter=meter)
     if not _downloads.acquire(blocking=False):
         name = str(request.get("secret") or "").strip()
         url = str(request.get("url") or "").strip()
@@ -1476,14 +1702,16 @@ def _admitted(conn, request: dict, *, store=None, opener=None,
         return {"refused": reason, "code": "unavailable", "secret": name,
                 "url": url}
     try:
-        return _fetch(conn, request, store=store, opener=opener, notify=notify)
+        return _fetch(conn, request, store=store, opener=opener, notify=notify,
+                      meter=meter)
     finally:
         _downloads.release()
 
 
 def _fetch(conn, request: dict, *, store=None, opener=None,
-           notify: bool = True) -> dict:
+           notify: bool = True, meter: _Meter | None = None) -> dict:
     started = time.monotonic()
+    meter = meter or _Meter()
     name = str(request.get("secret") or "").strip()
     url = str(request.get("url") or "").strip()
     method = str(request.get("method") or "GET").upper()
@@ -1589,6 +1817,9 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
                 f"wants a signature instead of the credential itself.",
                 code="malformed")
 
+        with _stage("bookkeep"):
+            meter.open(conn, names)
+
     except Refusal as refusal:
         return refuse(refusal)
     except vault.VaultError as exc:
@@ -1627,16 +1858,29 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
             echoed_binary = True
 
     deadline = time.monotonic() + timeout
+
+    def record(answer=None, *, reason=None, code=None, writes=(),
+               echoed=False, captured=None):
+        return meter.record(
+            conn, grants=grants, writes=writes, name=name, client=client,
+            host=host, method=method, url=url, placed=",".join(placed),
+            decision="allowed", reason=reason, code=code,
+            status=answer["status"] if answer is not None else None,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            echoed=echoed, **(captured or {}))
+
     try:
         sent = True
+        meter.sent = True
         with _stage("upstream"):
             answer = _send(target, method, sent_headers, data, timeout,
                            opener, pinned, sink=sink, watch=watch,
-                           deadline=deadline)
+                           deadline=deadline, meter=meter)
         for _hop in range(config.FETCH_MAX_REDIRECTS):
             location = answer["headers"].get("Location") or \
                 answer["headers"].get("location")
-            if not (300 <= answer["status"] < 400 and location):
+            if answer.get("cut") or not (
+                    300 <= answer["status"] < 400 and location):
                 break
             following = urljoin(target, location)
             redirects.append(scrubber.text(following) or "")
@@ -1655,27 +1899,35 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
                     f"is not carried across origins")
                 break
             try:
-                _host, following, pinned = permit(rows[name], following,
-                                                  method)
+                for extra in names:
+                    _host, following, pinned = permit(rows[extra], following,
+                                                      method)
+            except Refusal as refused:
+                warnings.append(f"stopped at a redirect: {refused}")
+                break
+            unrecorded = record(answer)
+            if unrecorded:
+                warnings.append(f"call not recorded: {unrecorded}")
+            try:
+                meter.open(conn, names)
             except Refusal as refused:
                 warnings.append(f"stopped at a redirect: {refused}")
                 break
             target = following
+            meter.sent = True
             with _stage("upstream"):
                 answer = _send(target, method, sent_headers, data, timeout,
                                opener, pinned, sink=sink, watch=watch,
-                               deadline=deadline)
+                               deadline=deadline, meter=meter)
     except Exception as exc:
         detail = scrubber.text(f"{type(exc).__name__}: {exc}")
+        if meter.uncertain:
+            detail += ("; the failed read did not report its byte count, so "
+                       "its reserved allowance remains charged to HTTP quotas")
         # After the bytes went out a timeout is not a failure but an unknown:
         # the far side may have acted. Saying 'timeout' would invite a retry.
         code = "sent-outcome-unknown" if sent else "timeout"
-        unrecorded = _record(conn, name=name, client=client, host=host, method=method,
-                url=url, placed=",".join(placed), decision="allowed",
-                reason=detail, code=code, grant_id=approval["id"], status=None,
-                size=None,
-                duration_ms=int((time.monotonic() - started) * 1000),
-                echoed=False)
+        unrecorded = record(reason=detail, code=code)
         if unrecorded:
             warnings.append(f"call not recorded: {unrecorded}")
         return {"error": detail, "code": code, "secret": name, "url": url,
@@ -1683,6 +1935,25 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
 
     raw: bytes = answer["raw"]
     streamed = answer.get("streamed")
+    if (answer.get("cut") == "quota"
+            or streamed and streamed.get("cut") == "quota"):
+        if streamed:
+            try:
+                Path(streamed["path"]).unlink()
+            except OSError:
+                pass
+        detail = (f"A credential used by this call reached its byte quota "
+                  f"after {meter.bytes:,} bytes in this response. Xenia "
+                  f"stopped reading before it could establish a complete "
+                  f"response; any partial file was removed. Received bytes "
+                  f"count against "
+                  f"each credential's HTTP quota.")
+        unrecorded = record(answer, reason=detail, code="quota",
+                            echoed=echoed_binary)
+        if unrecorded:
+            warnings.append(f"call not recorded: {unrecorded}")
+        return {"error": detail, "code": "quota", "secret": name, "url": url,
+                "warnings": warnings, "signed": signed}
     if streamed:
         # Nothing was decoded and nothing is held: the body is already on disk.
         truncated_bytes = streamed["truncated"]
@@ -1747,20 +2018,14 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
         body_text += "…[response longer than xenia will read]"
 
     duration = int((time.monotonic() - started) * 1000)
-    unrecorded = _bookkeep(conn, [
+    unrecorded = record(answer, writes=[
         _extend(approval, mutating),
         ("UPDATE secret SET last_used_at = max(coalesce(last_used_at, ''), ?) "
          "WHERE name = ?", (stamp(utcnow()), name)),
-        _use(name=name, client=client, host=host, method=method, url=url,
-             placed=",".join(placed),
-             decision="allowed", reason=(f"action: {permitted[0]}"
-                                         if permitted else None),
-             code=None, grant_id=approval["id"], status=answer["status"],
-             size=size, duration_ms=duration, echoed=echoed, **{
-                 key: captured.get(key) for key in
-                 ("request_path", "response_path", "request_sha256",
-                  "response_sha256")}),
-    ], name)
+    ], reason=f"action: {permitted[0]}" if permitted else None,
+        echoed=echoed, captured={key: captured.get(key) for key in
+                                ("request_path", "response_path",
+                                 "request_sha256", "response_sha256")})
     if unrecorded:
         warnings.append(f"call not recorded: {unrecorded}")
 
@@ -2040,7 +2305,12 @@ def _write_down(conn, writes: list[tuple[str, tuple]], name: str | None) -> str 
     try:
         for sql, params, _tries, _owner in waiting + fresh:
             conn.execute(sql, params)
-        conn.commit()
+        with _metered_lock:
+            conn.commit()
+            for _sql, params, _tries, _owner in waiting + fresh:
+                pending = _pending_uses.pop(id(params), None)
+                if pending is not None:
+                    _forget_reservation(pending[1], pending[2])
         return None
     except Exception as exc:
         _rollback(conn)
@@ -2715,7 +2985,10 @@ def request(payload: dict, *, path: str | None = None,
             f"the user needs to start it — `xenia` — before this tool can do "
             f"anything.") from exc
     try:
-        client.sendall(json.dumps(payload).encode() + b"\n")
+        try:
+            client.sendall(json.dumps(payload).encode() + b"\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         reply = _read_line(client)
     finally:
         client.close()

@@ -34,6 +34,8 @@
 
 Values live in the operating system's store; xenia holds the name, the policy and the record.
 
+HTTP quotas count received body bytes and each outgoing request, including redirects, against every credential used. The broker reserves capacity before sending or reading and keeps completed usage reserved until its ledger write commits. A failed read that reports no byte count keeps its allowance charged, with that uncertainty recorded. Signing-only calls are outside these quotas. A response that exhausts its byte allowance succeeds only when its completion can be established without reading beyond the allowance.
+
 | Module | What is in it |
 | --- | --- |
 | `vault.py` | the OS stores — Secret Service over `dbus.py`, Keychain over `security` — behind `get`/`set`/`delete` |

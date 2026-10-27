@@ -39,6 +39,9 @@ class Reply:
     def read(self, size=None):
         return self._body[:size] if size else self._body
 
+    def close(self):
+        pass
+
 
 class _Headers:
     def __init__(self, mapping):
@@ -77,6 +80,8 @@ def _dns(monkeypatch):
     # otherwise silence the next test's question.
     broker._asked.clear()
     broker._deferred.clear()
+    broker._metered.clear()
+    broker._pending_uses.clear()
 
 
 @pytest.fixture
@@ -2482,3 +2487,496 @@ def test_a_signing_only_refusal_is_scrubbed(conn, monkeypatch):
     reason = conn.execute(
         "SELECT reason FROM secret_use ORDER BY rowid DESC").fetchone()["reason"]
     assert VALUE not in reason
+
+
+def test_a_request_quota_refuses_before_anything_is_sent(wired):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_requests=2, per_s=3600)
+    opener = Opener()
+
+    assert call(wired, opener=opener)["status"] == 200
+    assert call(wired, opener=opener)["status"] == 200
+    refused = call(wired, opener=opener)
+
+    assert refused["code"] == "quota"
+    assert "2 requests" in refused["refused"]
+    assert len(opener.sent) == 2, "a refused call must not reach the far side"
+
+
+def test_a_download_is_cut_at_the_byte_quota_and_fails(wired, monkeypatch,
+                                                       tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=100, per_s=3600)
+
+    answer = call(wired, opener=Opener(Stream(200, LZ4ISH)),
+                  capture="metered", binary=True)
+
+    assert answer["code"] == "quota"
+    assert "error" in answer and "status" not in answer
+    assert not [f for f in (tmp_path / "captures").rglob("*") if f.is_file()]
+    row = wired.execute("SELECT bytes, code FROM secret_use "
+                        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert (row["bytes"], row["code"]) == (100, "quota"), \
+        "the bytes that arrived were paid for and must count"
+
+    opener = Opener(Stream(200, LZ4ISH))
+    again = call(wired, opener=opener, capture="metered", binary=True)
+    assert again["code"] == "quota" and "refused" in again
+    assert opener.sent == []
+
+
+def test_a_download_inside_the_quota_is_untouched(wired, monkeypatch,
+                                                  tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=len(LZ4ISH), per_s=3600)
+
+    answer = call(wired, opener=Opener(Stream(200, LZ4ISH, headers={
+        "Content-Length": str(len(LZ4ISH))})),
+                  capture="whole", binary=True)
+
+    assert Path(answer["response_path"]).read_bytes() == LZ4ISH
+    assert broker.quota_left(wired, "gitlab-pat")["bytes"] == 0
+
+
+def test_a_download_that_dies_keeps_its_unmeasured_read_reservation(
+        wired, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=10 * len(LZ4ISH),
+                     per_s=3600)
+
+    class Dies(Stream):
+        def read(self, size=None):
+            if self._at:
+                raise ConnectionResetError("peer went away")
+            return super().read(size)
+
+    answer = call(wired, opener=Opener(Dies(200, LZ4ISH * 4)),
+                  capture="dies", binary=True)
+
+    assert answer["code"] == "sent-outcome-unknown"
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == \
+        len(LZ4ISH) * 10
+    assert "reserved allowance remains charged" in answer["error"]
+    assert call(wired)["code"] == "quota"
+
+
+def test_the_quota_rolls_with_its_window(wired, monkeypatch):
+    monkeypatch.setenv("XENIA_FAKE_NOW", "2026-07-27T09:00:00.000+00:00")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_requests=1, per_s=600)
+
+    assert call(wired)["status"] == 200
+    assert call(wired)["code"] == "quota"
+    monkeypatch.setenv("XENIA_FAKE_NOW", "2026-07-27T09:11:00.000+00:00")
+    assert call(wired)["status"] == 200
+
+
+def test_a_quota_binds_only_its_own_credential(conn):
+    for name in ("spent", "free"):
+        broker.register(conn, name, backend="memory", hosts=[HOST],
+                        methods=["GET"])
+        broker.grant(conn, name, HOST, source="test")
+    broker.set_quota(conn, "spent", max_requests=1, per_s=3600)
+    store = Store({"spent": VALUE, "free": VALUE[::-1]})
+
+    assert call(conn, store=store, secret="spent")["status"] == 200
+    assert call(conn, store=store, secret="spent")["code"] == "quota"
+    for _ in range(3):
+        assert call(conn, store=store, secret="free")["status"] == 200
+
+
+def test_downloads_in_flight_share_the_quota(wired):
+    broker.set_quota(wired, "gitlab-pat", max_bytes=100, per_s=3600)
+    first, second = broker._Meter(), broker._Meter()
+    first.open(wired, "gitlab-pat")
+    second.open(wired, "gitlab-pat")
+
+    assert first.take(70) == 70
+    assert second.take(70) == 30
+
+    wired.execute(*broker._use(
+        name="gitlab-pat", host=HOST, method="GET", url="u", placed="header",
+        decision="allowed", reason=None, grant_id=None, status=200, size=70,
+        duration_ms=1, echoed=False))
+    wired.commit()
+    first.close()
+    assert second.take(10) == 0
+    second.close()
+
+
+def test_a_request_quota_counts_calls_in_flight(wired):
+    broker.set_quota(wired, "gitlab-pat", max_requests=1, per_s=3600)
+    first = broker._Meter()
+    first.open(wired, "gitlab-pat")
+
+    with pytest.raises(broker.Refusal) as refused:
+        broker._Meter().open(wired, "gitlab-pat")
+    assert refused.value.code == "quota"
+    first.close()
+
+
+def test_a_quota_needs_a_window_and_clears_whole(wired):
+    with pytest.raises(ValueError):
+        broker.set_quota(wired, "gitlab-pat", max_bytes=100)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=100, per_s=60)
+    broker.set_quota(wired, "gitlab-pat")
+
+    assert broker.quota_left(wired, "gitlab-pat") is None
+
+
+@pytest.mark.parametrize("binary", [False, True])
+@pytest.mark.parametrize("status", [200, 302, 404])
+def test_every_response_path_reserves_bytes_before_reading(
+        wired, monkeypatch, tmp_path, binary, status):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+    response = Stream(status, b"x" * 512)
+
+    answer = call(wired, opener=Opener(response), capture="bounded",
+                  binary=binary)
+
+    assert answer["code"] == "quota" and "error" in answer
+    assert response._at == 64
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 64
+    assert not list((tmp_path / "captures").glob("*"))
+
+
+def test_an_http_error_uses_the_same_byte_budget(wired):
+    import io
+    import urllib.error
+
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+    body = io.BytesIO(b"x" * 512)
+
+    class ErrorOpener:
+        def open(self, request, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden",
+                                         {}, body)
+
+    answer = call(wired, opener=ErrorOpener())
+
+    assert answer["code"] == "quota"
+    assert body.closed
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 64
+
+
+def test_a_full_budget_needs_evidence_that_the_response_is_complete(
+        wired, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+    response = Stream(200, b"x" * 64)
+
+    answer = call(wired, opener=Opener(response), capture="unknown-end",
+                  binary=True)
+
+    assert answer["code"] == "quota"
+    assert response._at == 64
+    assert not list((tmp_path / "captures").glob("*"))
+
+
+def test_an_exact_text_response_with_a_length_is_complete(wired):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+
+    answer = call(wired, opener=Opener(Reply(
+        body=b"x" * 64, headers={"Content-Length": "64"})))
+
+    assert answer["status"] == 200 and answer["bytes"] == 64
+    assert broker.quota_left(wired, "gitlab-pat")["bytes"] == 0
+
+
+def test_unused_read_reservations_are_refunded(wired):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+
+    assert call(wired)["status"] == 200
+    assert call(wired)["status"] == 200
+
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 4
+
+
+def test_a_secondary_credential_cannot_escape_an_exhausted_quota(wired):
+    allow(wired)
+    broker.register(wired, "aux-key", backend="memory", hosts=[HOST])
+    broker.grant(wired, "aux-key", HOST, source="test")
+    broker.set_quota(wired, "aux-key", max_requests=4, per_s=3600)
+    broker.set_quota(wired, "gitlab-pat", max_requests=1, per_s=3600)
+    assert call(wired)["status"] == 200
+    opener = Opener()
+
+    answer = call(wired, secret="aux-key", opener=opener,
+                  headers={"X-Aux": "{{secret}}",
+                           "X-Key": "{{secret:gitlab-pat}}"},
+                  store=Store({"aux-key": "invented-key", "gitlab-pat": VALUE}))
+
+    assert answer["code"] == "quota" and opener.sent == []
+    assert broker.quota_left(wired, "aux-key")["used_requests"] == 0
+
+
+def test_each_credential_counts_the_same_received_bytes(wired):
+    allow(wired)
+    broker.register(wired, "aux-key", backend="memory", hosts=[HOST])
+    broker.grant(wired, "aux-key", HOST, source="test")
+    broker.set_quota(wired, "aux-key", max_bytes=64, per_s=3600)
+    response = Stream(200, b"x" * 512)
+
+    answer = call(wired, opener=Opener(response),
+                  headers={"X-Key": "{{secret}}",
+                           "X-Aux": "{{secret:aux-key}}"},
+                  store=Store({"aux-key": "invented-key", "gitlab-pat": VALUE}))
+
+    assert answer["code"] == "quota" and response._at == 64
+    uses = wired.execute("SELECT name, bytes FROM secret_use "
+                         "WHERE decision = 'allowed' ORDER BY name").fetchall()
+    assert [tuple(row) for row in uses] == [("aux-key", 64), ("gitlab-pat", 64)]
+
+
+@pytest.mark.parametrize("byte_quota", [False, True])
+def test_pending_writes_keep_their_quota_until_committed(
+        wired, writer, tmp_path, byte_quota):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", per_s=3600,
+                     **({"max_bytes": 64} if byte_quota else {"max_requests": 1}))
+    other = db.connect(tmp_path / "audit.db")
+    other.execute("BEGIN IMMEDIATE")
+    opener = Opener(Reply(body=b"x" * 64, headers={"Content-Length": "64"}))
+    try:
+        assert call(wired, opener=opener)["status"] == 200
+        refused = call(wired, opener=opener)
+        left = broker.quota_left(wired, "gitlab-pat")
+        assert left["used_bytes"] == 64 and left["used_requests"] == 1
+    finally:
+        other.rollback()
+        other.close()
+
+    assert refused["code"] == "quota" and len(opener.sent) == 1
+    assert writer.flush()
+    left = broker.quota_left(wired, "gitlab-pat")
+    assert left["used_bytes"] == 64 and left["used_requests"] == 1
+
+
+def test_a_failed_write_keeps_its_quota_through_a_later_retry(
+        wired, writer, tmp_path, monkeypatch):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_requests=1, per_s=3600)
+    monkeypatch.setattr(config, "BUSY_TIMEOUT_MS", 1)
+    other = db.connect(tmp_path / "audit.db")
+    other.execute("BEGIN IMMEDIATE")
+    try:
+        assert call(wired)["status"] == 200
+        assert writer.flush()
+        assert call(wired)["code"] == "quota"
+    finally:
+        other.rollback()
+        other.close()
+    assert writer.flush()
+    assert broker.quota_left(wired, "gitlab-pat")["used_requests"] == 1
+    assert wired.execute("SELECT count(*) FROM secret_use "
+                         "WHERE decision = 'allowed'").fetchone()[0] == 1
+
+
+def test_a_call_in_flight_blocks_a_second_request(wired):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_requests=1, per_s=3600)
+    replies = []
+
+    class Overlapping(Opener):
+        def open(self, request, timeout=None):
+            replies.append(call(wired))
+            return super().open(request, timeout)
+
+    assert call(wired, opener=Overlapping())["status"] == 200
+    assert replies[0]["code"] == "quota"
+    assert broker.quota_left(wired, "gitlab-pat")["used_requests"] == 1
+
+
+def test_redirects_consume_request_and_byte_quota(wired):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64,
+                     max_requests=2, per_s=3600)
+    opener = Opener(Reply(302, b"route", {"Location": "/target"}),
+                    Reply(200, b"complete"))
+
+    assert call(wired, opener=opener)["status"] == 200
+
+    left = broker.quota_left(wired, "gitlab-pat")
+    assert left["used_requests"] == 2 and left["used_bytes"] == 13
+    assert call(wired)["code"] == "quota"
+
+
+def test_an_exhausted_request_quota_stops_before_a_redirect(wired):
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_requests=1, per_s=3600)
+    opener = Opener(Reply(302, headers={"Location": "/target"}), Reply())
+
+    answer = call(wired, opener=opener)
+
+    assert len(opener.sent) == 1
+    assert answer["status"] == 302
+    assert "quota" in " ".join(answer["warnings"])
+    assert broker.quota_left(wired, "gitlab-pat")["used_requests"] == 1
+
+
+def test_signatures_neither_consume_nor_obey_http_quotas(wired):
+    allow(wired)
+    profile(wired, "gitlab-pat", scheme="hmac", template="{body}",
+            encoding="hex")
+    broker.grant(wired, "gitlab-pat", broker.SIGN_SCOPE, mutating=True,
+                 source="test")
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64,
+                     max_requests=1, per_s=3600)
+    request = {"secret": "gitlab-pat", "payload": {"message": "hello"}}
+
+    for _ in range(2):
+        assert "signature" in broker.sign_only(wired, request,
+                                               store=Store(), notify=False)
+    left = broker.quota_left(wired, "gitlab-pat")
+    assert left["used_requests"] == 0 and left["used_bytes"] == 0
+    assert call(wired)["status"] == 200
+    assert call(wired)["code"] == "quota"
+    assert "signature" in broker.sign_only(wired, request,
+                                           store=Store(), notify=False)
+
+
+def test_partial_bytes_in_a_failed_read_still_count(wired, monkeypatch,
+                                                   tmp_path):
+    import http.client
+
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+
+    class Incomplete(Stream):
+        def read(self, size=None):
+            raise http.client.IncompleteRead(b"short", 12)
+
+    answer = call(wired, opener=Opener(Incomplete()),
+                  capture="interrupted", binary=True)
+
+    assert answer["code"] == "sent-outcome-unknown"
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 5
+    assert not list((tmp_path / "captures").glob("*"))
+
+
+def test_an_inflight_response_shares_bytes_with_a_completed_call(
+        wired, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    allow(wired)
+    broker.set_quota(wired, "gitlab-pat", max_bytes=64, per_s=3600)
+    entered, proceed = threading.Event(), threading.Event()
+    response = Stream(200, b"x" * 512)
+    answers = []
+
+    class Waiting(Opener):
+        def open(self, request, timeout=None):
+            entered.set()
+            if not proceed.wait(5):
+                raise TimeoutError("test response was not released")
+            return super().open(request, timeout)
+
+    def download():
+        own = db.connect(tmp_path / "audit.db")
+        try:
+            answers.append(call(own, opener=Waiting(response),
+                                capture="concurrent", binary=True))
+        finally:
+            own.close()
+
+    worker = threading.Thread(target=download)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        answer = call(wired, opener=Opener(Reply(
+            body=b"x" * 32, headers={"Content-Length": "32"})))
+        assert answer["status"] == 200
+    finally:
+        proceed.set()
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert answers[0]["code"] == "quota" and response._at == 32
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 64
+
+
+def test_unrecorded_usage_is_bounded_until_the_writer_catches_up(
+        wired, writer, tmp_path, monkeypatch):
+    allow(wired)
+    monkeypatch.setattr(broker, "DEFERRED_LIMIT", 2)
+    other = db.connect(tmp_path / "audit.db")
+    other.execute("BEGIN IMMEDIATE")
+    try:
+        assert call(wired)["status"] == 200
+        assert call(wired)["status"] == 200
+        opener = Opener()
+        refused = call(wired, opener=opener)
+        assert refused["code"] == "unavailable" and opener.sent == []
+    finally:
+        other.rollback()
+        other.close()
+
+    assert writer.flush()
+    assert call(wired)["status"] == 200
+
+
+@pytest.mark.parametrize("failure", [BrokenPipeError, ConnectionResetError])
+def test_a_refusal_already_sent_survives_a_failed_request_write(
+        monkeypatch, failure):
+    class RefusingSocket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            raise failure("peer stopped reading")
+
+        def recv(self, size):
+            return b'{"code":"unavailable","refused":"already handling calls"}\n'
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(broker.socket, "socket", lambda *args: RefusingSocket())
+
+    answer = broker.request({"op": "ping"}, path="broker.test")
+
+    assert answer["code"] == "unavailable"
+
+
+@pytest.mark.parametrize("binary", [False, True])
+@pytest.mark.parametrize("framing", ["chunked", "duplicate"])
+def test_response_framing_overrides_ambiguous_content_length(
+        wired, monkeypatch, tmp_path, binary, framing):
+    import http.client
+    import io
+
+    allow(wired)
+    monkeypatch.setattr(config, "capture_dir", lambda: tmp_path / "captures")
+    broker.set_quota(wired, "gitlab-pat", max_bytes=32, per_s=3600)
+    if framing == "chunked":
+        wire = (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                b"Content-Length: 32\r\n\r\n40\r\n" + b"x" * 64
+                + b"\r\n0\r\n\r\n")
+    else:
+        wire = (b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n"
+                b"Content-Length: 32\r\n\r\n" + b"x" * 64)
+
+    class ResponseSocket:
+        def makefile(self, mode):
+            return io.BytesIO(wire)
+
+    response = http.client.HTTPResponse(ResponseSocket())
+    response.begin()
+    answer = call(wired, opener=Opener(response), capture="chunked",
+                  binary=binary)
+
+    assert answer["code"] == "quota"
+    assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 32
+    assert not list((tmp_path / "captures").glob("*"))

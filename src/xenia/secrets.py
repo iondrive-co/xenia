@@ -597,6 +597,15 @@ def duration(text: str) -> float:
     return size * {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
 
 
+def size(text: str) -> int:
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]?)(i?)b?", text.strip().lower())
+    if not match:
+        raise ValueError(f"not a size: {text} (try 500MB, 5GB, 2GiB)")
+    power = "kmgt".find(match.group(2)) + 1 if match.group(2) else 0
+    unit = (1024 if match.group(3) else 1000) ** power
+    return int(float(match.group(1)) * unit)
+
+
 def main(argv: list[str]) -> int:
     from . import broker
 
@@ -629,6 +638,55 @@ def main(argv: list[str]) -> int:
     finally:
         conn.close()
     return _usage()
+
+
+def _quota(conn, broker, rest: list[str]) -> int:
+    if not rest or rest[0].startswith("-"):
+        print("xenia: xenia secret quota NAME [--max-bytes 5GB] "
+              "[--max-requests N] [--per 24h] | --clear", file=sys.stderr)
+        return 2
+    name = rest[0]
+    row = broker.entry(conn, name)
+    if row is None:
+        print(f"xenia: no credential called '{name}'", file=sys.stderr)
+        return 2
+    max_bytes = _flag_value(rest, "--max-bytes")
+    max_requests = _flag_value(rest, "--max-requests")
+    per = _flag_value(rest, "--per")
+    if "--clear" in rest:
+        if max_bytes or max_requests or per:
+            print("xenia: --clear lifts the quota; give it alone",
+                  file=sys.stderr)
+            return 2
+        broker.set_quota(conn, name)
+        print(f"'{name}' has no quota now: only its grants bound it.")
+        return 0
+    if max_bytes or max_requests or per:
+        try:
+            broker.set_quota(
+                conn, name,
+                max_bytes=size(max_bytes) if max_bytes else row["quota_bytes"],
+                max_requests=(int(max_requests) if max_requests
+                              else row["quota_requests"]),
+                per_s=int(duration(per)) if per else row["quota_window_s"])
+        except ValueError as exc:
+            print(f"xenia: {exc}", file=sys.stderr)
+            return 2
+    left = broker.quota_left(conn, name)
+    if left is None:
+        print(f"'{name}' has no quota: only its grants bound it.")
+        return 0
+    print(f"'{name}' HTTP quota over a rolling {broker._window_words(left['window_s'])}:")
+    for unit, used, most, remaining in (
+            ("bytes", left["used_bytes"], left["max_bytes"], left["bytes"]),
+            ("requests", left["used_requests"], left["max_requests"],
+             left["requests"])):
+        if most is None:
+            print(f"  {unit:9} {used:,} used, unbounded")
+        else:
+            print(f"  {unit:9} {used:,} of {most:,} used, "
+                  f"{max(0, remaining):,} left")
+    return 0
 
 
 def _secret(conn, broker, argv: list[str]) -> int:
@@ -822,6 +880,9 @@ def _secret(conn, broker, argv: list[str]) -> int:
         print("  anything else — including an endpoint added later — is "
               "refused.")
         return 0
+
+    if action == "quota":
+        return _quota(conn, broker, rest)
 
     if action == "schemes":
         from xenia import signing
@@ -1124,6 +1185,13 @@ def _usage() -> int:
                                   --service credential, where a route alone
                                   cannot separate a harmless call from a
                                   damaging one
+  xenia secret quota NAME [--max-bytes 5GB] [--max-requests N] [--per 24h]
+                                  bound received HTTP body bytes and outgoing
+                                  HTTP requests in a rolling window. Every
+                                  credential and redirect counts. Signing
+                                  alone does not count. Past the quota a call
+                                  is refused, or an incomplete response fails.
+                                  Alone it shows the count; --clear lifts it
   xenia secret schemes            which signing schemes work on this machine
   xenia secret digest PATH…       the sha256 a signing provider's `files`
                                   pin is checked against

@@ -719,3 +719,34 @@ def test_a_standing_approval_can_hold_the_value(cli, capsys):
     row = cli.db().execute("SELECT hold FROM secret_grant WHERE name = 'service-key' "
                            "AND revoked_at IS NULL").fetchone()
     assert row["hold"] == 1
+
+
+def test_a_quota_is_set_shown_narrowed_and_lifted(cli, capsys):
+    assert cli("secret", "add", "aws", "--host", "s3.example.com",
+               stdin=VALUE) == 0
+    assert cli("secret", "quota", "aws", "--max-bytes", "5GB",
+               "--max-requests", "3000", "--per", "24h") == 0
+    out = capsys.readouterr().out
+    assert "0 of 5,000,000,000 used" in out and "0 of 3,000 used" in out
+    assert "rolling 1d" in out
+
+    assert cli("secret", "quota", "aws", "--per", "12h") == 0
+    conn = cli.db()
+    row = broker.entry(conn, "aws")
+    conn.close()
+    assert (row["quota_bytes"], row["quota_requests"],
+            row["quota_window_s"]) == (5 * 10**9, 3000, 12 * 3600)
+
+    assert cli("secret", "quota", "aws", "--clear") == 0
+    conn = cli.db()
+    assert broker.quota_left(conn, "aws") is None
+    conn.close()
+
+
+def test_sizes_read_decimal_and_binary_units():
+    assert secrets.size("5GB") == 5 * 10**9
+    assert secrets.size("2GiB") == 2 * 2**30
+    assert secrets.size("500mb") == 500 * 10**6
+    assert secrets.size("123") == 123
+    with pytest.raises(ValueError):
+        secrets.size("lots")
