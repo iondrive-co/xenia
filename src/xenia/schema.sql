@@ -204,7 +204,11 @@ CREATE TABLE IF NOT EXISTS secret (
     revision          INTEGER,
     quota_bytes       INTEGER,
     quota_requests    INTEGER,
-    quota_window_s    INTEGER
+    quota_window_s    INTEGER,
+    backup_target     TEXT,
+    backup_revision   INTEGER,
+    backup_ref        TEXT,
+    backed_up_at      TEXT
 );
 
 -- One approval, by a human, for one credential against one host. Two clocks:

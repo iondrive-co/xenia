@@ -292,6 +292,10 @@ _ADDED_COLUMNS = (
     ("secret", "quota_bytes", "INTEGER"),
     ("secret", "quota_requests", "INTEGER"),
     ("secret", "quota_window_s", "INTEGER"),
+    ("secret", "backup_target", "TEXT"),
+    ("secret", "backup_revision", "INTEGER"),
+    ("secret", "backup_ref", "TEXT"),
+    ("secret", "backed_up_at", "TEXT"),
 )
 
 _REVISION = ("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'secret_revision'; "

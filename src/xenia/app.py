@@ -259,6 +259,7 @@ class App:
                 MenuItem("Add…", self.add_credential),
                 MenuItem("List", self.list_credentials),
                 MenuItem("Approvals…", self.approvals),
+                MenuItem("Back up…", self.backup_credentials),
                 MenuItem("Delete…", self.delete_credential),
             ]),
             MenuItem("Quit xenia", self.quit),
@@ -290,6 +291,9 @@ class App:
         the Credentials tab, and Approve… on a row is the form.
         """
         webbrowser.open(self.report.tab("credentials"))
+
+    def backup_credentials(self) -> None:
+        self._in_terminal(["secret", "backup", "--wait"], "xenia secret backup")
 
     def delete_credential(self) -> None:
         """A terminal, because this one cannot be taken back.

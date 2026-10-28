@@ -44,6 +44,7 @@ HTTP quotas count received body bytes and each outgoing request, including redir
 | `providers.py` | configured external signing commands, one-shot or resident, their pins and their bounded JSON protocols — [contract](SIGNING.md) |
 | `policy.py` | what a request may say, over its parsed body and query — `check`, `fields`, `Denied`, `Unparsed` |
 | `secrets.py` | first-use setup for the store, and adding, renaming, removing and approving credentials — `add`, `rename`, `remove`, shared by the command and the page |
+| `backup.py` | copying each credential added or changed since the last copy into a password manager - `Bitwarden`, `Command`, `pending`, `run` |
 
 ## Coordinate
 

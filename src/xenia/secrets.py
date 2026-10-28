@@ -472,7 +472,13 @@ def add(conn, name: str, value: str, **policy) -> dict:
 
     vault.backend().set(name, value)
     del value
-    return broker.register(conn, name, **policy)
+    registered = broker.register(conn, name, **policy)
+    try:
+        from . import backup
+        backup.nudge(conn, name)
+    except Exception:
+        pass
+    return registered
 
 
 def remove(conn, name: str) -> dict:
@@ -693,6 +699,9 @@ def _secret(conn, broker, argv: list[str]) -> int:
     if not argv:
         return _list(conn, broker)
     action, rest = argv[0], argv[1:]
+
+    if action == "backup":
+        return _backup(conn, broker, rest)
 
     if action == "list":
         code = _list(conn, broker)
@@ -1035,7 +1044,51 @@ def _list(conn, broker) -> int:
               f"{'':16} {'':12} —")
         print(f"  {'':18} left behind by a cancelled add; "
               f"`xenia secret rm {orphan}` clears it")
+
+    if rows:
+        from . import backup
+        print("\n" + backup.describe(backup.summary(conn)))
     return 0
+
+
+def _backup(conn, broker, rest: list[str]) -> int:
+    from . import backup
+
+    if "--check" in rest:
+        state = backup.summary(conn)
+        print(backup.describe(state))
+        return 1 if state["pending"] else 0
+    if not sys.stdin.isatty():
+        print("xenia: run `xenia secret backup` in a terminal, where the "
+              "password manager can ask for its password — or use the tray's "
+              "Credentials → Back up…", file=sys.stderr)
+        return 2
+
+    everything = "--all" in rest
+    code = 0
+    try:
+        chosen = backup.target()
+        count = len(broker.registry(conn) if everything
+                    else backup.pending(conn, chosen.kind))
+        if not count:
+            print(f"Every credential is already in {chosen.label}.")
+        else:
+            print(f"Copying {count} credential(s) to {chosen.label}:")
+            outcome = backup.run(conn, chosen, everything=everything)
+            print(f"Copied {len(outcome['done'])}.")
+            if outcome["missing"]:
+                print("No value in the store, so not copied: "
+                      + ", ".join(outcome["missing"]))
+            for name, why in outcome["failed"]:
+                print(f"xenia: '{name}' was not copied: {why}", file=sys.stderr)
+            code = 1 if outcome["failed"] else 0
+    except (backup.BackupError, vault.VaultError) as exc:
+        print(f"xenia: the backup stopped: {exc}", file=sys.stderr)
+        code = 1
+
+    if "--wait" in rest:
+        _ask("\nPress enter to close")
+    return code
 
 
 def until_moment(text: str) -> datetime:
@@ -1210,6 +1263,16 @@ def _usage() -> int:
                                   asks which — the same thing the tray's
                                   Credentials → Delete… opens
   xenia secret test               store, read back and delete a test value
+  xenia secret backup [--all]     copy every credential added or changed
+                                  since the last backup into a password
+                                  manager: Bitwarden through its `bw` CLI, or
+                                  any program named under "backup" in
+                                  config.json. Each value reaches it on a
+                                  pipe, never on a command line or on disk.
+                                  --all copies every one again. The tray's
+                                  Credentials → Back up… opens it
+  xenia secret backup --check     only say which are not backed up; exits 1
+                                  when any is
 
   xenia grant NAME --host H [--write] [--for 4h]
                                   approve use up front. Usually unnecessary:
