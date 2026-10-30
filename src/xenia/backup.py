@@ -11,7 +11,10 @@ from . import broker, config, vault
 
 PREFIX = "xenia: "
 FIELD = "xenia-name"
-NOTE_LIMIT = 9000
+# Bitwarden refuses a note longer than 10,000 characters in its encrypted form ("2.iv|ciphertext|mac", base64 of
+# AES-CBC), not as typed: 7,000 bytes of UTF-8 encrypt to 9,416 characters, so the limit counts bytes.
+NOTE_LIMIT = 7000
+ENCRYPTED_NOTE_CAP = 10000
 CALL_TIMEOUT = 120.0
 
 
@@ -107,13 +110,13 @@ def notes_for(policy: dict[str, Any]) -> str:
         return f"{head}\n\n{body}" if head else body
 
     text = written(rest)
-    if len(text) > NOTE_LIMIT:
+    if len(text.encode()) > NOTE_LIMIT:
         if isinstance(rest.get("schemes"), dict):
             rest["schemes"] = sorted(rest["schemes"])
         if isinstance(rest.get("body_policy"), dict):
             rest["body_policy"] = {"actions": sorted(rest["body_policy"].get("actions") or {})}
         text = written(rest)
-    return text[:NOTE_LIMIT]
+    return text.encode()[:NOTE_LIMIT].decode(errors="ignore")      # never half a character
 
 
 def record(conn, name: str, kind: str, revision, ref: str) -> bool:

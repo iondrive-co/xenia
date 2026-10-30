@@ -358,6 +358,39 @@ def test_a_long_policy_is_shortened_to_fit_the_note(world):
     assert "action-59" in notes and "/api/xxx" not in notes
 
 
+def encrypted_length(note: str) -> int:
+    """Bitwarden's stored form of a note: "2." + base64(iv 16) + "|" + base64(AES-CBC ciphertext) + "|" + base64(mac 32)."""
+    def b64(n):
+        return 4 * -(-n // 3)
+    return 2 + b64(16) + 1 + b64((len(note.encode()) // 16 + 1) * 16) + 1 + b64(32)
+
+
+def test_every_note_fits_bitwardens_cap_on_encrypted_notes(world):
+    conn, _store, _told = world
+    secrets.add(conn, "gitlab-pat", VALUE, hosts=[HOST])
+    actions = {f"действие-{n}": {"paths": ["/api/" + "ü" * 300]} for n in range(80)}
+    broker.set_body_policy(conn, "gitlab-pat", {"actions": actions})
+    policy = backup.policy_of(broker.entry(conn, "gitlab-pat"))
+
+    for shown in (policy, {**policy, "note": "é" * 9000}):
+        notes = backup.notes_for(shown)
+        assert len(notes.encode()) <= backup.NOTE_LIMIT
+        assert encrypted_length(notes) <= backup.ENCRYPTED_NOTE_CAP
+        assert notes.encode().decode() == notes                    # whole characters only
+
+    # The cap is on the encrypted bytes: 9,000 two-byte characters, under a character count of 9,000, would not fit.
+    assert encrypted_length("é" * 9000) > backup.ENCRYPTED_NOTE_CAP
+    assert encrypted_length("x" * backup.NOTE_LIMIT) <= backup.ENCRYPTED_NOTE_CAP
+
+
+def test_a_short_note_is_kept_whole(world):
+    conn, _store, _told = world
+    secrets.add(conn, "gitlab-pat", VALUE, hosts=[HOST])
+    shown = {**backup.policy_of(broker.entry(conn, "gitlab-pat")), "note": "für den Kraken-Abzug"}
+    notes = backup.notes_for(shown)
+    assert notes.startswith("für den Kraken-Abzug\n\nxenia policy:") and notes.endswith("}")
+
+
 def command_target(tmp_path, answer="{'ref': 'kept-' + seen['name']}"):
     script = tmp_path / "keep.py"
     script.write_text("import json, sys\n"
