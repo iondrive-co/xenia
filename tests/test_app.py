@@ -3,7 +3,30 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from xenia import app, icon, install
+
+has_terminal = app.has_terminal
+
+
+@pytest.fixture(autouse=True)
+def at_a_terminal(monkeypatch):
+    monkeypatch.setattr(app, "has_terminal", lambda: True)
+
+
+@pytest.fixture
+def nothing_may_happen(monkeypatch):
+    def refuse(what):
+        def raise_(*_a, **_kw):
+            raise AssertionError(f"must not {what}")
+        return raise_
+
+    monkeypatch.setattr(app.service, "restart", refuse("restart the service"))
+    monkeypatch.setattr(app.webbrowser, "open", refuse("open a browser"))
+    monkeypatch.setattr(app, "run_setup", refuse("set anything up"))
+    monkeypatch.setattr(app, "_retire", refuse("stop an instance"))
+    monkeypatch.setattr(app.App, "run", refuse("start an instance"))
 
 
 def test_the_icon_is_a_valid_png():
@@ -180,10 +203,71 @@ def test_capture_can_be_repaired_after_being_stripped(fake_home):
     assert json.loads(settings.read_text())["model"] == "opus"
 
 
-def test_the_command_takes_no_arguments(fake_home, capsys):
+def test_an_unknown_argument_is_refused_with_the_usage(
+    fake_home, nothing_may_happen, capsys
+):
     assert app.main(["--json"]) == 2
     assert app.main(["report"]) == 2
-    assert "takes no arguments" in capsys.readouterr().err
+    assert "usage: xenia" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["--help"], ["-h"], ["help"], ["help", "grant"]])
+def test_asking_for_help_does_nothing_else(
+    fake_home, nothing_may_happen, capsys, argv
+):
+    import os
+    app.runtime_file().write_text(json.dumps({
+        "pid": os.getpid(), "url": "http://127.0.0.1:9/?t=old",
+    }))
+
+    assert app.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "usage: xenia" in out
+    assert "xenia grant NAME --host H" in out
+
+
+def test_without_a_terminal_a_running_instance_is_left_alone(
+    fake_home, nothing_may_happen, monkeypatch, capsys
+):
+    import os
+    monkeypatch.setattr(app, "has_terminal", lambda: False)
+    app.runtime_file().write_text(json.dumps({
+        "pid": os.getpid(), "url": "http://127.0.0.1:9/?t=secret-token",
+    }))
+
+    assert app.main([]) == 0
+    out = capsys.readouterr().out
+    assert f"xenia is running (pid {os.getpid()})" in out
+    assert "usage: xenia" in out
+    assert "secret-token" not in out
+
+
+def test_without_a_terminal_nothing_is_set_up_or_started(
+    fake_home, nothing_may_happen, monkeypatch, capsys
+):
+    monkeypatch.setattr(app, "has_terminal", lambda: False)
+
+    assert app.main([]) == 0
+    assert "xenia is not running" in capsys.readouterr().out
+    assert not app.setup_marker().exists()
+
+
+def test_a_terminal_needs_both_ends(monkeypatch):
+    import io
+    import sys
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stdin", Tty())
+    monkeypatch.setattr(sys, "stdout", Tty())
+    assert has_terminal() is True
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    assert has_terminal() is False
+    monkeypatch.setattr(sys, "stdin", None)
+    assert has_terminal() is False
 
 
 def test_a_second_invocation_restarts_the_running_one(fake_home, monkeypatch):

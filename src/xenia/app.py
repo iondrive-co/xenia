@@ -380,28 +380,67 @@ class App:
 
 
 SUBCOMMANDS = ("secret", "secrets", "grant", "grants", "revoke")
+HELP = ("-h", "--help", "help")
+
+USAGE = """usage: xenia [COMMAND]
+
+  xenia                 in a terminal: set up on first run, restart what is
+                        already running, then open the report. Without a
+                        terminal it only says whether xenia is running, and
+                        starts, restarts and opens nothing
+  xenia secret ...      one credential: add, sign, list, backup, rm ...
+  xenia secrets setup   find and prove the credential store
+  xenia grant | grants | revoke
+                        approvals
+  xenia --help          this, followed by every credential command
+
+-h or --help anywhere in a command prints help and does nothing else.
+Everything else is in the report itself, or in the read-only MCP server
+(xenia-mcp)."""
+
+
+def has_terminal() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _help() -> int:
+    from . import secrets as secrets_cli
+    print(USAGE + "\n")
+    return secrets_cli._usage()
+
+
+def _without_terminal(running: dict | None) -> int:
+    if running:
+        print(f"xenia is running (pid {running.get('pid')}), and was left "
+              f"alone: a restart drops the credential values it holds in "
+              f"memory and refuses brokered calls until it is back, so only "
+              f"`xenia` run in a terminal restarts it.\n")
+    else:
+        print("xenia is not running. Nothing was set up or started: run "
+              "`xenia` in a terminal for that.\n")
+    print(USAGE)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in HELP:
+        return _help()
     if argv and argv[0] in SUBCOMMANDS:
         from . import secrets as secrets_cli
         return secrets_cli.main(argv)
     if argv:
-        print("xenia takes no arguments.\n\n"
-              "  xenia            set up on first run, restart what is already "
-              "running,\n"
-              "                   then open the report\n\n"
-              "  xenia secrets    the credential store: setup, entry, and "
-              "approvals\n"
-              "                   (`xenia secrets` on its own explains "
-              "itself)\n\n"
-              "Everything else is in the report itself, or in the read-only "
-              "MCP server (xenia-mcp).", file=sys.stderr)
+        print(f"xenia: no command {argv[0]!r}\n\n{USAGE}", file=sys.stderr)
         return 2
 
     running = _read_runtime()
-    if running.get("url") and _alive(running.get("pid", -1)):
+    live = bool(running.get("url")) and _alive(running.get("pid", -1))
+    if not has_terminal():
+        return _without_terminal(running if live else None)
+    if live:
         outcome = _restart(running)
         if outcome is not None:
             return outcome

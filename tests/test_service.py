@@ -182,6 +182,7 @@ def test_the_command_runs_in_the_foreground_when_there_is_no_service(
     fake_home, monkeypatch, capsys
 ):
     monkeypatch.setattr(service, "manager", lambda: None)
+    monkeypatch.setattr(app, "has_terminal", lambda: True)
     monkeypatch.setattr(app.webbrowser, "open", lambda _url: None)
     ran = []
     monkeypatch.setattr(app.App, "run", lambda self, **kw: ran.append(True) or 0)
@@ -195,6 +196,7 @@ def test_the_command_exits_once_the_service_has_the_report(
     fake_home, monkeypatch, capsys
 ):
     monkeypatch.setattr(service, "manager", lambda: "systemd")
+    monkeypatch.setattr(app, "has_terminal", lambda: True)
     monkeypatch.setattr(service, "install", lambda: {
         "manager": "systemd", "started": True, "detail": "unit", "unit": "/x"})
     monkeypatch.setattr(app, "_await_report", lambda **_kw: "http://127.0.0.1:1/?t=x")

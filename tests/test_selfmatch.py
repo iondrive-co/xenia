@@ -20,6 +20,16 @@ REFUSED = [
     'sudo -n pkill -9 -f appserver',
     'pkill --signal TERM --full appserver',
     "timeout 60 bash -c 'until ! pgrep -f appserver; do sleep 1; done'",
+    'job=import_orders.py; while pgrep -f "$job" >/dev/null; do sleep 30; done',
+    'export JOB="make integration"\nuntil ! pgrep -f "${JOB}"; do sleep 20; done',
+    'while ps aux | grep -q "render-queue --once"; do sleep 10; done',
+    'ps -eo pid,args | grep -E "export_cli|render-queue" | wc -l',
+    "kill $(ps aux | grep appserver | awk '{print $2}')",
+    'until ! ps -ef | grep -iq APPSERVER; do sleep 5; done',
+    "cat > wait.sh <<'EOF'\nwhile pgrep -f nightly-export >/dev/null; do sleep 30; done\nEOF\nbash wait.sh",
+    "bash -s <<'EOF'\npkill -f worker.sh\nEOF",
+    "cat <<EOF > /srv/repos/shop/stop.sh\npkill -f queue-watcher\nEOF\nchmod +x /srv/repos/shop/stop.sh && /srv/repos/shop/stop.sh",    'job=worker.sh; pkill -f $job',
+    'pkill -TERM -f [r]enderd; tail -3 renderd.log',
 ]
 
 ALLOWED = [
@@ -42,6 +52,29 @@ ALLOWED = [
     # Cannot be read as a literal, so cannot be decided.
     'pkill -f "$PATTERN"',
     'pkill -f "$(cat pattern.txt)"',
+    'read -r job < job.txt; pkill -f "$job"',
+    'job=$(cat job.txt); pkill -f "$job"',
+    'job=worker.sh pkill -f "$job"',
+    'pgrep -f render-queue -A >/dev/null && echo running',
+    'pkill -f appserver --ignore-ancestors',
+    'while ps aux | grep -v grep | grep -q render-queue; do sleep 10; done',
+    'while ps aux | grep -q "[r]ender-queue"; do sleep 10; done',
+    'ps aux | grep render-queue',
+    'ps -e | grep -q render-queue',
+    'ps -p 4242 -o args | grep -q render-queue',
+    'ps aux | grep -q render-queue jobs.txt',
+    "cat > stop.sh <<'EOF'\npkill -f foo\nEOF\nbash -n stop.sh",
+    "bash wait.sh <<'EOF'\npkill -f foo\nEOF",    'pkill -f $PATTERN',
+    'pgrep -f $JOB | xargs kill',
+    'job=$(cat job.txt); pkill -f $job',
+    'pkill -TERM -f [r]enderd; sleep 6',    'pkill -P $$ -f worker.sh',
+    'until pgrep -P "$pid" -f render-queue >/dev/null; do sleep 2; done',
+    'pkill --parent 4242 -f appserver',
+    'pgrep -s 0 -f appserver | xargs kill',
+    'pgrep -t pts/3 -f appserver | xargs kill',
+    'pgrep -F app.pid -f appserver | xargs kill',
+    'pgrep -u nobody -f appserver | xargs kill',
+    'ps -fu nobody | grep -q appserver',
 ]
 
 
@@ -77,3 +110,28 @@ def test_only_a_pre_tool_use_bash_call_is_checked():
     assert selfmatch.check({**call, "hook_event_name": "PostToolUse"}) is None
     assert selfmatch.check({**call, "tool_name": "Read"}) is None
     assert selfmatch.check({**call, "tool_input": "pkill -f worker.sh"}) is None
+
+
+def test_a_refusal_keeps_a_variable_a_variable():
+    said = selfmatch.refusal('job=worker.sh; pgrep -f "$job" | xargs kill')
+    assert 'pgrep -A -f "$job"' in said
+
+
+def test_a_ps_refusal_names_pgrep_a():
+    said = selfmatch.refusal('until ! ps aux | grep -q appserver; do sleep 5; done')
+    assert "ps aux | grep -q appserver" in said
+    assert "pgrep -A -f" in said
+
+
+def test_a_ps_pipeline_reaches_the_check():
+    call = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_input": {"command": "ps aux | grep -q appserver && echo up"}}
+    assert selfmatch.check(call)
+
+
+def test_the_agent_s_own_user_does_not_narrow_the_match():
+    import getpass
+    import os
+    for user in (getpass.getuser(), str(os.getuid()), '"$USER"', "$(id -u)"):
+        assert selfmatch.refusal(f"pgrep -u {user} -f appserver | xargs kill"), user
+        assert selfmatch.refusal(f"ps -fu {user} | grep -q appserver"), user

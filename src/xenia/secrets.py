@@ -617,13 +617,17 @@ def main(argv: list[str]) -> int:
 
     command, rest = argv[0], argv[1:]
 
+    if rest[:1] == ["help"] or "-h" in rest or "--help" in rest:
+        return _usage()
+
     if command == "secrets":
         # `secrets` is the store; `secret` is one credential. The plural with
         # a singular verb must not silently run setup.
-        if not rest or rest[0] == "setup":
-            return setup(rest[1:] if rest else [])
-        if rest[0] in ("help", "-h", "--help"):
-            return _usage()
+        if not rest:
+            from .app import has_terminal
+            return setup([]) if has_terminal() else _usage()
+        if rest[0] == "setup":
+            return setup(rest[1:])
         return main(["secret", *rest])
 
     conn = db.connect()

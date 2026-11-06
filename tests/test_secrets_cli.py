@@ -316,6 +316,45 @@ def test_revoking_ends_every_grant_for_a_name(cli, capsys):
     conn.close()
 
 
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_help_after_a_grant_s_arguments_grants_nothing(cli, capsys, flag):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    capsys.readouterr()
+
+    assert cli("grant", "pat", "--host", "h.example", flag) == 0
+    assert cli("revoke", "pat", flag) == 0
+
+    conn = cli.db()
+    assert broker.grants(conn) == []
+    conn.close()
+    assert "xenia grant NAME --host H" in capsys.readouterr().out
+
+
+def test_help_after_backup_backs_nothing_up(cli, monkeypatch, capsys):
+    monkeypatch.setattr(secrets, "_backup", lambda *_a: pytest.fail(
+        "--help must not start a backup"))
+
+    assert cli("secret", "backup", "--help") == 0
+    assert cli("secret", "help") == 0
+    assert "xenia secret backup" in capsys.readouterr().out
+
+
+def test_the_store_is_only_set_up_from_a_terminal(cli, monkeypatch, capsys):
+    from xenia import app
+
+    ran = []
+    monkeypatch.setattr(secrets, "setup", lambda argv: ran.append(argv) or 0)
+    monkeypatch.setattr(app, "has_terminal", lambda: False)
+    assert cli("secrets") == 0
+    assert ran == []
+    assert "xenia secrets setup" in capsys.readouterr().out
+
+    assert cli("secrets", "setup") == 0
+    monkeypatch.setattr(app, "has_terminal", lambda: True)
+    assert cli("secrets") == 0
+    assert ran == [[], []]
+
+
 def test_listing_says_what_is_registered_and_approved(cli, capsys):
     cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
     cli("grant", "pat", "--host", "h.example")
