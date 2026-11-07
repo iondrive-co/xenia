@@ -316,13 +316,23 @@ def test_revoking_ends_every_grant_for_a_name(cli, capsys):
     conn.close()
 
 
-@pytest.mark.parametrize("flag", ["--help", "-h"])
-def test_help_after_a_grant_s_arguments_grants_nothing(cli, capsys, flag):
+@pytest.fixture
+def opened(monkeypatch):
+    calls = []
+    real = db.connect
+    monkeypatch.setattr(db, "connect",
+                        lambda *a, **k: calls.append(a) or real(*a, **k))
+    return calls
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h", "help"])
+def test_help_anywhere_in_a_grant_grants_nothing(cli, capsys, flag):
     cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
     capsys.readouterr()
 
-    assert cli("grant", "pat", "--host", "h.example", flag) == 0
-    assert cli("revoke", "pat", flag) == 0
+    assert cli("grant", "pat", "--host", "h.example", flag) == 2
+    assert cli("grant", "pat", flag, "--host", "h.example") == 2
+    assert cli("grant", flag, "pat") == 2
 
     conn = cli.db()
     assert broker.grants(conn) == []
@@ -330,12 +340,99 @@ def test_help_after_a_grant_s_arguments_grants_nothing(cli, capsys, flag):
     assert "xenia grant NAME --host H" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("flag", ["--help", "-h", "help"])
+def test_help_anywhere_in_a_revoke_revokes_nothing(cli, capsys, flag):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    cli("grant", "pat", "--host", "h.example")
+    capsys.readouterr()
+
+    assert cli("revoke", "pat", flag) == 2
+    assert cli("revoke", "pat", "--host", "h.example", flag) == 2
+    assert cli("revoke", flag, "pat") == 2
+
+    conn = cli.db()
+    assert len(broker.grants(conn)) == 1
+    conn.close()
+    assert "xenia revoke NAME" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("words", [
+    ["--untill", "2026-12-08"],
+    ["--hots", "h.example"],
+    ["-w"],
+    ["--write=yes"],
+    ["extra"],
+    ["--for"],
+    ["--for", "--write"],
+    ["--host="],
+    ["--for", "10m", "--for", "4h"],
+])
+def test_a_grant_with_a_word_it_does_not_take_grants_nothing(
+        cli, capsys, opened, words):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    capsys.readouterr()
+    opened.clear()
+
+    assert cli("grant", "pat", *words) == 2
+    assert opened == []
+    assert "Nothing was granted" in capsys.readouterr().err
+
+    conn = cli.db()
+    assert broker.grants(conn) == []
+    conn.close()
+
+
+def test_a_misspelt_option_is_named_with_the_one_meant(cli, capsys):
+    assert cli("grant", "pat", "--untill", "2026-12-08") == 2
+    assert "did you mean --until" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("words", [
+    ["--hots", "h.example"],
+    ["extra"],
+    ["--host"],
+    ["--write"],
+    ["--host", "a.example", "--host", "h.example"],
+])
+def test_a_revoke_with_a_word_it_does_not_take_revokes_nothing(
+        cli, capsys, opened, words):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    cli("grant", "pat", "--host", "h.example")
+    capsys.readouterr()
+    opened.clear()
+
+    assert cli("revoke", "pat", *words) == 2
+    assert opened == []
+    assert "Nothing was revoked" in capsys.readouterr().err
+
+    conn = cli.db()
+    assert len(broker.grants(conn)) == 1
+    conn.close()
+
+
+def test_the_name_may_follow_the_options(cli):
+    cli("secret", "add", "pat", "--host", "h.example", stdin=VALUE)
+    assert cli("grant", "--host", "h.example", "--for=10m", "pat") == 0
+    assert cli("revoke", "--host=h.example", "pat") == 0
+
+    conn = cli.db()
+    assert broker.grants(conn) == []
+    conn.close()
+
+
+def test_listing_grants_refuses_a_word_it_does_not_take(cli, capsys, opened):
+    assert cli("grants", "--al") == 2
+    assert cli("grants", "pat") == 2
+    assert opened == []
+    assert cli("grants", "--all") == 0
+
+
 def test_help_after_backup_backs_nothing_up(cli, monkeypatch, capsys):
     monkeypatch.setattr(secrets, "_backup", lambda *_a: pytest.fail(
         "--help must not start a backup"))
 
-    assert cli("secret", "backup", "--help") == 0
-    assert cli("secret", "help") == 0
+    assert cli("secret", "backup", "--help") == 2
+    assert cli("secret", "help") == 2
     assert "xenia secret backup" in capsys.readouterr().out
 
 

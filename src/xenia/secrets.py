@@ -612,13 +612,82 @@ def size(text: str) -> int:
     return int(float(match.group(1)) * unit)
 
 
+_TAKES = {
+    "grant": ({"--host", "--for", "--until", "--reason", "--profiles"},
+              {"--write", "--hold"}, 1, "granted"),
+    "revoke": ({"--host"}, set(), 1, "revoked"),
+    "grants": (set(), {"--all"}, 0, "listed"),
+}
+
+
+def _arguments(command: str, argv: list[str]) -> tuple[list[str], dict]:
+    values, switches, _, _ = _TAKES[command]
+    names, given = [], {}
+    words = iter(argv)
+    for word in words:
+        if not word.startswith("-"):
+            names.append(word)
+            continue
+        flag, equals, value = word.partition("=")
+        if flag not in values | switches:
+            raise ValueError(_unknown(command, flag, values | switches))
+        if flag in given:
+            raise ValueError(f"{flag} is given twice")
+        if flag in switches:
+            if equals:
+                raise ValueError(f"{flag} takes no value")
+            given[flag] = True
+            continue
+        if not equals:
+            value = next(words, "")
+            if value.startswith("-"):
+                value = ""
+        if not value:
+            raise ValueError(f"{flag} needs a value")
+        given[flag] = value
+    return names, given
+
+
+def _unknown(command: str, flag: str, known: set[str]) -> str:
+    import difflib
+
+    close = difflib.get_close_matches(flag, sorted(known), n=1)
+    takes = ", ".join(sorted(known)) if known else "no options"
+    return (f"{command} takes no option '{flag}'"
+            f"{f' (did you mean {close[0]}?)' if close else ''}; "
+            f"it takes {takes}")
+
+
 def main(argv: list[str]) -> int:
     from . import broker
 
     command, rest = argv[0], argv[1:]
 
     if rest[:1] == ["help"] or "-h" in rest or "--help" in rest:
-        return _usage()
+        _usage()
+        return 2
+
+    given: dict = {}
+    if command in _TAKES:
+        _, _, wanted, outcome = _TAKES[command]
+        try:
+            names, given = _arguments(command, rest)
+        except ValueError as exc:
+            print(f"xenia: {exc}. Nothing was {outcome}.", file=sys.stderr)
+            return 2
+        if "help" in names:
+            _usage()
+            return 2
+        if wanted and not names:
+            print(f"xenia: {command} which credential?", file=sys.stderr)
+            return 2
+        if len(names) > wanted:
+            print(f"xenia: {command} takes "
+                  f"{'one credential' if wanted else 'no credential'}, and was "
+                  f"given {', '.join(map(repr, names))}. Nothing was {outcome}.",
+                  file=sys.stderr)
+            return 2
+        rest = names
 
     if command == "secrets":
         # `secrets` is the store; `secret` is one credential. The plural with
@@ -635,14 +704,11 @@ def main(argv: list[str]) -> int:
         if command == "secret":
             return _secret(conn, broker, rest)
         if command == "grant":
-            return _grant(conn, broker, rest)
+            return _grant(conn, broker, rest[0], given)
         if command == "grants":
-            return _grants(conn, broker, "--all" in rest)
+            return _grants(conn, broker, "--all" in given)
         if command == "revoke":
-            if not rest:
-                print("xenia: revoke which credential?", file=sys.stderr)
-                return 2
-            count = broker.revoke(conn, rest[0], _flag_value(rest, "--host"))
+            count = broker.revoke(conn, rest[0], given.get("--host"))
             print(f"Revoked {count} grant(s) for {rest[0]}.")
             return 0
     finally:
@@ -1123,12 +1189,8 @@ def until_moment(text: str) -> datetime:
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
-def _grant(conn, broker, argv: list[str]) -> int:
-    if not argv:
-        print("xenia: grant which credential?", file=sys.stderr)
-        return 2
-    name = argv[0]
-    host = _flag_value(argv, "--host")
+def _grant(conn, broker, name: str, given: dict) -> int:
+    host = given.get("--host")
     if not host:
         entry = broker.entry(conn, name)
         hosts = json.loads(entry["hosts"]) if entry else []
@@ -1138,13 +1200,13 @@ def _grant(conn, broker, argv: list[str]) -> int:
             print("xenia: --host is required", file=sys.stderr)
             return 2
 
-    mutating = ("--write" in argv) or (host == broker.SIGN_SCOPE)
-    window = _flag_value(argv, "--for")
-    until = _flag_value(argv, "--until")
-    reason = _flag_value(argv, "--reason") or ""
-    profiles = [p.strip() for p in (_flag_value(argv, "--profiles") or "").split(",")
+    mutating = ("--write" in given) or (host == broker.SIGN_SCOPE)
+    window = given.get("--for")
+    until = given.get("--until")
+    reason = given.get("--reason") or ""
+    profiles = [p.strip() for p in given.get("--profiles", "").split(",")
                 if p.strip()]
-    hold = "--hold" in argv
+    hold = "--hold" in given
 
     if window and until:
         print("xenia: --for and --until say different things; give one",
