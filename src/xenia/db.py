@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
 from pathlib import Path
@@ -43,6 +44,7 @@ def migrate(conn: sqlite3.Connection) -> None:
 
     current = schema_version(conn)
     if current == config.SCHEMA_VERSION:
+        _refresh_views(conn)
         conn.commit()
         return
 
@@ -332,6 +334,26 @@ def _add_columns(conn: sqlite3.Connection) -> None:
         for column, kind in columns:
             if column not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+
+
+@functools.lru_cache(maxsize=1)
+def _wanted_views() -> tuple[tuple[str, str], ...]:
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.executescript(_SCHEMA.read_text())
+        return tuple(scratch.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name"))
+    finally:
+        scratch.close()
+
+
+def _refresh_views(conn: sqlite3.Connection) -> None:
+    stored = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'view'"))
+    for name, sql in _wanted_views():
+        if stored.get(name) == sql:
+            continue
+        conn.execute(f"DROP VIEW IF EXISTS {name}")
+        conn.execute(sql)
 
 
 def _add_triggers(conn: sqlite3.Connection) -> None:

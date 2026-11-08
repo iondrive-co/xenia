@@ -287,3 +287,84 @@ def test_repairing_a_column_does_not_touch_what_is_stored(tmp_path):
 
 def _columns(conn, table):
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _stale_goal_view(conn):
+    conn.execute("DROP VIEW v_goal_outcomes")
+    conn.execute(
+        "CREATE VIEW v_goal_outcomes AS "
+        "SELECT g.id AS goal_id, s.repo AS repo, s.agent AS agent, "
+        "g.created_at AS at, g.status AS status, g.prompt AS prompt, "
+        "0 AS actions, 0 AS remote_calls, 0 AS fs_changes, 0 AS failures, "
+        "g.resolution_note AS note "
+        "FROM goal g JOIN session s ON s.id = g.session_id")
+    conn.commit()
+
+
+def test_a_view_changed_without_a_version_bump_is_rebuilt(tmp_path):
+    path = tmp_path / "audit.db"
+    conn = db.connect(path)
+    _stale_goal_view(conn)
+    conn.close()
+
+    ro = readonly.connect(path)
+    with pytest.raises(sqlite3.OperationalError, match="agent_work_ms"):
+        readonly.goals(ro, interactive=None)
+    ro.close()
+
+    again = db.connect(path)
+    assert db.schema_version(again) == config.SCHEMA_VERSION
+    again.close()
+
+    ro = readonly.connect(path)
+    assert readonly.goals(ro) == []
+    ro.close()
+
+
+def test_a_dropped_view_is_put_back(tmp_path):
+    path = tmp_path / "audit.db"
+    conn = db.connect(path)
+    conn.execute("DROP VIEW v_task_outcomes")
+    conn.commit()
+    conn.close()
+
+    again = db.connect(path)
+    views = {r[0] for r in again.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'view'")}
+    assert "v_task_outcomes" in views
+    again.close()
+
+
+def test_views_that_already_match_are_left_alone(tmp_path):
+    path = tmp_path / "audit.db"
+    conn = db.connect(path)
+    before = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.close()
+
+    again = db.connect(path)
+    assert again.execute("PRAGMA schema_version").fetchone()[0] == before
+    again.close()
+
+
+def test_rebuilding_a_view_does_not_touch_what_is_stored(tmp_path):
+    path = tmp_path / "audit.db"
+    conn = db.connect(path)
+    conn.execute(
+        "INSERT INTO session (session_uid, agent, repo, repo_path, cwd, started_at) "
+        "VALUES ('s9', 'claude', 'shop', '/srv/repos/shop', '/srv/repos/shop', "
+        "'2026-07-27T09:00:00.000+00:00')")
+    conn.execute(
+        "INSERT INTO goal (session_id, seq, prompt, prompt_sha256, created_at, agent_work_ms) "
+        "VALUES (1, 1, 'tidy the shop invoices', 'ab12', "
+        "'2026-07-27T09:00:01.000+00:00', 4200)")
+    _stale_goal_view(conn)
+    conn.close()
+
+    again = db.connect(path)
+    again.close()
+
+    ro = readonly.connect(path)
+    rows = readonly.goals(ro, interactive=None)
+    ro.close()
+    assert [(r["prompt"], r["agent_work_ms"]) for r in rows] == [
+        ("tidy the shop invoices", 4200)]
