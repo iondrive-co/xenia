@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import json
 import sqlite3
 from pathlib import Path
@@ -336,15 +335,20 @@ def _add_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
-@functools.lru_cache(maxsize=1)
+_VIEWS: tuple[tuple[str, str], ...] | None = None
+
+
 def _wanted_views() -> tuple[tuple[str, str], ...]:
-    scratch = sqlite3.connect(":memory:")
-    try:
-        scratch.executescript(_SCHEMA.read_text())
-        return tuple(scratch.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name"))
-    finally:
-        scratch.close()
+    global _VIEWS
+    if _VIEWS is None:
+        scratch = sqlite3.connect(":memory:")
+        try:
+            scratch.executescript(_SCHEMA.read_text())
+            _VIEWS = tuple(scratch.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'view' ORDER BY name"))
+        finally:
+            scratch.close()
+    return _VIEWS
 
 
 def _refresh_views(conn: sqlite3.Connection) -> None:
