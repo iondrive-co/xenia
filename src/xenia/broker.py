@@ -896,6 +896,54 @@ def _database_of(conn) -> str:
     return ""
 
 
+def _read_body_file(path: Any) -> tuple[str, int, str]:
+    if not isinstance(path, str) or not path.strip():
+        raise Refusal("'body_file' must be an absolute path", code="malformed")
+    target = Path(path)
+    if not target.is_absolute():
+        raise Refusal(f"'body_file' must be an absolute path, not {path!r}",
+                      code="malformed")
+    limit = config.FETCH_MAX_REQUEST_BYTES
+    root = config.bodies_dir()
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+    except OSError:
+        pass
+    root = Path(os.path.realpath(root))
+    resolved = Path(os.path.realpath(target))
+    if resolved != root and root not in resolved.parents:
+        raise Refusal(
+            f"'body_file' must be a file inside {root}, the one directory "
+            f"xenia reads request bodies from. Write the body there, then "
+            f"pass its path. Anything elsewhere (a symlink or '..' that "
+            f"leads out included) is refused so that a file the caller "
+            f"cannot read itself is never sent on its behalf.",
+            code="off-policy")
+    target = resolved
+    try:
+        with open(target, "rb") as handle:
+            import stat
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise Refusal(f"'body_file' is not a regular file: {path}",
+                              code="malformed")
+            raw = handle.read(limit + 1)
+    except Refusal:
+        raise
+    except OSError as exc:
+        raise Refusal(f"'body_file' could not be read: {exc.strerror or exc}",
+                      code="malformed") from exc
+    if len(raw) > limit:
+        raise Refusal(f"'body_file' is larger than the {limit:,} bytes xenia "
+                      f"will send as a request body", code="malformed")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Refusal(f"'body_file' is not UTF-8 text: {exc}",
+                      code="malformed") from exc
+    return text, len(raw), hashlib.sha256(raw).hexdigest()
+
+
 def _json_body(body: Any) -> tuple[str, bool]:
     if isinstance(body, (dict, list)):
         return json.dumps(body), True
@@ -1719,6 +1767,8 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
     body = request.get("body")
     client = request.get("client")
     capture = request.get("capture")
+    body_file = request.get("body_file")
+    file_bytes = file_sha = file_note = None
     binary = bool(request.get("binary"))
     timeout = min(float(request.get("timeout") or config.FETCH_TIMEOUT),
                   config.FETCH_MAX_TIMEOUT)
@@ -1742,6 +1792,12 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
         if method not in METHODS:
             raise Refusal(f"not an HTTP method xenia will send: {method}",
                           code="malformed")
+        if body_file is not None:
+            if body is not None:
+                raise Refusal("pass 'body' or 'body_file', not both",
+                              code="malformed")
+            body, file_bytes, file_sha = _read_body_file(body_file)
+            file_note = (f"body_file: {file_bytes} bytes sha256 {file_sha}")
         if binary and not capture:
             raise Refusal(
                 "a binary response needs 'capture' to name it: xenia will not "
@@ -2022,7 +2078,9 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
         _extend(approval, mutating),
         ("UPDATE secret SET last_used_at = max(coalesce(last_used_at, ''), ?) "
          "WHERE name = ?", (stamp(utcnow()), name)),
-    ], reason=f"action: {permitted[0]}" if permitted else None,
+    ], reason="; ".join(part for part in (
+        f"action: {permitted[0]}" if permitted else None, file_note) if part)
+        or None,
         echoed=echoed, captured={key: captured.get(key) for key in
                                 ("request_path", "response_path",
                                  "request_sha256", "response_sha256")})
@@ -2053,6 +2111,8 @@ def _fetch(conn, request: dict, *, store=None, opener=None,
         "placed": placed,
         "redirects": redirects,
         "warnings": warnings,
+        **({"body_file": body_file, "body_file_bytes": file_bytes,
+            "body_file_sha256": file_sha} if file_sha else {}),
         **captured,
     }
 
@@ -2688,7 +2748,10 @@ OPS = {
     "ops": "this contract, the refusal codes, and which signing schemes are "
            "available on this machine. -> {ops, codes, schemes}",
     "fetch": "make one authenticated HTTP request. Takes {secret, url, "
-             "method, headers, body, timeout, capture, binary}; credentials go "
+             "method, headers, body, body_file, timeout, capture, binary}; "
+             "'body_file' is an absolute path xenia reads and sends exactly as "
+             "an inline body (never with 'body'), and the reply adds "
+             "{body_file, body_file_bytes, body_file_sha256}; credentials go "
              "where {{secret}} / {{secret:name}} appear and signatures where "
              "{{sign}} / {{sign:profile}} do. -> {status, reason, headers, "
              "body, bytes, duration_ms, url, used, signed, placed, redirects, "

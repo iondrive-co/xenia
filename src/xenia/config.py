@@ -181,6 +181,8 @@ FETCH_MAX_BYTES = int(os.environ.get("XENIA_FETCH_MAX_BYTES", 1_048_576))
 # What a BINARY response may cost instead. It is not decoded and never enters a
 # reply, so the read cap above — sized so a reply still fits — does not bind it.
 # This one exists only so a runaway download cannot fill the disk.
+FETCH_MAX_REQUEST_BYTES = int(
+    os.environ.get("XENIA_FETCH_MAX_REQUEST_BYTES", 32 * 1_048_576))
 FETCH_MAX_BINARY_BYTES = int(
     os.environ.get("XENIA_FETCH_MAX_BINARY_BYTES", 256 * 1_048_576))
 FETCH_BODY_CHARS = int(os.environ.get("XENIA_FETCH_BODY_CHARS", 20_000))
@@ -200,6 +202,13 @@ def capture_dir() -> Path:
     if explicit:
         return Path(explicit).expanduser()
     return _xdg("XDG_DATA_HOME", ".local/share") / "xenia" / "captures"
+
+
+def bodies_dir() -> Path:
+    explicit = os.environ.get("XENIA_BODIES_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    return _xdg("XDG_DATA_HOME", ".local/share") / "xenia" / "bodies"
 
 
 # How long a verified scope is believed before it counts as stale.

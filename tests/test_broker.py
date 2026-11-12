@@ -2980,3 +2980,114 @@ def test_response_framing_overrides_ambiguous_content_length(
     assert answer["code"] == "quota"
     assert broker.quota_left(wired, "gitlab-pat")["used_bytes"] == 32
     assert not list((tmp_path / "captures").glob("*"))
+
+
+@pytest.fixture
+def bodies_dir(tmp_path, monkeypatch):
+    root = tmp_path / "bodies"
+    root.mkdir()
+    monkeypatch.setenv("XENIA_BODIES_DIR", str(root))
+    return root
+
+
+def test_a_body_file_is_sent_like_an_inline_body_and_its_digest_returned(
+        wired, bodies_dir):
+    import hashlib
+
+    allow(wired, mutating=True)
+    payload = '[{"id": 1, "token": "' + broker.PLACEHOLDER + '"}]'
+    path = bodies_dir / "bulk.json"
+    path.write_text(payload)
+    opener = Opener()
+
+    answer = call(wired, opener=opener, method="POST", body_file=str(path),
+                  headers={"Content-Type": "application/json"})
+
+    assert answer["status"] == 200
+    assert opener.sent[0].data == payload.replace(
+        broker.PLACEHOLDER, VALUE).encode()
+    assert answer["body_file_bytes"] == len(payload.encode())
+    assert answer["body_file_sha256"] == hashlib.sha256(
+        payload.encode()).hexdigest()
+    assert "body" in answer["placed"]
+    assert VALUE not in json.dumps(answer)
+    note = wired.execute("SELECT reason FROM secret_use").fetchone()[0]
+    assert answer["body_file_sha256"] in note
+
+
+def test_a_body_file_write_still_needs_approval(wired, bodies_dir):
+    allow(wired)
+    path = bodies_dir / "bulk.json"
+    path.write_text("{}")
+    opener = Opener()
+
+    answer = call(wired, opener=opener, method="POST", body_file=str(path))
+
+    assert answer["code"] == "unapproved"
+    assert opener.sent == []
+
+
+@pytest.mark.parametrize("make", ["both", "relative", "missing", "directory",
+                                  "binary", "large"])
+def test_a_body_file_that_cannot_be_used_is_refused_unsent(
+        wired, bodies_dir, monkeypatch, make):
+    allow(wired, mutating=True)
+    path = bodies_dir / "bulk.json"
+    path.write_bytes(b"{}")
+    extra = {}
+    if make == "both":
+        extra["body"] = "{}"
+    elif make == "relative":
+        path = "bulk.json"
+    elif make == "missing":
+        path = bodies_dir / "absent.json"
+    elif make == "directory":
+        path = bodies_dir
+    elif make == "binary":
+        path.write_bytes(b"\xff\xfe\x00")
+    else:
+        monkeypatch.setattr(broker.config, "FETCH_MAX_REQUEST_BYTES", 1)
+    opener = Opener()
+
+    answer = call(wired, opener=opener, method="POST", body_file=str(path),
+                  **extra)
+
+    assert answer["code"] == "malformed"
+    assert opener.sent == []
+
+
+@pytest.mark.parametrize("make", ["outside", "dotdot", "symlink", "sibling"])
+def test_a_body_file_outside_the_bodies_directory_is_refused_unread(
+        wired, bodies_dir, tmp_path, make):
+    allow(wired, mutating=True)
+    secret_file = tmp_path / "netrc"
+    secret_file.write_text("machine example.com password hunter2")
+    if make == "outside":
+        path = secret_file
+    elif make == "dotdot":
+        path = bodies_dir / ".." / "netrc"
+    elif make == "symlink":
+        path = bodies_dir / "link.json"
+        path.symlink_to(secret_file)
+    else:
+        sibling = tmp_path / "bodies-extra"
+        sibling.mkdir()
+        path = sibling / "x.json"
+        path.write_text("{}")
+    opener = Opener()
+
+    answer = call(wired, opener=opener, method="POST", body_file=str(path))
+
+    assert answer["code"] == "off-policy"
+    assert str(bodies_dir.resolve()) in answer["refused"]
+    assert opener.sent == []
+
+
+def test_the_bodies_directory_is_created_private(wired, tmp_path, monkeypatch):
+    root = tmp_path / "fresh" / "bodies"
+    monkeypatch.setenv("XENIA_BODIES_DIR", str(root))
+    allow(wired, mutating=True)
+
+    call(wired, method="POST", body_file=str(root / "x.json"))
+
+    assert root.is_dir() and (root.stat().st_mode & 0o777) == 0o700

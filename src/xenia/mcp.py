@@ -435,6 +435,22 @@ TOOLS: list[dict[str, Any]] = [
                             "description": "Request headers."},
                 "body": {"description": "Request body — a string, or an "
                                         "object sent as JSON."},
+                "body_file": {"type": "string",
+                              "description": "Absolute path of a UTF-8 file "
+                                             "inside xenia's bodies "
+                                             "directory, "
+                                             "$XDG_DATA_HOME/xenia/bodies "
+                                             "(created 0700); any other "
+                                             "path is refused. xenia sends "
+                                             "it as the request body, for "
+                                             "a body too large to write "
+                                             "into this call. Never with "
+                                             "'body'. {{secret}} is filled "
+                                             "in, and every policy and "
+                                             "approval applies, exactly as "
+                                             "for an inline body. The reply "
+                                             "carries the file's size and "
+                                             "sha256."},
                 "timeout": {"type": "number",
                             "description": "Seconds to wait (default 30)."},
                 "capture": {"type": "string",
@@ -889,6 +905,7 @@ def _fetch(args: dict[str, Any]) -> Any:
             "method": args.get("method"),
             "headers": args.get("headers"),
             "body": args.get("body"),
+            "body_file": args.get("body_file"),
             "timeout": args.get("timeout"),
             "capture": args.get("capture"),
             "binary": args.get("binary"),
