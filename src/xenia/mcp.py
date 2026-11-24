@@ -15,17 +15,12 @@ SERVER_INFO = {"name": "xenia", "version": "0.1.0"}
 
 _SINCE = {
     "type": "string",
-    "description": "Window to look back over. Either a length back from now "
-                   "— '30m', '4h', '7d', '2w' — or a moment to start from: "
-                   "'2026-07-01', '2026-07-01T04:30', "
-                   "'2026-07-01T04:30:00Z'. The record is UTC and a moment "
-                   "with no offset is read as UTC. Omit for all time; "
-                   "anything else is an error rather than a silent window.",
+    "description": "Lookback such as '30m', '4h', '7d' or '2w', or an ISO "
+                   "date or timestamp. UTC if no offset. Omit for all time.",
 }
 _REPO = {
     "type": "string",
-    "description": "Limit to one repository by name. Agent work outside any "
-                   "checkout is filed under 'general'.",
+    "description": "Repository name. Use 'general' for work outside checkouts.",
 }
 _LIMIT = {
     "type": "integer",
@@ -36,14 +31,11 @@ _AGENT = {"type": "string", "description": "Which runtime: claude or codex."}
 
 _TOOL = {
     "type": "string",
-    "description": "Tool name, exactly or as a glob: 'Bash', "
-                   "'mcp__acme-ssh__shell', 'mcp__acme*'.",
+    "description": "Tool name or glob, e.g. 'Bash' or 'mcp__acme*'.",
 }
 _VIA = {
     "type": "string",
-    "description": "Which broker carried the call: an MCP server name, or "
-                   "'direct' for the shell. Globs, so 'acme-*' covers every "
-                   "server at one site.",
+    "description": "MCP server name or glob, or 'direct' for the shell.",
 }
 _CHANNEL = {
     "type": "string",
@@ -52,15 +44,11 @@ _CHANNEL = {
 }
 _SESSION = {
     "type": "string",
-    "description": "One agent run, by session id. Worth using on a machine "
-                   "running several agents at once, where a timeline is "
-                   "otherwise several agents interleaved.",
+    "description": "Session ID of one agent run.",
 }
 _SIGNATURE = {
     "type": "string",
-    "description": "The normalised identity of the work, as returned by the "
-                   "failures, repeats and tools views. This is how you drill "
-                   "from one of those rows into the calls behind it.",
+    "description": "Signature returned by the failures, repeats or tools view.",
 }
 
 VIEWS = ("tasks", "instructions", "failures", "repeats", "tools", "disk",
@@ -93,94 +81,34 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "xenia_report",
         "description": (
-            "How coding agents have been getting on with their work on this "
-            "machine. One record, six views of it — choose what a row should "
-            "be with 'view':\n"
-            "\n"
-            "  tasks         one unit of work an agent named for itself, and "
-            "whether it got there: achieved, partial, failed, abandoned or "
-            "no_action. The outcome is read off the calls made under the task, "
-            "never off the agent's claim about it; where the two disagree "
-            "'overstated' is 1 and 'declared' is what the agent said. "
-            "Ordered by what went wrong — failed, then overstated and partial, "
-            "then the rest, most recent first inside each — because an "
-            "unfiltered window is mostly one-action successes and they are "
-            "not the answer to anything. Which means the top of any page is "
-            "every failure there is: read 'totals' before concluding anything "
-            "from the mix of rows, because it counts the whole window by "
-            "status and the rows are a worst-first slice of it. Pass "
-            "order='at' for a timeline instead. Start here.\n"
-            "  instructions  the same question one level up: one thing the "
-            "*user* asked for, and how it turned out. The only view that "
-            "carries whole prompts, which is why the rest carry a 'goal_id' — "
-            "pass one back as 'goal_id' for the full text of that instruction.\n"
-            "  failures      one kind of work that keeps failing, worst first, "
-            "grouped across sessions. 'repos' names the checkouts it failed "
-            "in, because that is where a fix goes; 'previously' is the same "
-            "count over the window before this one, so a row failing 8 times "
-            "against 0 is new and one against 12 is already getting better. "
-            "'recovered' is how often a later call put it right; many failures "
-            "and few recoveries is a gap in the environment or the "
-            "instructions, and the most actionable row here. Refusals split "
-            "by who did the refusing: 'refused_by_rule' is a hook or a "
-            "permission rule, and the reason is in 'example_error' — a config "
-            "or code fix; 'declined_by_user' is a person saying no at the "
-            "prompt, which is not yours to change; 'refused_unattributed' is a "
-            "refusal nothing recorded an owner for — a daemon or an MCP "
-            "server saying no in a reply the runtime read as an ordinary "
-            "error. That is the "
-            "class neither other count can see and the one most often "
-            "fixable, and 'example_error' says which it was and what it "
-            "wanted. Group by 'cause' instead of by signature "
-            "when one reason is failing several different calls: it keys on "
-            "the error text rather than on the work, and names the signatures "
-            "it spans. 'search' matches the error, the command, the intent or "
-            "the signature. Pass 'example_action_id' to xenia_trace.\n"
-            "  repeats       one piece of work a session did again minutes "
-            "after it had already succeeded. This is the waste 'failures' "
-            "cannot show, since none of it failed. Cost it in "
-            "'repeated_bytes' rather than 'repeated_ms': redoing work is "
-            "rarely slow, but every repeat puts its whole reply back into a "
-            "context.\n"
-            "  tools         one tool, broker, host, repo or signature, with "
-            "calls, failure rate, latency and reply bytes. Ask this rather "
-            "than totalling rows yourself; order by 'total_bytes' for what "
-            "floods a context rather than what takes time.\n"
-            "  disk          one file (or repo, tool, session) with what was "
-            "written to it, how often it was rewritten, and how much of that "
-            "hashed to what was already there — 'unchanged' is bytes that "
-            "reached the drive and changed nothing.\n"
-            "  credentials   one credential the user has given xenia to use "
-            "on your behalf: what it is called, where it may be sent, whether "
-            "it is approved right now, and how it has been used. The values "
-            "are not here and cannot be read through this server.\n"
-            "  claims        the agora: one expensive thing an agent on "
-            "this machine said it is running, what it is for, and what it "
-            "costs. Read it BEFORE starting anything heavy, and before "
-            "killing anything you did not start. 'may_kill' answers the "
-            "only question the row is usually asked: 'no' is live work "
-            "someone is waiting on, 'ask' is past its own deadline with "
-            "its session still alive, 'yes' is an orphan whose session is "
-            "gone. 'ram' carries what the box has, what live claims hold "
-            "and what is sitting in orphans — measured off the processes "
-            "where they could be seen rather than only what was declared. "
-            "Post your own with xenia_claim.\n"
-            "\n"
-            "Rows come back under 'rows'. The tasks view also returns "
-            "'instructions', the text of each instruction its rows sat under, "
-            "keyed by 'goal_id' — one entry per instruction rather than the "
-            "same sentence repeated down every row. 'since', 'repo' and "
-            "'limit' apply to "
-            "every view; each other parameter names the views that read it, "
-            "and passing one to a view that does not is an error rather than a "
-            "filter that quietly does nothing. For the individual calls behind "
-            "any row, take its 'signature' to xenia_calls."
+            "Grouped audit data. Start with a narrow 'since' and small 'limit'. "
+            "Choose a view:\n"
+            "tasks: verify attempted work against observed calls. Use 'totals' "
+            "for the whole window; rows are worst-first unless order='at'. "
+            "'declared' is the agent's claim; 'overstated' flags a mismatch.\n"
+            "instructions: user requests and outcomes; use a goal_id for one "
+            "full prompt.\n"
+            "failures: recurring failures, recoveries, prior counts and "
+            "refusals. Group by cause to combine signatures with the same "
+            "error. Trace an example_action_id for details.\n"
+            "repeats: successful calls redone; sort by repeated_bytes for "
+            "context cost.\n"
+            "tools: call counts, latency, failures and reply sizes; sort by "
+            "total_bytes for context cost.\n"
+            "disk: writes and rewrites; 'unchanged' is bytes rewritten "
+            "without changing content.\n"
+            "credentials: credential availability, approvals and usage.\n"
+            "claims: live and orphaned resource claims with memory and "
+            "may_kill status.\n"
+            "sessions: agent sessions in the selected scope.\n"
+            "Tasks include the user prompt for each returned goal_id under "
+            "'instructions'. Only pass parameters listed for the selected "
+            "view. Use xenia_calls to drill into a signature."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "view": {"type": "string", "enum": list(VIEWS),
-                         "description": "Which of the eight above."},
+                "view": {"type": "string", "enum": list(VIEWS)},
                 "since": _SINCE, "repo": _REPO, "limit": _LIMIT,
                 "agent": _views("tasks repeats tools disk", _AGENT),
                 "tool": _views("repeats tools disk", _TOOL),
@@ -193,14 +121,12 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "Restrict to one kind of action."}),
                 "status": {
                     "type": "string",
-                    "description": "[tasks instructions tools] Restrict to one "
-                                   "outcome. For tasks and instructions: "
-                                   f"{', '.join(readonly.TASK_STATUSES)}. For "
-                                   f"tools: {', '.join(readonly.STATUSES)} — "
-                                   "where 'blocked' is a call something "
-                                   "refused and 'unanswered' is one nobody "
-                                   "answered before the session ended, which "
-                                   "is counted as a failure nowhere."},
+                    "description": "[tasks instructions] "
+                                   f"{', '.join(readonly.TASK_STATUSES)}. "
+                                   "[tools] "
+                                   f"{', '.join(readonly.STATUSES)}. "
+                                   "'unanswered' is excluded from failure counts.",
+                },
                 "source": _views("tasks", {
                     "type": "string", "enum": list(readonly.TASK_SOURCES),
                     "description": "How the task was identified: the agent's "
@@ -212,13 +138,10 @@ TOOLS: list[dict[str, Any]] = [
                                    "the calls under them say were not."}),
                 "search": {
                     "type": "string",
-                    "description": "[tasks failures] Substring match. For "
-                                   "tasks: the label and the instruction it "
-                                   "sat under. For failures: the error text, "
-                                   "the command, the intent and the signature "
-                                   "— which is how to find every failure that "
-                                   "mentions a host, a path or a phrase, "
-                                   "whatever tool produced it."},
+                    "description": "[tasks] Match task label or prompt. "
+                                   "[failures] Match error, command, intent "
+                                   "or signature.",
+                },
                 "goal_id": _views("instructions", {
                     "type": "integer",
                     "description": "One instruction, in full, by the id the "
@@ -236,66 +159,42 @@ TOOLS: list[dict[str, Any]] = [
                     "enum": sorted(set(readonly.GROUPABLE)
                                    | set(readonly.DISK_GROUPS)
                                    | set(readonly.FAILURE_GROUPS)),
-                    "description": "[failures tools disk] What one row covers. "
-                                   "For failures: 'signature' (default), one "
-                                   "row per kind of work, or 'cause', one row "
-                                   "per normalised error — eight failures over "
-                                   "six signatures with one reason are six "
-                                   "rows the first way and one row the second. "
-                                   "For "
-                                   f"tools: {', '.join(sorted(readonly.GROUPABLE))} "
-                                   "(default 'tool'; a call with no such "
-                                   "property — a file edit has no host — groups "
-                                   "under null). For disk: "
+                    "description": "[failures] signature (default) or cause. "
+                                   "[tools] "
+                                   f"{', '.join(sorted(readonly.GROUPABLE))} "
+                                   "(default tool). [disk] "
                                    f"{', '.join(sorted(readonly.DISK_GROUPS))} "
-                                   "(default 'path')."},
+                                   "(default path).",
+                },
                 "order": {
                     "type": "string",
                     "enum": sorted(set(readonly.STAT_ORDERS)
                                    | set(readonly.DISK_ORDERS)
                                    | set(readonly.REPEAT_ORDERS)
                                    | set(readonly.TASK_ORDERS)),
-                    "description": "[tasks repeats tools disk] Sort by. For "
-                                   "tasks: 'significance' (default, what went "
-                                   "wrong first) or 'at' for a timeline. For "
-                                   "tools: "
+                    "description": "[tasks] significance (default) or at. "
+                                   "[tools] "
                                    f"{', '.join(sorted(readonly.STAT_ORDERS))} "
-                                   "(default 'total_ms', the time the group "
-                                   "actually cost). For disk: "
+                                   "(default total_ms). [disk] "
                                    f"{', '.join(sorted(readonly.DISK_ORDERS))} "
-                                   "(default 'wasted_bytes'; use 'writes' when "
-                                   "sizes are unknown). For repeats: "
+                                   "(default wasted_bytes). [repeats] "
                                    f"{', '.join(sorted(readonly.REPEAT_ORDERS))} "
-                                   "(default 'repeats'; order by "
-                                   "'repeated_bytes' for what the redoing cost "
-                                   "a context, which is where the cost of this "
-                                   "view lands — redone work is rarely slow)."},
+                                   "(default repeats).",
+                },
                 "state": _views("claims", {
                     "type": "string", "enum": list(agora.STATES),
-                    "description": "Only claims in one state: 'held' "
-                                   "(live work), 'overrun' (past the "
-                                   "window its holder gave it, its "
-                                   "session still alive), 'detached' "
-                                   "(holder is gone but processes still "
-                                   "running), 'abandoned' (its session "
-                                   "is gone — this is what is free to "
-                                   "reclaim), or 'released' (finished "
-                                   "with; kept as history and not returned "
-                                   "otherwise)."}),
+                    "description": "Filter by claim state. Released claims "
+                                   "are omitted by default."}),
                 "min_count": {
                     "type": "integer",
-                    "description": "[failures repeats tools disk] Drop rows "
-                                   "below this many failures, repeats, calls or "
-                                   "writes. Defaults to 2 for failures — one "
-                                   "failure is an incident rather than a "
-                                   "pattern — and to 1 elsewhere, so nothing is "
-                                   "hidden unless you ask."},
+                    "description": "Minimum failures, repeats, calls (tools) "
+                                   "or writes (disk) per row. Defaults to 2 "
+                                   "for failures and 1 elsewhere.",
+                },
                 "within_minutes": _views("repeats", {
                     "type": "number",
-                    "description": "How close together two calls have to be to "
-                                   "count as a repeat (default 10). Widen it "
-                                   "for a slow-moving session; a large window "
-                                   "starts counting honest re-runs."}),
+                    "description": "Maximum minutes apart to count as a "
+                                   "repeat (default 10)."}),
             },
             "required": ["view"],
         },
@@ -303,23 +202,10 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "xenia_calls",
         "description": (
-            "Individual calls, for the one question every xenia_report view "
-            "raises and cannot answer: which call was that. A 'tools' row "
-            "reporting a 33KB maximum does not say which call returned it, and "
-            "one signature covering six journalctl runs is one row on purpose. "
-            "Deliberately thin — action id, time, tool, status, duration, reply "
-            "size and a short command, and nothing that repeats identically "
-            "down the rows. Defaults to the heaviest replies first; pass the "
-            "'signature' or 'tool' from a report row to drill into it, and the "
-            "'action_id' it returns to xenia_trace. A failed row also "
-            "carries its 'error', which is the reason to be looking at it. "
-            f"'detail' is cut to {readonly.CALL_CHARS} characters and 'error' "
-            f"to {readonly.ERROR_CHARS} so a page of rows stays readable; a "
-            "cut always says how many characters went, and an error is cut "
-            "from the middle rather than the end, because what to do about it "
-            "is usually the last thing it says. xenia_trace on the same "
-            "action id is where the whole of both are, for any call and not "
-            "only a failed one."
+            "Find individual calls by session, tool or report signature. "
+            "Start with a narrow time range and a small limit. Returns action "
+            "ID, time, status, duration, reply bytes and short details or "
+            "errors. Use xenia_trace(action_id) for the full call."
         ),
         "inputSchema": {
             "type": "object",
@@ -333,18 +219,9 @@ TOOLS: list[dict[str, Any]] = [
                            "description": "Restrict to one outcome."},
                 "blocked_by": {
                     "type": "string", "enum": list(readonly.BLOCKED_BY),
-                    "description": "Restrict to calls something refused, by "
-                                   "who refused them: 'rule' for a hook or "
-                                   "permission rule (the reason is on the "
-                                   "row's error, and the fix is in a file), "
-                                   "'user' for a decline at the prompt, and "
-                                   "'unattributed' for a refusal that came "
-                                   "back as an ordinary error — the runtime "
-                                   "recorded no block for those, so they are "
-                                   "matched on the error text and the row's "
-                                   "'blocked_by' stays absent. Calls that "
-                                   "simply never completed carry none of the "
-                                   "three."},
+                    "description": "Refusals by rule (hook or policy), user, "
+                                   "or unattributed (tool or service error).",
+                },
                 "order": {"type": "string",
                           "enum": ["bytes", "duration_ms", "at"],
                           "description": "Sort by reply size (default), time "
@@ -355,36 +232,16 @@ TOOLS: list[dict[str, Any]] = [
                 "limit": {"type": "integer",
                           "description": f"Maximum rows (default "
                                          f"{readonly.CALLS_DEFAULT_LIMIT}, "
-                                         f"capped at {readonly.MAX_LIMIT}). "
-                                         f"Small on purpose: this is a "
-                                         f"drill-down, not a timeline. Raising "
-                                         f"it is the wrong move on a reply that "
-                                         f"came back truncated — rows here are "
-                                         f"whole shell commands, so a few "
-                                         f"hundred of them hit the reply "
-                                         f"ceiling and get cut. Filter instead."},
+                                         f"max {readonly.MAX_LIMIT}). Narrow "
+                                         "the filters for truncated replies."},
             },
         },
     },
     {
         "name": "xenia_trace",
-        "description": "One action, the task it was working towards, its "
-                       "outcome, and — when a later action fixed it — every "
-                       "action in between, from that one session. This is how a "
-                       "failure was actually recovered from. A recovery is "
-                       "reported twice over: 'resolution_span' counts the "
-                       "actions in between and 'resolution_seconds' the clock "
-                       "time, and they answer different questions — a span of "
-                       "0 over seven minutes is an agent that waited, not one "
-                       "that fixed it instantly. A fix in a later "
-                       "session gives the two endpoints only: the work between "
-                       "them belongs to two sessions and threading it into one "
-                       "list by clock time would not be a reading of anything. "
-                       "Takes ANY action id, not only a failed one: it is also "
-                       "the way to read one call's arguments in full, since "
-                       "xenia_calls shortens them to keep its rows scannable "
-                       "and a recovery series is simply absent when there was "
-                       "nothing to recover from.",
+        "description": "Full arguments and outcome for one action_id. Shows "
+                       "follow-up calls for a recovery in the same session, "
+                       "or just the endpoints for a cross-session recovery.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1021,62 +878,20 @@ class Server:
                     "capabilities": {"tools": {}},
                     "serverInfo": SERVER_INFO,
                     "instructions": (
-                        "The record of how coding agents have been getting "
-                        "on with their work on this machine, and the agora "
-                        "they keep so that they can share it.\n"
-                        "\n"
-                        "The record is read-only: xenia_report, xenia_calls "
-                        "and xenia_trace only ever read it. The agora is "
-                        "yours to write — xenia_claim posts a claim, attaches "
-                        "pids to it and releases it — and xenia_fetch makes a "
-                        "call with a credential you are never handed.\n"
-                        "\n"
-                        "xenia_report answers it, in eight views: 'tasks' (what "
-                        "agents were trying to do, and whether it worked — "
-                        "start here), 'instructions' (what the user asked for), "
-                        "'failures' (kinds of work that keep failing), "
-                        "'repeats' (work redone that never failed), 'tools' "
-                        "(counts, failure rates, latency and reply bytes — ask "
-                        "for these rather than totalling rows yourself) and "
-                        "'disk' (what was written, and how much of it changed "
-                        "nothing), 'credentials' (what the user has given "
-                        "xenia to use on your behalf) and 'claims' (the "
-                        "agora).\n"
-                        "\n"
-                        "The agora is how the agents sharing this "
-                        "machine stay out of each other's way. Read "
-                        "xenia_report(view='claims') before you start "
-                        "anything that will hold a lot of memory — a headless "
-                        "browser, a long suite, a build, a model — and before "
-                        "you kill any process you did not start yourself: "
-                        "every row says what it is, what it is for, what it "
-                        "costs, and whether it is safe to kill ('yes' only "
-                        "for orphans whose session is gone). Announce your "
-                        "own heavy work with xenia_claim, attach its pids "
-                        "once they exist, and release it when you are done.\n"
-                        "\n"
-                        "xenia_fetch makes an HTTP call with one of those "
-                        "credentials without being handed it: write "
-                        "{{secret}} where the credential belongs and xenia "
-                        "fills it in, then takes it back out of the reply.\n"
-                        "\n"
-                        "Every view groups. xenia_calls is the drill-down to "
-                        "the individual calls behind one of their rows, and "
-                        "xenia_trace takes an action id and shows how that "
-                        "failure was recovered from.\n"
-                        "\n"
-                        "Replies are capped at "
-                        f"{config.REPLY_LIMIT} characters and rows past that "
-                        "are dropped, with a 'truncated' key saying how many "
-                        "and why — a cut answer beats one the client discards "
-                        "whole. If you see it, narrow the query rather than "
-                        "raising 'limit'; the rows kept are the top of the "
-                        "order the reply names in 'ordered_by'.\n"
-                        "\n"
-                        "Every timestamp here is UTC. Every reply opens with "
-                        "'now' and 'now_local' so a row can be lined up "
-                        "against a local log or an mtime without guessing the "
-                        "offset."
+                        "The record of how coding agents work on this machine.\n"
+                        "The record is read-only. The agora is yours to write "
+                        "with xenia_claim. Read claims before heavy work or "
+                        "killing a process you did not start. Only orphans "
+                        "are marked may_kill='yes'. Post your heavy work, "
+                        "attach its PIDs and release the claim when done.\n"
+                        "Use xenia_fetch to make requests with a credential "
+                        "placeholder such as {{secret}}.\n"
+                        "Start reports and call searches with a narrow time "
+                        "window and a small limit. If 'truncated' appears, "
+                        f"tighten filters; replies are capped at "
+                        f"{config.REPLY_LIMIT} characters. Drill into calls "
+                        "with xenia_calls and action IDs with xenia_trace. "
+                        "Timestamps are UTC; replies include now_local."
                     ) + self._retirement_notice(),
                 })
 
