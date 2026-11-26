@@ -1157,6 +1157,71 @@ class _NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+_egress_cache: dict[str, Any] = {"stamp": None, "rule": {}}
+_egress_state = {"down_until": 0.0}
+
+
+def _egress_rule() -> dict[str, Any]:
+    path = config.site_config_path()
+    try:
+        stat = path.stat()
+        stamp = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = None
+    if stamp != _egress_cache["stamp"]:
+        rule: dict[str, Any] = {}
+        try:
+            loaded = json.loads(path.read_text() or "{}") if stamp else {}
+            raw = loaded.get("egress") if isinstance(loaded, dict) else None
+            if isinstance(raw, dict) and raw.get("hosts"):
+                rule = {
+                    "source": str(ipaddress.IPv4Address(raw["source"])),
+                    "hosts": {str(h).lower().rstrip(".") for h in raw["hosts"]},
+                    "connect_timeout": float(raw.get("connect_timeout", 2)),
+                    "cooldown": float(raw.get("cooldown", 60)),
+                }
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            rule = {}
+        _egress_cache.update(stamp=stamp, rule=rule)
+    return _egress_cache["rule"]
+
+
+def _egress_for(host: str, address: str) -> dict[str, Any] | None:
+    rule = _egress_rule()
+    if not rule or time.monotonic() < _egress_state["down_until"]:
+        return None
+    try:
+        if ipaddress.ip_address(address).version != 4:
+            return None
+    except ValueError:
+        return None
+    name = (host or "").lower().rstrip(".")
+    if "*" in rule["hosts"] or name in rule["hosts"]:
+        return rule
+    return None
+
+
+def _connect(address: str, port: int, timeout, source_address, host: str):
+    rule = _egress_for(host, address) if source_address is None else None
+    if rule is not None:
+        limit = rule["connect_timeout"]
+        if isinstance(timeout, (int, float)):
+            limit = min(limit, timeout)
+        try:
+            sock = socket.create_connection(
+                (address, port), limit, (rule["source"], 0))
+        except OSError as exc:
+            _egress_state["down_until"] = time.monotonic() + rule["cooldown"]
+            print(f"xenia: egress via {rule['source']} to {host} failed "
+                  f"({type(exc).__name__}: {exc}); direct for "
+                  f"{rule['cooldown']:.0f}s", file=sys.stderr, flush=True)
+        else:
+            sock.settimeout(timeout if isinstance(timeout, (int, float))
+                            else socket.getdefaulttimeout())
+            return sock
+    return socket.create_connection((address, port), timeout, source_address)
+
+
 def _opener(pinned: str = ""):
     """An opener that connects where the check said, not where DNS says now.
 
@@ -1170,8 +1235,8 @@ def _opener(pinned: str = ""):
 
     class Secure(http.client.HTTPSConnection):
         def connect(self):
-            self.sock = socket.create_connection(
-                (pinned, self.port), self.timeout, self.source_address)
+            self.sock = _connect(pinned, self.port, self.timeout,
+                                 self.source_address, self.host)
             if self._tunnel_host:
                 self._tunnel()
             context = getattr(self, "_context", None) or \
@@ -1180,8 +1245,8 @@ def _opener(pinned: str = ""):
 
     class Plain(http.client.HTTPConnection):
         def connect(self):
-            self.sock = socket.create_connection(
-                (pinned, self.port), self.timeout, self.source_address)
+            self.sock = _connect(pinned, self.port, self.timeout,
+                                 self.source_address, self.host)
 
     class SecureHandler(urllib.request.HTTPSHandler):
         def https_open(self, req):
